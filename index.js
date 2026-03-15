@@ -105,6 +105,23 @@ REPORT FORMAT (Strictly follow this for each position):
 
   const screenTask = cron.schedule(`*/${Math.max(1, config.schedule.screeningIntervalMin)} * * * *`, async () => {
     if (_screeningBusy || busy) return;
+
+    // Hard guards — don't even run the agent if preconditions aren't met
+    try {
+      const [positions, balance] = await Promise.all([getMyPositions(), getWalletBalances()]);
+      if (positions.total_positions >= config.risk.maxPositions) {
+        log("cron", `Screening skipped — max positions reached (${positions.total_positions}/${config.risk.maxPositions})`);
+        return;
+      }
+      if (balance.sol < config.management.minSolToOpen) {
+        log("cron", `Screening skipped — insufficient SOL (${balance.sol.toFixed(3)} < ${config.management.minSolToOpen})`);
+        return;
+      }
+    } catch (e) {
+      log("cron_error", `Screening pre-check failed: ${e.message}`);
+      return;
+    }
+
     _screeningBusy = true;
     timers.screeningLastRun = Date.now();
     log("cron", `Starting screening cycle [model: ${config.llm.screeningModel}]`);

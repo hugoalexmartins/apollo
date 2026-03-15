@@ -286,12 +286,12 @@ async function runSafetyChecks(name, args) {
         };
       }
 
-      // We allow the agent to decide the amount, but cap it at maxDeployAmount for safety.
-      // MINIMUM: 0.1 SOL as an absolute floor (gas protection).
-      if (amountY < 0.1) {
+      // Enforce minimum deploy amount — must be at least deployAmountSol (configured) or 0.1 SOL absolute floor.
+      const minDeploy = Math.max(0.1, config.management.deployAmountSol);
+      if (amountY < minDeploy) {
         return {
           pass: false,
-          reason: `Amount ${amountY} SOL is too low (0.1 SOL minimum absolute floor).`,
+          reason: `Amount ${amountY} SOL is below the minimum deploy amount (${minDeploy} SOL). Use at least ${minDeploy} SOL.`,
         };
       }
       if (amountY > config.risk.maxDeployAmount) {
