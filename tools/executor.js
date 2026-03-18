@@ -16,7 +16,7 @@ import { setPositionInstruction } from "../state.js";
 import { getPoolMemory, addPoolNote } from "../pool-memory.js";
 import { addToBlacklist, removeFromBlacklist, listBlacklist } from "../token-blacklist.js";
 import { addSmartWallet, removeSmartWallet, listSmartWallets, checkSmartWalletsOnPool } from "../smart-wallets.js";
-import { getTokenInfo, getTokenHolders } from "./token.js";
+import { getTokenInfo, getTokenHolders, getTokenNarrative } from "./token.js";
 import { config, reloadScreeningThresholds } from "../config.js";
 import fs from "fs";
 import path from "path";
@@ -45,6 +45,7 @@ const toolMap = {
   search_pools: searchPools,
   get_token_info: getTokenInfo,
   get_token_holders: getTokenHolders,
+  get_token_narrative: getTokenNarrative,
   add_smart_wallet: addSmartWallet,
   remove_smart_wallet: removeSmartWallet,
   list_smart_wallets: listSmartWallets,

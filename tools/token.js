@@ -1,6 +1,21 @@
 const DATAPI_BASE = "https://datapi.jup.ag/v1";
 
 /**
+ * Get the narrative/story behind a token from Jupiter ChainInsight.
+ * Useful for understanding if a token has a real community/theme vs nothing.
+ */
+export async function getTokenNarrative({ mint }) {
+  const res = await fetch(`${DATAPI_BASE}/chaininsight/narrative/${mint}`);
+  if (!res.ok) throw new Error(`Narrative API error: ${res.status}`);
+  const data = await res.json();
+  return {
+    mint,
+    narrative: data.narrative || null,
+    status: data.status,
+  };
+}
+
+/**
  * Search for token data by name, symbol, or mint address.
  * Returns condensed token info useful for confidence scoring.
  */

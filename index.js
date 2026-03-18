@@ -173,10 +173,10 @@ SCREENING CYCLE — DEPLOY ONLY
 4. Call get_pool_memory for the chosen pool. If it has a bad track record (losing avg_pnl_pct, low win_rate), skip and try next candidate.
 5. Call check_smart_wallets_on_pool for the chosen pool.
    - Smart wallets present → strong confidence boost, proceed to deploy.
-   - No smart wallets → MUST call get_token_holders (use base mint from the pool) before deciding:
-     * SKIP if: top_10_real_holders_pct > 60% (dangerously concentrated) OR bundlers_pct_in_top_100 > 30% (extreme bundling)
+   - No smart wallets → MUST call get_token_holders AND get_token_narrative (use base mint from the pool) before deciding:
+     * SKIP if: top_10_real_holders_pct > 60% OR bundlers_pct_in_top_100 > 30% OR narrative is empty/null
      * CAUTION (check organic score + buy/sell pressure before deciding) if: bundlers_pct 15–30% AND top_10 > 40%
-     * DEPLOY if: distribution is healthy, organic score is high, or smart_wallets_holding shows known wallets holding the token
+     * DEPLOY if: distribution is healthy, narrative is clear and community-driven, or smart_wallets_holding shows known wallets holding the token
      * Bundlers 5–15% are normal and not a reason to skip on their own — weigh against overall token health
      * Report what you found and why you decided to deploy or skip.
 6. If the pool passes all checks: get_active_bin and deploy_position.

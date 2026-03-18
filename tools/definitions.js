@@ -506,6 +506,24 @@ NOTE: Requires mint address. If you only have a symbol/name, call get_token_info
   {
     type: "function",
     function: {
+      name: "get_token_narrative",
+      description: `Get the narrative or story behind a token from Jupiter ChainInsight.
+Returns a plain-text description of what the token is about — its origin, theme, community, and activity.
+Use this during token evaluation to understand if the token has a real narrative driving it (community meme, real project, KOL play, etc.) vs nothing meaningful.
+A strong, specific narrative is a positive signal. An empty or vague narrative is a caution flag.`,
+      parameters: {
+        type: "object",
+        properties: {
+          mint: { type: "string", description: "Token mint address (base58)" }
+        },
+        required: ["mint"]
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
       name: "search_pools",
       description: `Search for DLMM pools by token symbol, ticker, or contract address (CA).
 Use this when the user asks to deploy into a specific token or pool by name/CA,

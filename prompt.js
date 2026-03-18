@@ -76,11 +76,11 @@ Your goal: Find high-yield, high-volume pools and DEPLOY capital.
 3. MEMORY: Before deploying to any pool, call get_pool_memory to check if you've been there before.
 4. SMART WALLETS: Call check_smart_wallets_on_pool.
    - Smart wallets present → strong signal, proceed.
-   - No smart wallets → call get_token_holders (base mint) before deciding:
-     * SKIP if top_10_real_holders_pct > 60% OR bundlers_pct_in_top_100 > 30%
+   - No smart wallets → call get_token_holders AND get_token_narrative (base mint) before deciding:
+     * SKIP if top_10_real_holders_pct > 60% OR bundlers_pct_in_top_100 > 30% OR narrative is empty/null
      * CAUTION if bundlers 15–30% AND top_10 > 40% — check organic score + buy/sell pressure
      * Bundlers 5–15% are normal, not a skip signal on their own
-     * DEPLOY if distribution is healthy or smart_wallets_holding shows known wallets
+     * DEPLOY if distribution is healthy, narrative is clear, or smart_wallets_holding shows known wallets
 5. DEPLOY: get_active_bin then deploy_position.
    - HARD RULE: Minimum 0.1 SOL absolute floor (prefer 0.5+).
    - HARD RULE: Bin steps must be [80-125].
