@@ -217,8 +217,25 @@ export function getMemoryContext() {
   return lines.length ? lines.join("\n") : null;
 }
 
-export function rememberFact(nuggetName, key, value) {
-  const safeKey = upsertFact(nuggetName, key, value);
+export function rememberFact(nuggetOrPayload, keyArg, valueArg) {
+  const payload = typeof nuggetOrPayload === "object" && nuggetOrPayload !== null
+    ? {
+        nugget: nuggetOrPayload.nugget ?? nuggetOrPayload.topic ?? "facts",
+        key: nuggetOrPayload.key,
+        value: nuggetOrPayload.value,
+      }
+    : {
+        nugget: nuggetOrPayload,
+        key: keyArg,
+        value: valueArg,
+      };
+
+  if (!payload.key) {
+    return { saved: false, error: "key required" };
+  }
+
+  const nuggetName = payload.nugget || "facts";
+  const safeKey = upsertFact(nuggetName, payload.key, payload.value);
   log("memory", `Stored fact in ${nuggetName}: ${safeKey}`);
   return { saved: true, nugget: nuggetName, key: safeKey };
 }

@@ -368,13 +368,20 @@ export async function getMyPositions({ force = false } = {}) {
     for (const acc of accounts) {
       const positionAddress = acc.pubkey.toBase58();
       const lbPairKey = new PublicKey(acc.account.data.slice(8, 40)).toBase58();
-      // Pair name: use tracked state pool_name if available
       const tracked = getTrackedPosition(positionAddress);
       const pair = tracked?.pool_name || lbPairKey.slice(0, 8);
       raw.push({
         position: positionAddress,
         pool: lbPairKey,
         pair,
+        pool_name: tracked?.pool_name || null,
+        strategy: tracked?.strategy || null,
+        bin_range: tracked?.bin_range || null,
+        bin_step: tracked?.bin_step ?? null,
+        volatility: tracked?.volatility ?? null,
+        fee_tvl_ratio: tracked?.fee_tvl_ratio ?? null,
+        organic_score: tracked?.organic_score ?? null,
+        instruction: tracked?.instruction || null,
         base_mint: null, // enriched from PnL API below
         lower_bin: null,
         upper_bin: null,
@@ -417,6 +424,13 @@ export async function getMyPositions({ force = false } = {}) {
         position: r.position,
         pool: r.pool,
         pair: r.pair,
+        pool_name: r.pool_name,
+        strategy: r.strategy,
+        bin_range: r.bin_range,
+        bin_step: r.bin_step,
+        volatility: r.volatility,
+        organic_score: r.organic_score,
+        instruction: r.instruction,
         base_mint: r.base_mint,
         lower_bin: lowerBin,
         upper_bin: upperBin,
@@ -429,6 +443,9 @@ export async function getMyPositions({ force = false } = {}) {
         pnl_pct: Math.round(pnlPct * 100) / 100,
         age_minutes: ageMinutes,
         minutes_out_of_range: minutesOutOfRange(r.position),
+        fee_tvl_ratio: p?.feeActiveTvlRatio != null
+          ? Math.round(p.feeActiveTvlRatio * 10000) / 10000
+          : r.fee_tvl_ratio,
       };
     });
 
