@@ -11,15 +11,18 @@ import { evolveThresholds, getPerformanceSummary } from "./lessons.js";
 import { registerCronRestarter } from "./tools/executor.js";
 import { startPolling, stopPolling, sendMessage, sendHTML, notifyOutOfRange, isEnabled as telegramEnabled } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
-import { getLastBriefingDate, setLastBriefingDate } from "./state.js";
+import { getLastBriefingDate, setLastBriefingDate, updatePnlAndCheckExits } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
 import { recordPositionSnapshot, recallForPool } from "./pool-memory.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
 import { getTokenHolders, getTokenNarrative, getTokenInfo } from "./tools/token.js";
+import { initMemory, recallForManagement, recallForScreening } from "./memory.js";
 
 log("startup", "DLMM LP Agent starting...");
 log("startup", `Mode: ${process.env.DRY_RUN === "true" ? "DRY RUN" : "LIVE"}`);
 log("startup", `Model: ${process.env.LLM_MODEL || "hermes-3-405b"}`);
+
+initMemory();
 
 const TP_PCT  = config.management.takeProfitFeePct;
 const DEPLOY  = config.management.deployAmountSol;
@@ -120,8 +123,25 @@ export function startCronJobs() {
         recordPositionSnapshot(p.pool, p);
         const pnl = await getPositionPnl({ pool_address: p.pool, position_address: p.position }).catch(() => null);
         const recall = recallForPool(p.pool);
-        return { ...p, pnl, recall };
+        const enriched = {
+          ...p,
+          pnl_pct: pnl?.pnl_pct ?? p.pnl_pct,
+          unclaimed_fees_usd: pnl?.unclaimed_fee_usd ?? p.unclaimed_fees_usd,
+          fee_tvl_ratio: pnl?.fee_active_tvl_ratio ?? p.fee_tvl_ratio,
+        };
+        const memoryHits = recallForManagement(enriched);
+        const memoryRecall = memoryHits.length
+          ? memoryHits.map((hit) => `[${hit.source}] ${hit.key}: ${hit.answer}`).join(" | ")
+          : null;
+        const exitAlert = pnl?.pnl_pct != null
+          ? updatePnlAndCheckExits(p.position, pnl.pnl_pct, config)
+          : null;
+        return { ...enriched, pnl, recall, memoryRecall, exitAlert };
       }));
+
+      const exitAlerts = positionData
+        .filter((p) => p.exitAlert)
+        .map((p) => `- ${p.pair}: ${p.exitAlert}`);
 
       // Build pre-loaded position blocks for the LLM
       const positionBlocks = positionData.map((p) => {
@@ -132,7 +152,9 @@ export function startCronJobs() {
           `  age: ${p.age_minutes ?? "?"}m | in_range: ${p.in_range} | oor_minutes: ${p.minutes_out_of_range ?? 0}`,
           pnl ? `  pnl_pct: ${pnl.pnl_pct}% | pnl_usd: $${pnl.pnl_usd} | unclaimed_fees: $${pnl.unclaimed_fee_usd} | claimed_fees: $${Math.max(0, (pnl.all_time_fees_usd || 0) - (pnl.unclaimed_fee_usd || 0)).toFixed(2)} | value: $${pnl.current_value_usd}` : `  pnl: fetch failed`,
           p.instruction ? `  instruction: "${p.instruction}"` : null,
-          p.recall ? `  memory: ${p.recall}` : null,
+          p.exitAlert ? `  exit_alert: ${p.exitAlert}` : null,
+          p.recall ? `  pool_memory: ${p.recall}` : null,
+          p.memoryRecall ? `  learned_memory: ${p.memoryRecall}` : null,
         ].filter(Boolean);
         return lines.join("\n");
       }).join("\n\n");
@@ -143,7 +165,10 @@ MANAGEMENT CYCLE — ${positions.length} position(s)
 PRE-LOADED POSITION DATA (no fetching needed):
 ${positionBlocks}
 
-HARD CLOSE RULES — apply in order, first match wins:
+${exitAlerts.length ? `AUTOMATIC EXIT ALERTS (highest priority — close these immediately):
+${exitAlerts.join("\n")}
+
+` : ""}HARD CLOSE RULES — apply in order, first match wins:
 1. instruction set AND condition met → CLOSE (highest priority)
 2. instruction set AND condition NOT met → HOLD, skip remaining rules
 3. pnl_pct <= ${config.management.emergencyPriceDropPct}% → CLOSE (stop loss)
@@ -237,6 +262,15 @@ REPORT FORMAT (one per position):
           const n    = narrative.status === "fulfilled" ? narrative.value : null;
           const ti   = tokenInfo.status === "fulfilled" ? tokenInfo.value?.results?.[0] : null;
           const mem  = poolMemory.value;
+          const memoryHits = recallForScreening({
+            name: pool.name,
+            pair: pool.name,
+            base_token: mint,
+            bin_step: pool.bin_step,
+          });
+          const learnedMemory = memoryHits.length
+            ? memoryHits.map((hit) => `[${hit.source}] ${hit.key}: ${hit.answer}`).join(" | ")
+            : null;
 
           const momentum = ti?.stats_1h
             ? `1h: price${ti.stats_1h.price_change >= 0 ? "+" : ""}${ti.stats_1h.price_change}%, buyers=${ti.stats_1h.buyers}, net_buyers=${ti.stats_1h.net_buyers}`
@@ -250,7 +284,8 @@ REPORT FORMAT (one per position):
             h ? `  holders: top_10_pct=${h.top_10_real_holders_pct ?? "?"}%, bundlers_pct=${h.bundlers_pct_in_top_100 ?? "?"}%, global_fees_sol=${h.global_fees_sol ?? "?"}` : `  holders: fetch failed`,
             momentum ? `  momentum: ${momentum}` : null,
             n?.narrative ? `  narrative: ${n.narrative.slice(0, 500)}` : `  narrative: none`,
-            mem ? `  memory: ${mem}` : null,
+            mem ? `  pool_memory: ${mem}` : null,
+            learnedMemory ? `  learned_memory: ${learnedMemory}` : null,
           ].filter(Boolean);
 
           return lines.join("\n");

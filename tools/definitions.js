@@ -369,11 +369,18 @@ Changes persist to user-config.json and take effect immediately — no restart n
 
 VALID KEYS (use EXACTLY these key names, nothing else):
 Screening: minFeeActiveTvlRatio, minTvl, maxTvl, minVolume, minOrganic, minHolders, minMcap, maxMcap, minBinStep, maxBinStep, timeframe, category, minTokenFeesSol
-Management: minClaimAmount, outOfRangeBinsToClose, outOfRangeWaitMinutes, minVolumeToRebalance, emergencyPriceDropPct, takeProfitFeePct, minSolToOpen, deployAmountSol, gasReserve, positionSizePct
+Management: minClaimAmount, outOfRangeBinsToClose, outOfRangeWaitMinutes, minVolumeToRebalance, emergencyPriceDropPct, stopLossPct, takeProfitFeePct, trailingTakeProfit, trailingTriggerPct, trailingDropPct, minSolToOpen, deployAmountSol, gasReserve, positionSizePct
 Risk: maxPositions, maxDeployAmount
 Schedule: managementIntervalMin, screeningIntervalMin
 Models: managementModel, screeningModel, generalModel
 Strategy: binsBelow
+
+Examples:
+- { takeProfitFeePct: 8 }        — raise the fixed take-profit target
+- { stopLossPct: -15 }           — tighten downside protection
+- { trailingTakeProfit: true }   — enable trailing exits
+- { trailingTriggerPct: 5 }      — only arm trailing after +5%
+- { trailingDropPct: 2 }         — close after a 2% pullback from peak
 
 Reason is optional but helpful — logged as a lesson when provided.`,
       parameters: {
@@ -628,6 +635,26 @@ Use this before deploying into a new pool to:
   {
     type: "function",
     function: {
+      name: "get_pool_info",
+      description: `Get deep pool intelligence from LP Agent API — token audit, fee trends, holder concentration, and trading flow.
+Use this for extra due diligence before deploying or when you need richer context than get_pool_detail provides.
+Rate limited to 5 calls per minute. Results are also saved into long-term memory for later recall.`,
+      parameters: {
+        type: "object",
+        properties: {
+          pool_address: {
+            type: "string",
+            description: "Pool address to inspect"
+          }
+        },
+        required: ["pool_address"]
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
       name: "clear_lessons",
       description: `Remove lessons from memory. Use when the user asks to erase lessons, or when lessons contain bad data (e.g. bug-caused -100% PnL records).
 
@@ -721,6 +748,41 @@ Examples:
           }
         },
         required: ["rule"]
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "remember_fact",
+      description: `Store a fact in long-term memory for cross-session recall.
+Use this to remember pool outcomes, strategy patterns, timing effects, or any other information worth reusing later.`,
+      parameters: {
+        type: "object",
+        properties: {
+          nugget: { type: "string", description: "Memory category, e.g. pools, strategies, lessons, patterns" },
+          key: { type: "string", description: "Short descriptive key for this fact" },
+          value: { type: "string", description: "What should be remembered" }
+        },
+        required: ["nugget", "key", "value"]
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "recall_memory",
+      description: `Query long-term memory for relevant facts from prior sessions.
+Supports fuzzy matching, so you can search by related pool name, strategy, pattern, or concept.`,
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "What to search for in memory" },
+          nugget: { type: "string", description: "Optional memory category to search within" }
+        },
+        required: ["query"]
       }
     }
   },

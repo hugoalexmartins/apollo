@@ -11,7 +11,7 @@
  */
 import { config } from "./config.js";
 
-export function buildSystemPrompt(agentType, portfolio, positions, stateSummary = null, lessons = null, perfSummary = null) {
+export function buildSystemPrompt(agentType, portfolio, positions, stateSummary = null, lessons = null, perfSummary = null, memoryContext = null) {
   const s = config.screening;
 
   let basePrompt = `You are an autonomous DLMM LP (Liquidity Provider) agent operating on Meteora, Solana.
@@ -36,6 +36,11 @@ ${lessons ? `══════════════════════�
  LESSONS LEARNED
 ═══════════════════════════════════════════
 ${lessons}` : ""}
+
+${memoryContext ? `═══════════════════════════════════════════
+ HOLOGRAPHIC MEMORY
+═══════════════════════════════════════════
+${memoryContext}` : ""}
 
 ═══════════════════════════════════════════
  BEHAVIORAL CORE
@@ -96,6 +101,11 @@ Your goal: Find high-yield, high-volume pools and DEPLOY capital.
 Your goal: Manage positions to maximize total Fee + PnL yield.
 
 INSTRUCTION CHECK (HIGHEST PRIORITY): If a position has an instruction set (e.g. "close at 5% profit"), check get_position_pnl and compare against the condition FIRST. If the condition IS MET → close immediately. No further analysis, no hesitation. BIAS TO HOLD does NOT apply when an instruction condition is met.
+
+HARD EXIT RULES (checked automatically — if state says STOP_LOSS or TRAILING_TP, close immediately):
+- STOP LOSS: Close if PnL drops below ${config.management.stopLossPct}%.
+- TRAILING TAKE PROFIT: Once PnL reaches +${config.management.trailingTriggerPct}%, trailing mode activates. If PnL then drops ${config.management.trailingDropPct}% from peak, close and lock in profit.
+- FIXED TAKE PROFIT: Close when fees earned >= ${config.management.takeProfitFeePct}% of deployed capital.
 
 BIAS TO HOLD: Unless an instruction fires, a pool is dying, volume has collapsed, or yield has vanished, hold.
 

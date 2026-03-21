@@ -117,6 +117,121 @@ export async function studyTopLPers({ pool_address, limit = 4 }) {
   };
 }
 
+const _lpagentCalls = [];
+
+function checkRateLimit() {
+  const now = Date.now();
+  while (_lpagentCalls.length > 0 && now - _lpagentCalls[0] > 60_000) {
+    _lpagentCalls.shift();
+  }
+  if (_lpagentCalls.length >= 5) {
+    const waitSec = Math.ceil((60_000 - (now - _lpagentCalls[0])) / 1000);
+    return { allowed: false, waitSec };
+  }
+  _lpagentCalls.push(now);
+  return { allowed: true };
+}
+
+export async function getPoolInfo({ pool_address }) {
+  if (!LPAGENT_KEY) {
+    return { error: "LPAGENT_API_KEY not set — get_pool_info is disabled." };
+  }
+
+  const rateCheck = checkRateLimit();
+  if (!rateCheck.allowed) {
+    return { error: `Rate limited (5/min). Try again in ${rateCheck.waitSec}s.` };
+  }
+
+  const res = await fetch(
+    `${LPAGENT_API}/pools/${pool_address}/info`,
+    { headers: { "x-api-key": LPAGENT_KEY } }
+  );
+
+  if (!res.ok) {
+    if (res.status === 429) return { error: "Rate limited by LP Agent API. Wait 60s." };
+    throw new Error(`Pool info API error: ${res.status}`);
+  }
+
+  const raw = await res.json();
+  const d = raw.data;
+  if (!d) return { error: "No data returned for this pool." };
+
+  const tokens = d.tokenInfo?.[0]?.data || [];
+  const tokenX = tokens[0] || {};
+  const tokenY = tokens[1] || {};
+  const feeInfo = d.feeInfo || {};
+
+  const result = {
+    pool: pool_address,
+    type: d.type,
+    token_x: {
+      symbol: tokenX.symbol,
+      name: tokenX.name,
+      mcap: tokenX.mcap,
+      fdv: tokenX.fdv,
+      price_usd: tokenX.usdPrice,
+      organic_score: tokenX.organicScore,
+      holders: tokenX.holderCount,
+      mint_disabled: tokenX.audit?.mintAuthorityDisabled,
+      freeze_disabled: tokenX.audit?.freezeAuthorityDisabled,
+      top_holders_pct: tokenX.audit?.topHoldersPercentage,
+      bot_holders_pct: tokenX.audit?.botHoldersPercentage,
+      dev_balance_pct: tokenX.audit?.devBalancePercentage,
+      dev_migrations: tokenX.audit?.devMigrations,
+      cto: tokenX.cto,
+      tags: tokenX.tags,
+    },
+    token_y: {
+      symbol: tokenY.symbol,
+      name: tokenY.name,
+    },
+    amount_x: d.amountX,
+    amount_y: d.amountY,
+    fees: {
+      base_fee_pct: feeInfo.baseFeeRatePercentage,
+      max_fee_pct: feeInfo.maxFeeRatePercentage,
+      dynamic_fee: feeInfo.dynamicFee,
+    },
+    stats_5m: tokenX.stats5m ? {
+      price_change: tokenX.stats5m.priceChange,
+      buy_volume: tokenX.stats5m.buyVolume,
+      sell_volume: tokenX.stats5m.sellVolume,
+      num_buys: tokenX.stats5m.numBuys,
+      num_sells: tokenX.stats5m.numSells,
+      num_traders: tokenX.stats5m.numTraders,
+      organic_buy_ratio: tokenX.stats5m.numOrganicBuyers / (tokenX.stats5m.numTraders || 1),
+    } : null,
+    stats_1h: tokenX.stats1h ? {
+      price_change: tokenX.stats1h.priceChange,
+      buy_volume: tokenX.stats1h.buyVolume,
+      sell_volume: tokenX.stats1h.sellVolume,
+      num_traders: tokenX.stats1h.numTraders,
+    } : null,
+    fee_trend_7d: (d.feeStats || []).slice(-24).map((hour) => ({
+      hour: hour.hour,
+      fee_usd: hour.feeUsd,
+    })),
+  };
+
+  try {
+    const { rememberFact } = await import("../memory.js");
+    const pair = `${tokenX.symbol || "?"}-${tokenY.symbol || "SOL"}`;
+    const safety = [
+      tokenX.audit?.mintAuthorityDisabled ? "mint-off" : "MINT-ON",
+      tokenX.audit?.freezeAuthorityDisabled ? "freeze-off" : "FREEZE-ON",
+      `${(tokenX.audit?.botHoldersPercentage || 0).toFixed(0)}% bots`,
+      `${(tokenX.audit?.topHoldersPercentage || 0).toFixed(0)}% top holders`,
+      `organic ${(tokenX.organicScore || 0).toFixed(0)}`,
+      `${tokenX.holderCount || 0} holders`,
+    ].join(", ");
+    rememberFact("pools", `${pair}_audit`, safety);
+  } catch {
+    // best-effort only
+  }
+
+  return result;
+}
+
 function avg(arr) {
   if (!arr.length) return null;
   return Math.round((arr.reduce((s, x) => s + x, 0) / arr.length) * 100) / 100;

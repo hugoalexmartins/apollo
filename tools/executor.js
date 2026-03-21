@@ -10,10 +10,11 @@ import {
   searchPools,
 } from "./dlmm.js";
 import { getWalletBalances, swapToken } from "./wallet.js";
-import { studyTopLPers } from "./study.js";
+import { getPoolInfo, studyTopLPers } from "./study.js";
 import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, pinLesson, unpinLesson, listLessons } from "../lessons.js";
 import { setPositionInstruction } from "../state.js";
 import { getPoolMemory, addPoolNote } from "../pool-memory.js";
+import { rememberFact, recallMemory } from "../memory.js";
 import { addStrategy, listStrategies, getStrategy, setActiveStrategy, removeStrategy } from "../strategy-library.js";
 import { addToBlacklist, removeFromBlacklist, listBlacklist } from "../token-blacklist.js";
 import { addSmartWallet, removeSmartWallet, listSmartWallets, checkSmartWalletsOnPool } from "../smart-wallets.js";
@@ -57,6 +58,7 @@ const toolMap = {
   swap_token: swapToken,
   get_top_lpers: studyTopLPers,
   study_top_lpers: studyTopLPers,
+  get_pool_info: getPoolInfo,
   set_position_note: ({ position_address, instruction }) => {
     const ok = setPositionInstruction(position_address, instruction || null);
     if (!ok) return { error: `Position ${position_address} not found in state` };
@@ -98,6 +100,8 @@ const toolMap = {
     addLesson(rule, tags || [], { pinned: !!pinned, role: role || null });
     return { saved: true, rule, pinned: !!pinned, role: role || "all" };
   },
+  remember_fact: ({ nugget, key, value }) => rememberFact(nugget, key, value),
+  recall_memory: ({ query, nugget }) => recallMemory(query, nugget),
   pin_lesson:   ({ id }) => pinLesson(id),
   unpin_lesson: ({ id }) => unpinLesson(id),
   list_lessons: ({ role, pinned, tag, limit } = {}) => listLessons({ role, pinned, tag, limit }),
@@ -144,7 +148,11 @@ const toolMap = {
       outOfRangeWaitMinutes: ["management", "outOfRangeWaitMinutes"],
       minVolumeToRebalance: ["management", "minVolumeToRebalance"],
       emergencyPriceDropPct: ["management", "emergencyPriceDropPct"],
+      stopLossPct: ["management", "stopLossPct"],
       takeProfitFeePct: ["management", "takeProfitFeePct"],
+      trailingTakeProfit: ["management", "trailingTakeProfit"],
+      trailingTriggerPct: ["management", "trailingTriggerPct"],
+      trailingDropPct: ["management", "trailingDropPct"],
       minSolToOpen: ["management", "minSolToOpen"],
       deployAmountSol: ["management", "deployAmountSol"],
       gasReserve: ["management", "gasReserve"],

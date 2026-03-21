@@ -47,7 +47,11 @@ export const config = {
     outOfRangeWaitMinutes: u.outOfRangeWaitMinutes ?? 30,
     minVolumeToRebalance:  u.minVolumeToRebalance  ?? 1000,
     emergencyPriceDropPct: u.emergencyPriceDropPct ?? -50,
+    stopLossPct:           u.stopLossPct           ?? -20,
     takeProfitFeePct:      u.takeProfitFeePct      ?? 5,
+    trailingTakeProfit:    u.trailingTakeProfit    ?? true,
+    trailingTriggerPct:    u.trailingTriggerPct    ?? 3,
+    trailingDropPct:       u.trailingDropPct       ?? 1.5,
     minSolToOpen:          u.minSolToOpen          ?? 0.55,
     deployAmountSol:       u.deployAmountSol       ?? 0.5,
     gasReserve:            u.gasReserve            ?? 0.2,
@@ -132,4 +136,3 @@ export function reloadScreeningThresholds() {
     if (fresh.category       != null) s.category       = fresh.category;
   } catch { /* ignore */ }
 }
-

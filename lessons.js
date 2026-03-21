@@ -105,6 +105,20 @@ export async function recordPerformance(perf) {
     });
   }
 
+  // Mirror generalized strategy outcomes into fuzzy memory.
+  try {
+    const { rememberStrategy } = await import("./memory.js");
+    const outcome = pnl_pct >= 0 ? "profitable" : "unprofitable";
+    if (perf.strategy && perf.bin_step != null) {
+      rememberStrategy(
+        `${perf.strategy}_bs${perf.bin_step}`,
+        `${outcome}, PnL ${pnl_pct.toFixed(1)}%, vol=${perf.volatility}, fee_tvl=${perf.fee_tvl_ratio}`
+      );
+    }
+  } catch (error) {
+    log("memory", `Failed to mirror lesson into memory: ${error.message}`);
+  }
+
   // Evolve thresholds every 5 closed positions
   if (data.performance.length % MIN_EVOLVE_POSITIONS === 0) {
     const { config, reloadScreeningThresholds } = await import("./config.js");
