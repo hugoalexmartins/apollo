@@ -11,12 +11,12 @@ import { evolveThresholds, getPerformanceSummary } from "./lessons.js";
 import { executeTool, registerCronRestarter } from "./tools/executor.js";
 import { startPolling, stopPolling, sendMessage, sendHTML, notifyOutOfRange, isEnabled as telegramEnabled } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
-import { getLastBriefingDate, setLastBriefingDate, updatePnlAndCheckExits } from "./state.js";
+import { getLastBriefingDate, getTrackedPosition, recordCycleEvaluation, setLastBriefingDate, updatePnlAndCheckExits } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
 import { recordPositionSnapshot, recallForPool } from "./pool-memory.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
 import { getTokenHolders, getTokenNarrative, getTokenInfo } from "./tools/token.js";
-import { initMemory, recallForManagement, recallForScreening } from "./memory.js";
+import { getWalletScoreMemory, initMemory, recallForManagement, recallForScreening } from "./memory.js";
 
 log("startup", "DLMM LP Agent starting...");
 log("startup", `Mode: ${process.env.DRY_RUN === "true" ? "DRY RUN" : "LIVE"}`);
@@ -131,6 +131,103 @@ function formatPlannerContext(distributionPlan, tierPlan) {
     `alloc=${alloc}`,
     `bins=${asNumber(tiers.bins_below, 0)}/${asNumber(tiers.bins_above, 0)}`,
   ].join(" | ");
+}
+
+function hasUsableNarrative(narrativeResult) {
+  const text = narrativeResult?.narrative;
+  return typeof text === "string" && text.trim().length >= 20;
+}
+
+function evaluateCandidateIntel(pool, {
+  smartWallets,
+  holders,
+  narrative,
+  scoredLpers,
+}) {
+  const smartWalletCount = smartWallets?.in_pool?.length ?? 0;
+  const top10Pct = asNumber(holders?.top_10_real_holders_pct, 0);
+  const bundlersPct = asNumber(holders?.bundlers_pct_in_top_100, 0);
+  const globalFeesSol = asNumber(holders?.global_fees_sol, 0);
+  const lpWalletTopScore = asNumber(scoredLpers?.candidates?.[0]?.score_breakdown?.total_score, 0);
+  const hardBlocks = [];
+
+  if (holders && globalFeesSol < config.screening.minTokenFeesSol) {
+    hardBlocks.push(`global_fees_sol ${globalFeesSol.toFixed(2)} < ${config.screening.minTokenFeesSol}`);
+  }
+  if (holders && top10Pct > config.screening.maxTop10Pct) {
+    hardBlocks.push(`top_10_pct ${top10Pct.toFixed(1)} > ${config.screening.maxTop10Pct}`);
+  }
+  if (holders && bundlersPct > config.screening.maxBundlersPct) {
+    hardBlocks.push(`bundlers_pct ${bundlersPct.toFixed(1)} > ${config.screening.maxBundlersPct}`);
+  }
+  if (smartWalletCount === 0 && !hasUsableNarrative(narrative)) {
+    hardBlocks.push("missing_specific_narrative_without_smart_wallets");
+  }
+
+  const bonusBreakdown = {
+    smart_wallet_bonus: roundMetric(Math.min(12, smartWalletCount * 4)),
+    lp_wallet_bonus: roundMetric(Math.min(10, lpWalletTopScore / 10)),
+    narrative_bonus: hasUsableNarrative(narrative) ? 4 : 0,
+  };
+  const walletScoreMessage = scoredLpers?.message || null;
+  const walletScoreAgeMatch = walletScoreMessage?.match(/from\s+(\d+)\s+minute/);
+
+  return {
+    hard_blocked: hardBlocks.length > 0,
+    hard_blocks: hardBlocks,
+    smart_wallet_count: smartWalletCount,
+    holder_metrics: holders
+      ? {
+          top_10_pct: roundMetric(top10Pct),
+          bundlers_pct: roundMetric(bundlersPct),
+          global_fees_sol: roundMetric(globalFeesSol),
+        }
+      : null,
+    score: {
+      ranking_score: roundMetric(pool.deterministic_score || 0),
+      context_score: roundMetric((pool.deterministic_score || 0) + Object.values(bonusBreakdown).reduce((sum, value) => sum + value, 0)),
+      bonus_breakdown: bonusBreakdown,
+    },
+    wallet_score_source: walletScoreMessage?.includes("reused wallet-score memory") ? "memory_cache" : "live_or_not_preloaded",
+    wallet_score_age_minutes: walletScoreAgeMatch ? Number(walletScoreAgeMatch[1]) : null,
+  };
+}
+
+function roundMetric(value) {
+  return Number(Number(value || 0).toFixed(2));
+}
+
+function truncatePromptText(value, maxLength) {
+  if (typeof value !== "string") return null;
+  const normalized = value.replace(/\s+/g, " ").trim();
+  if (!normalized) return null;
+  if (normalized.length <= maxLength) return normalized;
+  return `${normalized.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
+}
+
+function resolveTargetManagementInterval(positions) {
+  const maxVolatility = positions.reduce((max, position) => {
+    const tracked = getTrackedPosition(position.position);
+    const candidate = Number(position.volatility ?? tracked?.volatility ?? 0);
+    return Number.isFinite(candidate) ? Math.max(max, candidate) : max;
+  }, 0);
+
+  const interval = maxVolatility >= 5 ? 3 : maxVolatility >= 2 ? 5 : 10;
+  return { interval, maxVolatility: roundMetric(maxVolatility) };
+}
+
+function enforceManagementIntervalFromPositions(positions) {
+  const { interval, maxVolatility } = resolveTargetManagementInterval(positions);
+  if (config.schedule.managementIntervalMin === interval) {
+    return { changed: false, interval, maxVolatility };
+  }
+
+  const previous = config.schedule.managementIntervalMin;
+  config.schedule.managementIntervalMin = interval;
+  log("cron", `Management interval adjusted ${previous}m -> ${interval}m (max open-position volatility: ${maxVolatility})`);
+
+  if (cronStarted) startCronJobs();
+  return { changed: true, interval, maxVolatility };
 }
 
 function shouldSkipManagedRuntimeAction(position) {
@@ -256,14 +353,29 @@ export function startCronJobs() {
     timers.managementLastRun = Date.now();
     log("cron", `Starting management cycle [model: ${config.llm.managementModel}]`);
     let mgmtReport = null;
+    let managementEvaluation = null;
     let positions = [];
     try {
       // Pre-load all positions + PnL in parallel — LLM gets everything, no fetch steps needed
       const livePositions = await getMyPositions().catch(() => null);
       positions = livePositions?.positions || [];
+      const intervalAdjustment = enforceManagementIntervalFromPositions(positions);
 
       if (positions.length === 0) {
         log("cron", "No open positions — triggering screening cycle");
+        managementEvaluation = {
+          cycle_type: "management",
+          status: "empty_positions",
+          summary: {
+            positions_total: 0,
+            pending_positions: 0,
+            runtime_actions_handled: 0,
+            runtime_actions_attempted: 0,
+            enforced_management_interval_min: intervalAdjustment.interval,
+            max_open_position_volatility: intervalAdjustment.maxVolatility,
+          },
+          positions: [],
+        };
         runScreeningCycle().catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
         return;
       }
@@ -333,6 +445,25 @@ export function startCronJobs() {
 
       if (pendingPositionData.length === 0) {
         mgmtReport = `RUNTIME ACTIONS ALREADY EXECUTED\n${handledRuntimeActionBlock}\n\nNo remaining positions required manager write decisions this cycle.`;
+        managementEvaluation = {
+          cycle_type: "management",
+          status: "runtime_only",
+          summary: {
+            positions_total: positions.length,
+            pending_positions: 0,
+            runtime_actions_handled: handledRuntimeActions.length,
+            runtime_actions_attempted: attemptedRuntimeActions.length,
+            enforced_management_interval_min: intervalAdjustment.interval,
+            max_open_position_volatility: intervalAdjustment.maxVolatility,
+          },
+          positions: positionData.slice(0, 8).map((p) => ({
+            pair: p.pair,
+            position: p.position,
+            in_range: p.in_range,
+            unclaimed_fee_usd: roundMetric(p.pnl?.unclaimed_fee_usd ?? p.unclaimed_fees_usd),
+            exit_alert: p.exitAlert || null,
+          })),
+        };
         return;
       }
 
@@ -391,10 +522,41 @@ REPORT FORMAT (one per position):
       mgmtReport = runtimeActions.length > 0
         ? `RUNTIME ACTIONS ALREADY EXECUTED\n${handledRuntimeActionBlock}\n\nRUNTIME WRITE ATTEMPTS NOT COMPLETED\n${attemptedRuntimeActionBlock}\n\n${content}`
         : content;
+      managementEvaluation = {
+        cycle_type: "management",
+        status: "completed",
+        summary: {
+          positions_total: positions.length,
+            pending_positions: pendingPositionData.length,
+            runtime_actions_handled: handledRuntimeActions.length,
+            runtime_actions_attempted: attemptedRuntimeActions.length,
+            exit_alerts: pendingExitAlerts.length,
+            enforced_management_interval_min: intervalAdjustment.interval,
+            max_open_position_volatility: intervalAdjustment.maxVolatility,
+          },
+        positions: pendingPositionData.slice(0, 8).map((p) => ({
+          pair: p.pair,
+          position: p.position,
+          in_range: p.in_range,
+          unclaimed_fee_usd: roundMetric(p.pnl?.unclaimed_fee_usd ?? p.unclaimed_fees_usd),
+          exit_alert: p.exitAlert || null,
+          memory_hits: p.memoryRecall ? 1 : 0,
+        })),
+      };
     } catch (error) {
       log("cron_error", `Management cycle failed: ${error.message}`);
       mgmtReport = `Management cycle failed: ${error.message}`;
+      managementEvaluation = {
+        cycle_type: "management",
+        status: "failed",
+        summary: {
+          positions_total: positions.length,
+          error: error.message,
+        },
+        positions: [],
+      };
     } finally {
+      if (managementEvaluation) recordCycleEvaluation(managementEvaluation);
       _managementBusy = false;
       if (telegramEnabled()) {
         if (mgmtReport) sendMessage(`🔄 Management Cycle\n\n${mgmtReport}`).catch(() => {});
@@ -416,15 +578,39 @@ REPORT FORMAT (one per position):
       [prePositions, preBalance] = await Promise.all([getMyPositions(), getWalletBalances()]);
       if (prePositions.total_positions >= config.risk.maxPositions) {
         log("cron", `Screening skipped — max positions reached (${prePositions.total_positions}/${config.risk.maxPositions})`);
+        recordCycleEvaluation({
+          cycle_type: "screening",
+          status: "skipped_max_positions",
+          summary: {
+            total_positions: prePositions.total_positions,
+            max_positions: config.risk.maxPositions,
+          },
+          candidates: [],
+        });
         return;
       }
       const minRequired = config.management.deployAmountSol + config.management.gasReserve;
       if (preBalance.sol < minRequired) {
         log("cron", `Screening skipped — insufficient SOL (${preBalance.sol.toFixed(3)} < ${minRequired} needed for deploy + gas)`);
+        recordCycleEvaluation({
+          cycle_type: "screening",
+          status: "skipped_insufficient_balance",
+          summary: {
+            wallet_sol: roundMetric(preBalance.sol),
+            min_required_sol: roundMetric(minRequired),
+          },
+          candidates: [],
+        });
         return;
       }
     } catch (e) {
       log("cron_error", `Screening pre-check failed: ${e.message}`);
+      recordCycleEvaluation({
+        cycle_type: "screening",
+        status: "failed_precheck",
+        summary: { error: e.message },
+        candidates: [],
+      });
       return;
     }
 
@@ -432,6 +618,9 @@ REPORT FORMAT (one per position):
     timers.screeningLastRun = Date.now();
     log("cron", `Starting screening cycle [model: ${config.llm.screeningModel}]`);
     let screenReport = null;
+    let screeningEvaluation = null;
+    let screeningTopCandidates = null;
+    let candidateEvaluations = [];
     try {
       // Reuse pre-fetched balance — no extra RPC call needed
       const currentBalance = preBalance;
@@ -445,17 +634,30 @@ REPORT FORMAT (one per position):
         : `No active strategy — use default bid_ask, bins_above: 0, SOL only.`;
 
       // Pre-load top candidates + all recon data in parallel (saves 4-6 LLM steps)
-      const topCandidates = await getTopCandidates({ limit: 5 }).catch(() => null);
-      const candidates = topCandidates?.candidates || topCandidates?.pools || [];
+      screeningTopCandidates = await getTopCandidates({ limit: 5 }).catch(() => null);
+      const candidates = screeningTopCandidates?.candidates || screeningTopCandidates?.pools || [];
+      const totalEligible = screeningTopCandidates?.total_eligible ?? candidates.length;
+      const blockedSummary = screeningTopCandidates?.blocked_summary || {};
 
       const scorePreloadLimit = Math.min(2, candidates.length);
       const preloadedLpScores = new Map();
       for (const pool of candidates.slice(0, scorePreloadLimit)) {
-        const scoreResult = await executeTool("score_top_lpers", { pool_address: pool.pool, limit: 4 });
+        const cachedScore = getWalletScoreMemory(pool.pool);
+        const scoreResult = cachedScore.found && (cachedScore.age_minutes == null || cachedScore.age_minutes <= 360)
+          ? {
+              message: `reused wallet-score memory from ${cachedScore.age_minutes ?? 0} minute(s) ago`,
+              candidates: cachedScore.scored_wallets || [],
+              source_status: {
+                lpagent: { status: "cached_memory" },
+                dune: { status: "cached_memory" },
+              },
+            }
+          : await executeTool("score_top_lpers", { pool_address: pool.pool, limit: 4 });
         preloadedLpScores.set(pool.pool, scoreResult);
       }
 
       const candidateBlocks = [];
+      candidateEvaluations = [];
       for (const pool of candidates.slice(0, 5)) {
         const mint = pool.base?.mint;
         const planningPoolData = {
@@ -496,6 +698,12 @@ REPORT FORMAT (one per position):
           };
           const planner = distributionPlan.status === "fulfilled" ? distributionPlan.value : null;
           const tiering = tierPlan.status === "fulfilled" ? tierPlan.value : null;
+          const candidateIntel = evaluateCandidateIntel(pool, {
+            smartWallets: sw,
+            holders: h,
+            narrative: n,
+            scoredLpers,
+          });
           const memoryHits = recallForScreening({
             name: pool.name,
             pair: pool.name,
@@ -509,21 +717,45 @@ REPORT FORMAT (one per position):
           const momentum = ti?.stats_1h
             ? `1h: price${ti.stats_1h.price_change >= 0 ? "+" : ""}${ti.stats_1h.price_change}%, buyers=${ti.stats_1h.buyers}, net_buyers=${ti.stats_1h.net_buyers}`
             : null;
+          const smartWalletCount = sw?.in_pool?.length ?? 0;
+          const smartWalletLine = smartWalletCount
+            ? `  smart_wallets: ${smartWalletCount} present → CONFIDENCE BOOST (${sw.in_pool.map(w => w.name).join(", ")})`
+            : null;
+          const holderLine = h
+            ? `  holders: top_10_pct=${h.top_10_real_holders_pct ?? "?"}%, bundlers_pct=${h.bundlers_pct_in_top_100 ?? "?"}%, global_fees_sol=${h.global_fees_sol ?? "?"}`
+            : null;
+          const narrativeLine = truncatePromptText(n?.narrative, 200);
+          const poolMemoryLine = truncatePromptText(mem, 140);
+          const learnedMemoryLine = truncatePromptText(learnedMemory, 140);
 
           // Build compact block
           const lines = [
             `POOL: ${pool.name} (${pool.pool})`,
-            `  metrics: bin_step=${pool.bin_step}, fee_pct=${pool.fee_pct}%, fee_tvl=${pool.fee_active_tvl_ratio}, vol=$${pool.volume_window}, tvl=$${pool.active_tvl}, volatility=${pool.volatility}, mcap=$${pool.mcap}, organic=${pool.organic_score}`,
-            `  smart_wallets: ${sw?.in_pool?.length ?? 0} present${sw?.in_pool?.length ? ` → CONFIDENCE BOOST (${sw.in_pool.map(w => w.name).join(", ")})` : ""}`,
-            h ? `  holders: top_10_pct=${h.top_10_real_holders_pct ?? "?"}%, bundlers_pct=${h.bundlers_pct_in_top_100 ?? "?"}%, global_fees_sol=${h.global_fees_sol ?? "?"}` : `  holders: fetch failed`,
+            `  metrics: bin_step=${pool.bin_step}, fee_tvl=${pool.fee_active_tvl_ratio}, vol=$${pool.volume_window}, tvl=$${pool.active_tvl}, organic=${pool.organic_score}`,
+            `  ranking_score: ${roundMetric(pool.deterministic_score)} | context_score: ${candidateIntel.score.context_score}`,
+            `  hard_gate: ${candidateIntel.hard_blocked ? `BLOCKED (${candidateIntel.hard_blocks.join(", ")})` : "pass"}`,
+            smartWalletLine,
+            holderLine,
             momentum ? `  momentum: ${momentum}` : null,
-            n?.narrative ? `  narrative: ${n.narrative.slice(0, 500)}` : `  narrative: none`,
+            narrativeLine ? `  narrative: ${narrativeLine}` : null,
             `  lp_wallet_scoring: ${formatLpWalletScore(scoredLpers)}`,
             `  planner: ${formatPlannerContext(planner, tiering)}`,
-            mem ? `  pool_memory: ${mem}` : null,
-            learnedMemory ? `  learned_memory: ${learnedMemory}` : null,
+            poolMemoryLine ? `  pool_memory: ${poolMemoryLine}` : null,
+            learnedMemoryLine ? `  learned_memory: ${learnedMemoryLine}` : null,
           ].filter(Boolean);
 
+          candidateEvaluations.push({
+            pool: pool.pool,
+            name: pool.name,
+            ranking_score: candidateIntel.score.ranking_score,
+            context_score: candidateIntel.score.context_score,
+            hard_blocked: candidateIntel.hard_blocked,
+            hard_blocks: candidateIntel.hard_blocks,
+            smart_wallet_count: candidateIntel.smart_wallet_count,
+            holder_metrics: candidateIntel.holder_metrics,
+            wallet_score_source: candidateIntel.wallet_score_source,
+            wallet_score_age_minutes: candidateIntel.wallet_score_age_minutes,
+          });
           candidateBlocks.push(lines.join("\n"));
       }
 
@@ -549,13 +781,8 @@ ${strategyBlock}
 Positions: ${prePositions.total_positions}/${config.risk.maxPositions} | SOL: ${currentBalance.sol.toFixed(3)} | Deploy: ${deployAmount} SOL
 ${candidateContext}
 DECISION RULES (apply to the pre-loaded candidates above, no re-fetching needed):
-- HARD SKIP if global_fees_sol < ${config.screening.minTokenFeesSol} SOL (bundled/scam)
-- HARD SKIP if top_10_pct > ${config.screening.maxTop10Pct}% OR bundlers_pct > ${config.screening.maxBundlersPct}%
-- SKIP if narrative is empty/null or pure hype with no specific story (unless smart wallets present)
-- Bundlers 5–15% are normal, not a skip reason on their own
-- Smart wallets present → strong confidence boost
-- LP-wallet scoring matters: prefer pools where top scored LPs show real win rate, fee yield, and sample depth
-- Use the pre-loaded planner context to bias strategy/range choices before deploy; only override it if a candidate has a clear contradictory signal
+- Respect hard_gate=BLOCKED. Never deploy a blocked candidate.
+- Ranking precedence: use ranking_score first. context_score is explanatory context only; it must not override a blocked candidate.
 - LP-wallet scoring preload is conservative and rate-aware. It is only preloaded for the top ${scorePreloadLimit} candidate${scorePreloadLimit === 1 ? "" : "s"}; for later candidates, only fetch score_top_lpers if the cheaper signals already make that pool a serious finalist.
 
 STEPS:
@@ -567,10 +794,34 @@ STEPS:
 5. Report: pool chosen, key signals, LP-wallet score takeaway, planner takeaway, deploy outcome.
       `, config.llm.maxSteps, [], "SCREENER", config.llm.screeningModel, 4096);
       screenReport = content;
+      screeningEvaluation = {
+        cycle_type: "screening",
+        status: "completed",
+        summary: {
+          total_screened: screeningTopCandidates?.total_screened ?? candidates.length,
+          total_eligible: totalEligible,
+          candidates_scored: candidateEvaluations.length,
+          candidates_blocked: candidateEvaluations.filter((candidate) => candidate.hard_blocked).length,
+          deploy_amount: deployAmount,
+          score_preload_limit: scorePreloadLimit,
+          blocked_summary: blockedSummary,
+        },
+        candidates: candidateEvaluations,
+      };
     } catch (error) {
       log("cron_error", `Screening cycle failed: ${error.message}`);
       screenReport = `Screening cycle failed: ${error.message}`;
+      screeningEvaluation = {
+        cycle_type: "screening",
+        status: "failed",
+        summary: {
+          error: error.message,
+          total_eligible: screeningTopCandidates?.total_eligible ?? 0,
+        },
+        candidates: [],
+      };
     } finally {
+      if (screeningEvaluation) recordCycleEvaluation(screeningEvaluation);
       _screeningBusy = false;
       if (telegramEnabled()) {
         if (screenReport) sendMessage(`🔍 Screening Cycle\n\n${screenReport}`).catch(() => {});
@@ -884,12 +1135,15 @@ Commands:
 
     if (input === "/thresholds") {
       const s = config.screening;
+      const evaluation = getStateSummary().evaluation;
       console.log("\nCurrent screening thresholds:");
-      console.log(`  maxVolatility:    ${s.maxVolatility}`);
-      console.log(`  minFeeTvlRatio:   ${s.minFeeTvlRatio}`);
+      console.log(`  minFeeActiveTvlRatio: ${s.minFeeActiveTvlRatio}`);
+      console.log(`  minTokenFeesSol:      ${s.minTokenFeesSol}`);
+      console.log(`  maxBundlersPct:       ${s.maxBundlersPct}`);
+      console.log(`  maxTop10Pct:          ${s.maxTop10Pct}`);
       console.log(`  minOrganic:       ${s.minOrganic}`);
       console.log(`  minHolders:       ${s.minHolders}`);
-      console.log(`  maxPriceChangePct: ${s.maxPriceChangePct}`);
+      console.log(`  minVolume:        ${s.minVolume}`);
       console.log(`  timeframe:        ${s.timeframe}`);
       const perf = getPerformanceSummary();
       if (perf) {
@@ -897,6 +1151,10 @@ Commands:
         console.log(`  Win rate: ${perf.win_rate_pct}%  |  Avg PnL: ${perf.avg_pnl_pct}%`);
       } else {
         console.log("\n  No closed positions yet — thresholds are preset defaults.");
+      }
+      if (evaluation?.counters) {
+        console.log(`  Screening cycles logged: ${evaluation.counters.screening_cycles}`);
+        console.log(`  Candidates scored: ${evaluation.counters.candidates_scored} | blocked: ${evaluation.counters.candidates_blocked}`);
       }
       console.log();
       rl.prompt();
