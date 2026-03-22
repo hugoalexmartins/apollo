@@ -52,6 +52,7 @@ export const config = {
     trailingTakeProfit:    u.trailingTakeProfit    ?? true,
     trailingTriggerPct:    u.trailingTriggerPct    ?? 3,
     trailingDropPct:       u.trailingDropPct       ?? 1.5,
+    minFeePerTvl24h:       u.minFeePerTvl24h       ?? 7,
     minSolToOpen:          u.minSolToOpen          ?? 0.55,
     deployAmountSol:       u.deployAmountSol       ?? 0.5,
     gasReserve:            u.gasReserve            ?? 0.2,

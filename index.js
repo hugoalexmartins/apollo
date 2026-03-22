@@ -263,7 +263,8 @@ export function startCronJobs() {
       positions = livePositions?.positions || [];
 
       if (positions.length === 0) {
-        log("cron", "Management skipped — no open positions");
+        log("cron", "No open positions — triggering screening cycle");
+        runScreeningCycle().catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
         return;
       }
 
@@ -319,7 +320,8 @@ export function startCronJobs() {
           `POSITION: ${p.pair} (${p.position})`,
           `  pool: ${p.pool}`,
           `  age: ${p.age_minutes ?? "?"}m | in_range: ${p.in_range} | oor_minutes: ${p.minutes_out_of_range ?? 0}`,
-          pnl ? `  pnl_pct: ${pnl.pnl_pct}% | pnl_usd: $${pnl.pnl_usd} | unclaimed_fees: $${pnl.unclaimed_fee_usd} | claimed_fees: $${Math.max(0, (pnl.all_time_fees_usd || 0) - (pnl.unclaimed_fee_usd || 0)).toFixed(2)} | value: $${pnl.current_value_usd}` : `  pnl: fetch failed`,
+          pnl ? `  pnl_pct: ${pnl.pnl_pct}% | pnl_usd: $${pnl.pnl_usd} | unclaimed_fees: $${pnl.unclaimed_fee_usd} | claimed_fees: $${Math.max(0, (pnl.all_time_fees_usd || 0) - (pnl.unclaimed_fee_usd || 0)).toFixed(2)} | value: $${pnl.current_value_usd} | fee_per_tvl_24h: ${pnl.fee_per_tvl_24h ?? "?"}%` : `  pnl: fetch failed`,
+          pnl ? `  bins: lower=${pnl.lower_bin} upper=${pnl.upper_bin} active=${pnl.active_bin}` : null,
           p.instruction ? `  instruction: "${p.instruction}"` : null,
           p.exitAlert ? `  exit_alert: ${p.exitAlert}` : null,
           runtimeAttempt ? `  runtime_attempt_this_cycle: ${runtimeAttempt.toolName} -> ${summarizeRuntimeActionResult(runtimeAttempt.result)}` : null,
@@ -334,6 +336,19 @@ export function startCronJobs() {
         return;
       }
 
+      // Hive mind pattern consensus (if enabled)
+      let hivePatterns = "";
+      try {
+        const hiveMind = await import("./hive-mind.js");
+        if (hiveMind.isEnabled()) {
+          const patterns = await hiveMind.queryPatternConsensus();
+          const significant = (patterns || []).filter(p => p.count >= 10);
+          if (significant.length > 0) {
+            hivePatterns = `\nHIVE MIND PATTERNS (supplementary):\n${significant.slice(0, 3).map(p => `[HIVE] ${p.strategy}: ${p.win_rate}% win, ${p.avg_pnl}% avg PnL (${p.count} deploys)`).join("\n")}\n`;
+          }
+        }
+      } catch { /* hive is best-effort */ }
+
       const { content } = await agentLoop(`
 MANAGEMENT CYCLE — ${positions.length} position(s), ${pendingPositionData.length} still actionable after runtime orchestration
 
@@ -344,7 +359,7 @@ RUNTIME WRITE ATTEMPTS THAT DID NOT COMPLETE (do not retry the same tool on thes
 ${attemptedRuntimeActionBlock}
 
 PRE-LOADED POSITION DATA (no fetching needed):
-${positionBlocks}
+${positionBlocks}${hivePatterns}
 
 ${pendingExitAlerts.length ? `AUTOMATIC EXIT ALERTS (highest priority — close these immediately):
 ${pendingExitAlerts.join("\n")}
@@ -354,8 +369,10 @@ ${pendingExitAlerts.join("\n")}
 2. instruction set AND condition NOT met → HOLD, skip remaining rules
 3. pnl_pct <= ${config.management.emergencyPriceDropPct}% → CLOSE (stop loss)
 4. pnl_pct >= ${config.management.takeProfitFeePct}% → CLOSE (take profit)
+<<<<<<< HEAD
 5. in_range = false → REBALANCE with rebalance_on_exit immediately, unless a higher-priority close rule already fired
-6. fee_active_tvl_ratio < ${config.screening.minFeeActiveTvlRatio} AND volume < $${config.screening.minVolume} → CLOSE (yield dead)
+6. fee_per_tvl_24h < ${config.management.minFeePerTvl24h} AND age_minutes >= 60 → CLOSE (fee yield too low)
+7. fee_active_tvl_ratio < ${config.screening.minFeeActiveTvlRatio} AND volume < $${config.screening.minVolume} → CLOSE (yield dead)
 
 CLAIM RULE: If a position is staying open and unclaimed_fee_usd >= ${config.management.minClaimAmount}, use auto_compound_fees with execute_reinvest=false. Do not call claim_fees directly unless auto_compound_fees is unavailable.
 
@@ -391,7 +408,7 @@ REPORT FORMAT (one per position):
     }
   });
 
-  const screenTask = cron.schedule(`*/${Math.max(1, config.schedule.screeningIntervalMin)} * * * *`, async () => {
+  async function runScreeningCycle() {
     if (_screeningBusy) return;
 
     // Hard guards — don't even run the agent if preconditions aren't met
@@ -439,23 +456,23 @@ REPORT FORMAT (one per position):
         preloadedLpScores.set(pool.pool, scoreResult);
       }
 
-      const candidateBlocks = await Promise.all(
-        candidates.slice(0, 5).map(async (pool) => {
-          const mint = pool.base?.mint;
-          const planningPoolData = {
-            six_hour_volatility: asNumber(pool.six_hour_volatility ?? pool.volatility, 0),
-            volatility: asNumber(pool.six_hour_volatility ?? pool.volatility, 0),
-            fee_tvl_ratio: asNumber(pool.fee_active_tvl_ratio ?? pool.fee_tvl_ratio, 0),
-            organic_score: asNumber(pool.organic_score, 0),
-            bin_step: asNumber(pool.bin_step, 0),
-            price_change_pct: asNumber(pool.price_change_pct, 0),
-            active_tvl: asNumber(pool.active_tvl, 0),
-            volume_24h: asNumber(pool.volume_24h ?? pool.volume_window, 0),
-          };
-          const expectedVolumeProfile = deriveExpectedVolumeProfile(pool);
-          const [smartWallets, holders, narrative, tokenInfo, poolMemory, distributionPlan, tierPlan] = await Promise.allSettled([
+      const candidateBlocks = [];
+      for (const pool of candidates.slice(0, 5)) {
+        const mint = pool.base?.mint;
+        const planningPoolData = {
+          six_hour_volatility: asNumber(pool.six_hour_volatility ?? pool.volatility, 0),
+          volatility: asNumber(pool.six_hour_volatility ?? pool.volatility, 0),
+          fee_tvl_ratio: asNumber(pool.fee_active_tvl_ratio ?? pool.fee_tvl_ratio, 0),
+          organic_score: asNumber(pool.organic_score, 0),
+          bin_step: asNumber(pool.bin_step, 0),
+          price_change_pct: asNumber(pool.price_change_pct, 0),
+          active_tvl: asNumber(pool.active_tvl, 0),
+          volume_24h: asNumber(pool.volume_24h ?? pool.volume_window, 0),
+        };
+        const expectedVolumeProfile = deriveExpectedVolumeProfile(pool);
+        const [smartWallets, holders, narrative, tokenInfo, poolMemory, distributionPlan, tierPlan] = await Promise.allSettled([
             checkSmartWalletsOnPool({ pool_address: pool.pool }),
-            mint ? getTokenHolders({ mint, limit: 10 }) : Promise.resolve(null),
+            mint ? getTokenHolders({ mint, limit: 100 }) : Promise.resolve(null),
             mint ? getTokenNarrative({ mint }) : Promise.resolve(null),
             mint ? getTokenInfo({ query: mint }) : Promise.resolve(null),
             Promise.resolve(recallForPool(pool.pool)),
@@ -508,13 +525,24 @@ REPORT FORMAT (one per position):
             learnedMemory ? `  learned_memory: ${learnedMemory}` : null,
           ].filter(Boolean);
 
-          return lines.join("\n");
-        })
-      );
+          candidateBlocks.push(lines.join("\n"));
+      }
 
-      const candidateContext = candidateBlocks.length > 0
-        ? `\nPRE-LOADED CANDIDATE ANALYSIS (smart wallets, holders, narrative, planner context, and conservative LP-wallet scoring for the top ${scorePreloadLimit} candidate${scorePreloadLimit === 1 ? "" : "s"}):\n${candidateBlocks.join("\n\n")}\n`
+      let candidateContext = candidateBlocks.length > 0
+        ? `\nPRE-LOADED CANDIDATE ANALYSIS (smart wallets, 100-holder distribution, narrative, planner context, and conservative LP-wallet scoring for the top ${scorePreloadLimit} candidate${scorePreloadLimit === 1 ? "" : "s"}):\n${candidateBlocks.join("\n\n")}\n`
         : "";
+
+      // Hive mind consensus (if enabled)
+      try {
+        const hiveMind = await import("./hive-mind.js");
+        if (hiveMind.isEnabled()) {
+          const poolAddrs = candidates.map(c => c.pool).filter(Boolean);
+          if (poolAddrs.length > 0) {
+            const hive = await hiveMind.formatPoolConsensusForPrompt(poolAddrs);
+            if (hive) candidateContext += "\n" + hive + "\n";
+          }
+        }
+      } catch { /* hive is best-effort */ }
 
       const { content } = await agentLoop(`
 SCREENING CYCLE — DEPLOY ONLY
@@ -549,7 +577,9 @@ STEPS:
         if (screenReport) sendMessage(`🔍 Screening Cycle\n\n${screenReport}`).catch(() => {});
       }
     }
-  });
+  }
+
+  const screenTask = cron.schedule(`*/${Math.max(1, config.schedule.screeningIntervalMin)} * * * *`, runScreeningCycle);
 
   const healthTask = cron.schedule(`0 * * * *`, async () => {
     if (_managementBusy) return;
