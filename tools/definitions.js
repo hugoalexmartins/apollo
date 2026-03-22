@@ -48,10 +48,10 @@ Use this as the primary tool for finding new LP opportunities.`,
     type: "function",
     function: {
       name: "get_top_candidates",
-      description: `Get the top pre-scored pool candidates ready for deployment.
-All filtering, scoring, and rule-checking is done in code — no analysis needed.
-Returns the top N eligible pools ranked by score (fee/TVL, organic, stability, volume).
-Each pool includes a score (0-100) and has already passed all hard disqualifiers.
+      description: `Get the top deterministic pool candidates ready for deployment.
+All base filtering, scoring, and occupied-position checks are done in code before the result is returned.
+Returns the top N eligible pools ranked by deterministic score (fee efficiency, volume, organic score, holder depth, active liquidity, volatility fit).
+Each pool includes deterministic_score, score_breakdown, gate_results, and eligibility metadata.
 Use this instead of discover_pools for screening cycles.`,
       parameters: {
         type: "object",
@@ -106,7 +106,7 @@ This is an on-chain call via the SDK. Returns:
 - price: human-readable price (token X per token Y)
 - pricePerLamport: raw price in lamports
 
-Always call this before deploying a position to get the freshest price.`,
+Use this when you explicitly need a standalone active-bin check. deploy_position already fetches the active bin internally.`,
       parameters: {
         type: "object",
         properties: {
@@ -494,7 +494,7 @@ WARNING: This executes a real on-chain transaction.`,
 Changes persist to user-config.json and take effect immediately — no restart needed.
 
 VALID KEYS (use EXACTLY these key names, nothing else):
-Screening: minFeeActiveTvlRatio, minTvl, maxTvl, minVolume, minOrganic, minHolders, minMcap, maxMcap, minBinStep, maxBinStep, timeframe, category, minTokenFeesSol
+Screening: minFeeActiveTvlRatio, minTvl, maxTvl, minVolume, minOrganic, minHolders, minMcap, maxMcap, minBinStep, maxBinStep, timeframe, category, minTokenFeesSol, maxBundlersPct, maxTop10Pct
 Management: minClaimAmount, outOfRangeBinsToClose, outOfRangeWaitMinutes, minVolumeToRebalance, emergencyPriceDropPct, stopLossPct, takeProfitFeePct, trailingTakeProfit, trailingTriggerPct, trailingDropPct, minSolToOpen, deployAmountSol, gasReserve, positionSizePct
 Risk: maxPositions, maxDeployAmount
 Schedule: managementIntervalMin, screeningIntervalMin

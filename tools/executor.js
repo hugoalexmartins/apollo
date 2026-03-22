@@ -16,7 +16,7 @@ import {
 import { getWalletBalances, swapToken } from "./wallet.js";
 import { getPoolInfo, scoreTopLPers, studyTopLPers } from "./study.js";
 import { addLesson, clearAllLessons, clearPerformance, removeLessonsByKeyword, getPerformanceHistory, pinLesson, unpinLesson, listLessons } from "../lessons.js";
-import { setPositionInstruction } from "../state.js";
+import { recordToolOutcome, setPositionInstruction } from "../state.js";
 import { getPoolMemory, addPoolNote } from "../pool-memory.js";
 import { rememberFact, recallMemory } from "../memory.js";
 import { addStrategy, listStrategies, getStrategy, setActiveStrategy, removeStrategy } from "../strategy-library.js";
@@ -150,6 +150,8 @@ const toolMap = {
       timeframe: ["screening", "timeframe"],
       category: ["screening", "category"],
       minTokenFeesSol: ["screening", "minTokenFeesSol"],
+      maxBundlersPct: ["screening", "maxBundlersPct"],
+      maxTop10Pct: ["screening", "maxTop10Pct"],
       // management
       minClaimAmount: ["management", "minClaimAmount"],
       autoSwapAfterClaim: ["management", "autoSwapAfterClaim"],
@@ -200,11 +202,18 @@ const toolMap = {
     }
 
     // Apply to live config immediately
+    const effectiveApplied = {};
     for (const [key, val] of Object.entries(applied)) {
       const [section, field] = CONFIG_MAP[key];
       const before = config[section][field];
+      if (Object.is(before, val)) continue;
+      effectiveApplied[key] = val;
       config[section][field] = val;
       log("config", `update_config: config.${section}.${field} ${before} → ${val} (verify: ${config[section][field]})`);
+    }
+
+    if (Object.keys(effectiveApplied).length === 0) {
+      return { success: true, applied: {}, unknown, reason, noop: true };
     }
 
     // Persist to user-config.json
@@ -212,12 +221,12 @@ const toolMap = {
     if (fs.existsSync(USER_CONFIG_PATH)) {
       try { userConfig = JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8")); } catch { /**/ }
     }
-    Object.assign(userConfig, applied);
+    Object.assign(userConfig, effectiveApplied);
     userConfig._lastAgentTune = new Date().toISOString();
     fs.writeFileSync(USER_CONFIG_PATH, JSON.stringify(userConfig, null, 2));
 
     // Restart cron jobs if intervals changed
-    const intervalChanged = applied.managementIntervalMin != null || applied.screeningIntervalMin != null;
+    const intervalChanged = effectiveApplied.managementIntervalMin != null || effectiveApplied.screeningIntervalMin != null;
     if (intervalChanged && _cronRestarter) {
       _cronRestarter();
       log("config", `Cron restarted — management: ${config.schedule.managementIntervalMin}m, screening: ${config.schedule.screeningIntervalMin}m`);
@@ -226,16 +235,16 @@ const toolMap = {
     // Save as a lesson — but skip ephemeral per-deploy interval changes
     // (managementIntervalMin / screeningIntervalMin change every deploy based on volatility;
     //  the rule is already in the system prompt, storing it 75+ times is pure noise)
-    const lessonsKeys = Object.keys(applied).filter(
+    const lessonsKeys = Object.keys(effectiveApplied).filter(
       k => k !== "managementIntervalMin" && k !== "screeningIntervalMin"
     );
     if (lessonsKeys.length > 0) {
-      const summary = lessonsKeys.map(k => `${k}=${applied[k]}`).join(", ");
+      const summary = lessonsKeys.map(k => `${k}=${effectiveApplied[k]}`).join(", ");
       addLesson(`[SELF-TUNED] Changed ${summary} — ${reason}`, ["self_tune", "config_change"]);
     }
 
-    log("config", `Agent self-tuned: ${JSON.stringify(applied)} — ${reason}`);
-    return { success: true, applied, unknown, reason };
+    log("config", `Agent self-tuned: ${JSON.stringify(effectiveApplied)} — ${reason}`);
+    return { success: true, applied: effectiveApplied, unknown, reason };
   },
 };
 
@@ -264,13 +273,22 @@ export async function executeTool(name, args) {
   }
 
   // ─── Pre-execution safety checks ──────────
-  if (WRITE_TOOLS.has(name)) {
-    const safetyCheck = await runSafetyChecks(name, args);
-    if (!safetyCheck.pass) {
-      log("safety_block", `${name} blocked: ${safetyCheck.reason}`);
-      return {
-        blocked: true,
-        reason: safetyCheck.reason,
+    if (WRITE_TOOLS.has(name)) {
+      const safetyCheck = await runSafetyChecks(name, args);
+      if (!safetyCheck.pass) {
+        log("safety_block", `${name} blocked: ${safetyCheck.reason}`);
+        recordToolOutcome({
+          tool: name,
+          outcome: "blocked",
+          reason: safetyCheck.reason,
+          metadata: {
+            pool_address: args?.pool_address || null,
+            position_address: args?.position_address || null,
+          },
+        });
+        return {
+          blocked: true,
+          reason: safetyCheck.reason,
       };
     }
   }
@@ -290,6 +308,16 @@ export async function executeTool(name, args) {
     });
 
     if (success) {
+      if (WRITE_TOOLS.has(name)) {
+        recordToolOutcome({
+          tool: name,
+          outcome: "success",
+          metadata: {
+            pool_address: args?.pool_address || result?.pool_address || null,
+            position_address: args?.position_address || result?.position || null,
+          },
+        });
+      }
       if (name === "swap_token" && result.tx) {
         notifySwap({ inputSymbol: args.input_mint?.slice(0, 8), outputSymbol: args.output_mint === "So11111111111111111111111111111111111111112" || args.output_mint === "SOL" ? "SOL" : args.output_mint?.slice(0, 8), amountIn: result.amount_in, amountOut: result.amount_out, tx: result.tx }).catch(() => {});
       } else if (name === "deploy_position") {
@@ -326,6 +354,18 @@ export async function executeTool(name, args) {
     return result;
   } catch (error) {
     const duration = Date.now() - startTime;
+
+    if (WRITE_TOOLS.has(name)) {
+      recordToolOutcome({
+        tool: name,
+        outcome: "error",
+        reason: error.message,
+        metadata: {
+          pool_address: args?.pool_address || null,
+          position_address: args?.position_address || null,
+        },
+      });
+    }
 
     logAction({
       tool: name,
