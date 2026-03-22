@@ -14,26 +14,92 @@ import { log } from "./logger.js";
 const STATE_FILE = "./state.json";
 
 const MAX_RECENT_EVENTS = 20;
+const MAX_RECENT_CYCLES = 25;
+const MAX_RECENT_TOOL_OUTCOMES = 40;
+
+function emptyState() {
+  return {
+    positions: {},
+    recentEvents: [],
+    evaluation: {
+      recentCycles: [],
+      recentToolOutcomes: [],
+      counters: {
+        management_cycles: 0,
+        screening_cycles: 0,
+        health_checks: 0,
+        candidates_scored: 0,
+        candidates_blocked: 0,
+        runtime_actions_handled: 0,
+        runtime_actions_attempted: 0,
+        tool_blocks: 0,
+        tool_errors: 0,
+        write_successes: 0,
+      },
+    },
+    lastUpdated: null,
+  };
+}
+
+function ensureEvaluation(state) {
+  if (!state.evaluation || typeof state.evaluation !== "object") {
+    state.evaluation = emptyState().evaluation;
+  }
+
+  state.evaluation.recentCycles = Array.isArray(state.evaluation.recentCycles)
+    ? state.evaluation.recentCycles
+    : [];
+  state.evaluation.recentToolOutcomes = Array.isArray(state.evaluation.recentToolOutcomes)
+    ? state.evaluation.recentToolOutcomes
+    : [];
+  state.evaluation.counters = {
+    ...emptyState().evaluation.counters,
+    ...(state.evaluation.counters || {}),
+  };
+
+  return state.evaluation;
+}
 
 function load() {
   if (!fs.existsSync(STATE_FILE)) {
-    return { positions: {}, recentEvents: [], lastUpdated: null };
+    return emptyState();
   }
   try {
-    return JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+    const parsed = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
+    const state = {
+      ...emptyState(),
+      ...parsed,
+    };
+    ensureEvaluation(state);
+    return state;
   } catch (err) {
     log("state_error", `Failed to read state.json: ${err.message}`);
-    return { positions: {}, lastUpdated: null };
+    return emptyState();
   }
 }
 
 function save(state) {
   try {
+    ensureEvaluation(state);
     state.lastUpdated = new Date().toISOString();
     fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
   } catch (err) {
     log("state_error", `Failed to write state.json: ${err.message}`);
   }
+}
+
+function incrementCounter(state, key, amount = 1) {
+  const evaluation = ensureEvaluation(state);
+  evaluation.counters[key] = (evaluation.counters[key] || 0) + amount;
+}
+
+function summarizeCycleRecord(record) {
+  return {
+    ts: record.ts,
+    cycle_type: record.cycle_type,
+    status: record.status,
+    summary: record.summary,
+  };
 }
 
 // ─── Position Registry ─────────────────────────────────────────
@@ -150,6 +216,78 @@ function pushEvent(state, event) {
   if (state.recentEvents.length > MAX_RECENT_EVENTS) {
     state.recentEvents = state.recentEvents.slice(-MAX_RECENT_EVENTS);
   }
+}
+
+export function recordCycleEvaluation({
+  cycle_type,
+  status = "completed",
+  summary = {},
+  candidates = [],
+  positions = [],
+}) {
+  if (!cycle_type) return;
+
+  const state = load();
+  const evaluation = ensureEvaluation(state);
+  const record = {
+    ts: new Date().toISOString(),
+    cycle_type,
+    status,
+    summary,
+    candidates: Array.isArray(candidates) ? candidates.slice(0, 8) : [],
+    positions: Array.isArray(positions) ? positions.slice(0, 8) : [],
+  };
+
+  evaluation.recentCycles.push(record);
+  if (evaluation.recentCycles.length > MAX_RECENT_CYCLES) {
+    evaluation.recentCycles = evaluation.recentCycles.slice(-MAX_RECENT_CYCLES);
+  }
+
+  if (cycle_type === "management") incrementCounter(state, "management_cycles");
+  if (cycle_type === "screening") incrementCounter(state, "screening_cycles");
+  if (cycle_type === "health") incrementCounter(state, "health_checks");
+  if (summary.candidates_scored) incrementCounter(state, "candidates_scored", Number(summary.candidates_scored) || 0);
+  if (summary.candidates_blocked) incrementCounter(state, "candidates_blocked", Number(summary.candidates_blocked) || 0);
+  if (summary.runtime_actions_handled) incrementCounter(state, "runtime_actions_handled", Number(summary.runtime_actions_handled) || 0);
+  if (summary.runtime_actions_attempted) incrementCounter(state, "runtime_actions_attempted", Number(summary.runtime_actions_attempted) || 0);
+
+  save(state);
+}
+
+export function recordToolOutcome({ tool, outcome, reason = null, metadata = null }) {
+  if (!tool || !outcome) return;
+
+  const state = load();
+  const evaluation = ensureEvaluation(state);
+  const entry = {
+    ts: new Date().toISOString(),
+    tool,
+    outcome,
+    reason,
+    metadata,
+  };
+
+  evaluation.recentToolOutcomes.push(entry);
+  if (evaluation.recentToolOutcomes.length > MAX_RECENT_TOOL_OUTCOMES) {
+    evaluation.recentToolOutcomes = evaluation.recentToolOutcomes.slice(-MAX_RECENT_TOOL_OUTCOMES);
+  }
+
+  if (outcome === "blocked") incrementCounter(state, "tool_blocks");
+  if (outcome === "error") incrementCounter(state, "tool_errors");
+  if (outcome === "success") incrementCounter(state, "write_successes");
+
+  save(state);
+}
+
+export function getEvaluationSummary(limit = 5) {
+  const state = load();
+  const evaluation = ensureEvaluation(state);
+
+  return {
+    counters: evaluation.counters,
+    recent_cycles: evaluation.recentCycles.slice(-limit).map(summarizeCycleRecord),
+    recent_tool_outcomes: evaluation.recentToolOutcomes.slice(-limit),
+  };
 }
 
 /**
@@ -288,6 +426,7 @@ export function getStateSummary() {
       rebalance_count: p.rebalance_count,
       instruction: p.instruction || null,
     })),
+    evaluation: getEvaluationSummary(3),
     last_updated: state.lastUpdated,
     recent_events: (state.recentEvents || []).slice(-10),
   };
