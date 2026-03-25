@@ -203,7 +203,7 @@ WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,
           },
           amount_x: {
             type: "number",
-            description: "Amount of base token to deposit (if doing dual-sided or base-only)."
+            description: "Amount of base token to deposit (if doing dual-sided)."
           },
           amount_sol: {
             type: "number",

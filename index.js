@@ -3,7 +3,7 @@ import cron from "node-cron";
 import readline from "readline";
 import { agentLoop } from "./agent.js";
 import { log } from "./logger.js";
-import { getMyPositions, getPositionPnl } from "./tools/dlmm.js";
+import { getMyPositions, getPositionPnl, closePosition } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
 import { getTopCandidates } from "./tools/screening.js";
 import { config, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
@@ -11,7 +11,7 @@ import { evolveThresholds, getPerformanceSummary } from "./lessons.js";
 import { executeTool, registerCronRestarter } from "./tools/executor.js";
 import { startPolling, stopPolling, sendMessage, sendHTML, notifyOutOfRange, isEnabled as telegramEnabled } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
-import { getLastBriefingDate, setLastBriefingDate, updatePnlAndCheckExits } from "./state.js";
+import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, setPositionInstruction } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
 import { recordPositionSnapshot, recallForPool } from "./pool-memory.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
@@ -209,6 +209,7 @@ function buildPrompt() {
 let _cronTasks = [];
 let _managementBusy = false; // prevents overlapping management cycles
 let _screeningBusy = false;  // prevents overlapping screening cycles
+let _screeningLastTriggered = 0; // epoch ms — prevents management from spamming screening
 
 async function runBriefing() {
   log("cron", "Starting morning briefing");
@@ -247,24 +248,39 @@ function stopCronJobs() {
   _cronTasks = [];
 }
 
-export function startCronJobs() {
-  stopCronJobs(); // stop any running tasks before (re)starting
-
-  const mgmtTask = cron.schedule(`*/${Math.max(1, config.schedule.managementIntervalMin)} * * * *`, async () => {
-    if (_managementBusy) return;
-    _managementBusy = true;
-    timers.managementLastRun = Date.now();
-    log("cron", `Starting management cycle [model: ${config.llm.managementModel}]`);
-    let mgmtReport = null;
-    let positions = [];
-    try {
+export async function runManagementCycle({ silent = false } = {}) {
+  log("cron", `Starting management cycle [model: ${config.llm.managementModel}]`);
+  let mgmtReport = null;
+  let positions = [];
+  try {
       // Pre-load all positions + PnL in parallel — LLM gets everything, no fetch steps needed
       const livePositions = await getMyPositions().catch(() => null);
       positions = livePositions?.positions || [];
 
       if (positions.length === 0) {
-        log("cron", "Management skipped — no open positions");
+        log("cron", "No open positions — triggering screening cycle");
+        runScreeningCycle().catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
         return;
+      }
+
+      // Enforce management interval based on most volatile open position
+      const maxVolatility = positions.reduce((max, p) => {
+        const tracked = getTrackedPosition(p.position);
+        return Math.max(max, tracked?.volatility ?? 0);
+      }, 0);
+      const targetInterval = maxVolatility >= 5 ? 3 : maxVolatility >= 2 ? 5 : 10;
+      if (config.schedule.managementIntervalMin !== targetInterval) {
+        config.schedule.managementIntervalMin = targetInterval;
+        log("cron", `Management interval adjusted to ${targetInterval}m (max volatility: ${maxVolatility})`);
+        if (cronStarted) startCronJobs();
+      }
+
+      // Also trigger screening if under max positions — cooldown 5min to avoid spamming
+      const screeningCooldownMs = 5 * 60 * 1000;
+      if (positions.length < config.risk.maxPositions && Date.now() - _screeningLastTriggered > screeningCooldownMs) {
+        _screeningLastTriggered = Date.now();
+        log("cron", `Positions (${positions.length}/${config.risk.maxPositions}) — triggering screening in background`);
+        runScreeningCycle().catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
       }
 
       // Snapshot + PnL fetch in parallel for all positions
@@ -319,7 +335,8 @@ export function startCronJobs() {
           `POSITION: ${p.pair} (${p.position})`,
           `  pool: ${p.pool}`,
           `  age: ${p.age_minutes ?? "?"}m | in_range: ${p.in_range} | oor_minutes: ${p.minutes_out_of_range ?? 0}`,
-          pnl ? `  pnl_pct: ${pnl.pnl_pct}% | pnl_usd: $${pnl.pnl_usd} | unclaimed_fees: $${pnl.unclaimed_fee_usd} | claimed_fees: $${Math.max(0, (pnl.all_time_fees_usd || 0) - (pnl.unclaimed_fee_usd || 0)).toFixed(2)} | value: $${pnl.current_value_usd}` : `  pnl: fetch failed`,
+          pnl ? `  pnl_pct: ${pnl.pnl_pct}% | pnl_usd: $${pnl.pnl_usd} | unclaimed_fees: $${pnl.unclaimed_fee_usd} | claimed_fees: $${Math.max(0, (pnl.all_time_fees_usd || 0) - (pnl.unclaimed_fee_usd || 0)).toFixed(2)} | value: $${pnl.current_value_usd} | fee_per_tvl_24h: ${pnl.fee_per_tvl_24h ?? "?"}%` : `  pnl: fetch failed`,
+          pnl ? `  bins: lower=${pnl.lower_bin} upper=${pnl.upper_bin} active=${pnl.active_bin}` : null,
           p.instruction ? `  instruction: "${p.instruction}"` : null,
           p.exitAlert ? `  exit_alert: ${p.exitAlert}` : null,
           runtimeAttempt ? `  runtime_attempt_this_cycle: ${runtimeAttempt.toolName} -> ${summarizeRuntimeActionResult(runtimeAttempt.result)}` : null,
@@ -329,10 +346,18 @@ export function startCronJobs() {
         return lines.join("\n");
       }).join("\n\n");
 
-      if (pendingPositionData.length === 0) {
-        mgmtReport = `RUNTIME ACTIONS ALREADY EXECUTED\n${handledRuntimeActionBlock}\n\nNo remaining positions required manager write decisions this cycle.`;
-        return;
-      }
+      // Hive mind pattern consensus (if enabled)
+      let hivePatterns = "";
+      try {
+        const hiveMind = await import("./hive-mind.js");
+        if (hiveMind.isEnabled()) {
+          const patterns = await hiveMind.queryPatternConsensus();
+          const significant = (patterns || []).filter(p => p.count >= 10);
+          if (significant.length > 0) {
+            hivePatterns = `\nHIVE MIND PATTERNS (supplementary):\n${significant.slice(0, 3).map(p => `[HIVE] ${p.strategy}: ${p.win_rate}% win, ${p.avg_pnl}% avg PnL (${p.count} deploys)`).join("\n")}\n`;
+          }
+        }
+      } catch { /* hive is best-effort */ }
 
       const { content } = await agentLoop(`
 MANAGEMENT CYCLE — ${positions.length} position(s), ${pendingPositionData.length} still actionable after runtime orchestration
@@ -344,7 +369,7 @@ RUNTIME WRITE ATTEMPTS THAT DID NOT COMPLETE (do not retry the same tool on thes
 ${attemptedRuntimeActionBlock}
 
 PRE-LOADED POSITION DATA (no fetching needed):
-${positionBlocks}
+${positionBlocks}${hivePatterns}
 
 ${pendingExitAlerts.length ? `AUTOMATIC EXIT ALERTS (highest priority — close these immediately):
 ${pendingExitAlerts.join("\n")}
@@ -354,23 +379,25 @@ ${pendingExitAlerts.join("\n")}
 2. instruction set AND condition NOT met → HOLD, skip remaining rules
 3. pnl_pct <= ${config.management.emergencyPriceDropPct}% → CLOSE (stop loss)
 4. pnl_pct >= ${config.management.takeProfitFeePct}% → CLOSE (take profit)
-5. in_range = false → REBALANCE with rebalance_on_exit immediately, unless a higher-priority close rule already fired
-6. fee_active_tvl_ratio < ${config.screening.minFeeActiveTvlRatio} AND volume < $${config.screening.minVolume} → CLOSE (yield dead)
+5. active_bin > upper_bin + ${config.management.outOfRangeBinsToClose} → CLOSE (pumped far above range)
+6. active_bin > upper_bin AND oor_minutes >= ${config.management.outOfRangeWaitMinutes} → CLOSE (stale above range)
+7. fee_per_tvl_24h < ${config.management.minFeePerTvl24h} AND age_minutes >= 60 → CLOSE (fee yield too low)
 
 CLAIM RULE: If a position is staying open and unclaimed_fee_usd >= ${config.management.minClaimAmount}, use auto_compound_fees with execute_reinvest=false. Do not call claim_fees directly unless auto_compound_fees is unavailable.
 
 INSTRUCTIONS:
 All data is pre-loaded above — do NOT call get_my_positions or get_position_pnl.
 Apply the rules to each position and write your report immediately.
-Never repeat a write action for any position already listed in RUNTIME ACTIONS ALREADY EXECUTED.
-If a position shows runtime_attempt_this_cycle, do not retry that same tool again this cycle. You may still choose a different action or report why no further action is safe.
-Only call tools if a remaining position needs to be CLOSED, REBALANCED, or fees need safe-mode compounding.
-If you use auto_compound_fees, keep execute_reinvest=false because in-place compounding is still blocked; safe mode claims fees and returns a non-executed reinvest plan.
+Only call tools if a position needs to be CLOSED, FLIPPED, or fees need to be CLAIMED.
 If all positions STAY and no fees to claim, just write the report with no tool calls.
 
 REPORT FORMAT (one per position):
-**[PAIR]** | Age: [X]m | Unclaimed: $[X] | Claimed: $[X] | PnL: [X]%
-**Rule:** [number or "none"] | **Decision:** STAY/CLOSE/REBALANCE/COMPOUND | **Reason:** [1 sentence]
+**[PAIR]** | Age: [X]m | Unclaimed: $[X] | PnL: [X]% | [STAY/CLOSE]
+Range: [████████░░░░░░░░░░░░] (20 chars: █ = bins up to active, ░ = bins above active)
+Only add: **Rule [N]:** [reason] — if a close rule triggered. Omit rule line if STAY with no rule.
+
+After all positions, add one summary line:
+💼 [N] positions | $[total_value] | fees today: $[sum_unclaimed] | [any notable action taken]
       `, config.llm.maxSteps, [], "MANAGER", config.llm.managementModel, 4096);
       mgmtReport = runtimeActions.length > 0
         ? `RUNTIME ACTIONS ALREADY EXECUTED\n${handledRuntimeActionBlock}\n\nRUNTIME WRITE ATTEMPTS NOT COMPLETED\n${attemptedRuntimeActionBlock}\n\n${content}`
@@ -379,8 +406,7 @@ REPORT FORMAT (one per position):
       log("cron_error", `Management cycle failed: ${error.message}`);
       mgmtReport = `Management cycle failed: ${error.message}`;
     } finally {
-      _managementBusy = false;
-      if (telegramEnabled()) {
+      if (!silent && telegramEnabled()) {
         if (mgmtReport) sendMessage(`🔄 Management Cycle\n\n${mgmtReport}`).catch(() => {});
         for (const p of positions) {
           if (!p.in_range && p.minutes_out_of_range >= config.management.outOfRangeWaitMinutes) {
@@ -389,9 +415,10 @@ REPORT FORMAT (one per position):
         }
       }
     }
-  });
+  return mgmtReport;
+}
 
-  const screenTask = cron.schedule(`*/${Math.max(1, config.schedule.screeningIntervalMin)} * * * *`, async () => {
+export async function runScreeningCycle({ silent = false } = {}) {
     if (_screeningBusy) return;
 
     // Hard guards — don't even run the agent if preconditions aren't met
@@ -432,30 +459,12 @@ REPORT FORMAT (one per position):
       const topCandidates = await getTopCandidates({ limit: 5 }).catch(() => null);
       const candidates = topCandidates?.candidates || topCandidates?.pools || [];
 
-      const scorePreloadLimit = Math.min(2, candidates.length);
-      const preloadedLpScores = new Map();
-      for (const pool of candidates.slice(0, scorePreloadLimit)) {
-        const scoreResult = await executeTool("score_top_lpers", { pool_address: pool.pool, limit: 4 });
-        preloadedLpScores.set(pool.pool, scoreResult);
-      }
-
-      const candidateBlocks = await Promise.all(
-        candidates.slice(0, 5).map(async (pool) => {
-          const mint = pool.base?.mint;
-          const planningPoolData = {
-            six_hour_volatility: asNumber(pool.six_hour_volatility ?? pool.volatility, 0),
-            volatility: asNumber(pool.six_hour_volatility ?? pool.volatility, 0),
-            fee_tvl_ratio: asNumber(pool.fee_active_tvl_ratio ?? pool.fee_tvl_ratio, 0),
-            organic_score: asNumber(pool.organic_score, 0),
-            bin_step: asNumber(pool.bin_step, 0),
-            price_change_pct: asNumber(pool.price_change_pct, 0),
-            active_tvl: asNumber(pool.active_tvl, 0),
-            volume_24h: asNumber(pool.volume_24h ?? pool.volume_window, 0),
-          };
-          const expectedVolumeProfile = deriveExpectedVolumeProfile(pool);
-          const [smartWallets, holders, narrative, tokenInfo, poolMemory, distributionPlan, tierPlan] = await Promise.allSettled([
+      const candidateBlocks = [];
+      for (const pool of candidates.slice(0, 5)) {
+        const mint = pool.base?.mint;
+        const [smartWallets, holders, narrative, tokenInfo, poolMemory] = await Promise.allSettled([
             checkSmartWalletsOnPool({ pool_address: pool.pool }),
-            mint ? getTokenHolders({ mint, limit: 10 }) : Promise.resolve(null),
+            mint ? getTokenHolders({ mint, limit: 100 }) : Promise.resolve(null),
             mint ? getTokenNarrative({ mint }) : Promise.resolve(null),
             mint ? getTokenInfo({ query: mint }) : Promise.resolve(null),
             Promise.resolve(recallForPool(pool.pool)),
@@ -490,17 +499,30 @@ REPORT FORMAT (one per position):
             ? memoryHits.map((hit) => `[${hit.source}] ${hit.key}: ${hit.answer}`).join(" | ")
             : null;
 
-          const momentum = ti?.stats_1h
-            ? `1h: price${ti.stats_1h.price_change >= 0 ? "+" : ""}${ti.stats_1h.price_change}%, buyers=${ti.stats_1h.buyers}, net_buyers=${ti.stats_1h.net_buyers}`
-            : null;
+          const priceChange = ti?.stats_1h?.price_change;
+          const netBuyers = ti?.stats_1h?.net_buyers;
+
+          // Use Jupiter audit for bot/top holders (more reliable than custom detection)
+          const botPct    = ti?.audit?.bot_holders_pct ?? h?.bundlers_pct_in_top_100 ?? "?";
+          const top10Pct  = ti?.audit?.top_holders_pct ?? h?.top_10_real_holders_pct ?? "?";
+          const launchpad = ti?.launchpad ?? null;
+          const feesSol   = ti?.global_fees_sol ?? h?.global_fees_sol ?? "?";
+
+          // Hard filter: skip blocked launchpads before even showing to LLM
+          if (launchpad && config.screening.blockedLaunchpads.length > 0) {
+            if (config.screening.blockedLaunchpads.includes(launchpad)) {
+              log("screening", `Skipping ${pool.name} — blocked launchpad: ${launchpad}`);
+              continue;
+            }
+          }
 
           // Build compact block
           const lines = [
             `POOL: ${pool.name} (${pool.pool})`,
             `  metrics: bin_step=${pool.bin_step}, fee_pct=${pool.fee_pct}%, fee_tvl=${pool.fee_active_tvl_ratio}, vol=$${pool.volume_window}, tvl=$${pool.active_tvl}, volatility=${pool.volatility}, mcap=$${pool.mcap}, organic=${pool.organic_score}`,
+            `  audit: top10=${top10Pct}%, bots=${botPct}%, fees=${feesSol}SOL${launchpad ? `, launchpad=${launchpad}` : ""}`,
             `  smart_wallets: ${sw?.in_pool?.length ?? 0} present${sw?.in_pool?.length ? ` → CONFIDENCE BOOST (${sw.in_pool.map(w => w.name).join(", ")})` : ""}`,
-            h ? `  holders: top_10_pct=${h.top_10_real_holders_pct ?? "?"}%, bundlers_pct=${h.bundlers_pct_in_top_100 ?? "?"}%, global_fees_sol=${h.global_fees_sol ?? "?"}` : `  holders: fetch failed`,
-            momentum ? `  momentum: ${momentum}` : null,
+            priceChange != null ? `  1h: price${priceChange >= 0 ? "+" : ""}${priceChange}%, net_buyers=${netBuyers ?? "?"}` : null,
             n?.narrative ? `  narrative: ${n.narrative.slice(0, 500)}` : `  narrative: none`,
             `  lp_wallet_scoring: ${formatLpWalletScore(scoredLpers)}`,
             `  planner: ${formatPlannerContext(planner, tiering)}`,
@@ -508,48 +530,71 @@ REPORT FORMAT (one per position):
             learnedMemory ? `  learned_memory: ${learnedMemory}` : null,
           ].filter(Boolean);
 
-          return lines.join("\n");
-        })
-      );
+          candidateBlocks.push(lines.join("\n"));
+      }
 
-      const candidateContext = candidateBlocks.length > 0
-        ? `\nPRE-LOADED CANDIDATE ANALYSIS (smart wallets, holders, narrative, planner context, and conservative LP-wallet scoring for the top ${scorePreloadLimit} candidate${scorePreloadLimit === 1 ? "" : "s"}):\n${candidateBlocks.join("\n\n")}\n`
+      let candidateContext = candidateBlocks.length > 0
+        ? `\nPRE-LOADED CANDIDATE ANALYSIS (smart wallets, holders, narrative already fetched):\n${candidateBlocks.join("\n\n")}\n`
         : "";
 
+      // Hive mind consensus (if enabled)
+      try {
+        const hiveMind = await import("./hive-mind.js");
+        if (hiveMind.isEnabled()) {
+          const poolAddrs = candidates.map(c => c.pool).filter(Boolean);
+          if (poolAddrs.length > 0) {
+            const hive = await hiveMind.formatPoolConsensusForPrompt(poolAddrs);
+            if (hive) candidateContext += "\n" + hive + "\n";
+          }
+        }
+      } catch { /* hive is best-effort */ }
+
       const { content } = await agentLoop(`
-SCREENING CYCLE — DEPLOY ONLY
+SCREENING CYCLE
 ${strategyBlock}
 Positions: ${prePositions.total_positions}/${config.risk.maxPositions} | SOL: ${currentBalance.sol.toFixed(3)} | Deploy: ${deployAmount} SOL
 ${candidateContext}
-DECISION RULES (apply to the pre-loaded candidates above, no re-fetching needed):
-- HARD SKIP if global_fees_sol < ${config.screening.minTokenFeesSol} SOL (bundled/scam)
-- HARD SKIP if top_10_pct > 60% OR bundlers_pct > 30%
+DECISION RULES:
+- HARD SKIP if fees < ${config.screening.minTokenFeesSol} SOL (bundled/scam)
+- HARD SKIP if top10 > ${config.screening.maxTop10Pct}% OR bots > ${config.screening.maxBundlersPct}%
+${config.screening.blockedLaunchpads.length ? `- HARD SKIP if launchpad is any of: ${config.screening.blockedLaunchpads.join(", ")}` : ""}
 - SKIP if narrative is empty/null or pure hype with no specific story (unless smart wallets present)
-- Bundlers 5–15% are normal, not a skip reason on their own
+- Bots 5–25% are normal, not a skip reason on their own
 - Smart wallets present → strong confidence boost
 - LP-wallet scoring matters: prefer pools where top scored LPs show real win rate, fee yield, and sample depth
 - Use the pre-loaded planner context to bias strategy/range choices before deploy; only override it if a candidate has a clear contradictory signal
 - LP-wallet scoring preload is conservative and rate-aware. It is only preloaded for the top ${scorePreloadLimit} candidate${scorePreloadLimit === 1 ? "" : "s"}; for later candidates, only fetch score_top_lpers if the cheaper signals already make that pool a serious finalist.
 
 STEPS:
-1. Pick the best candidate from the pre-loaded analysis above. If none pass, report why and stop.
-2. Reuse the pre-loaded LP-wallet scoring and planner context in your reasoning. Do not call choose_distribution_strategy or calculate_dynamic_bin_tiers again unless a candidate block explicitly failed to load and the missing data is decisive.
-3. Only call score_top_lpers for a later candidate if that pool is already a leading deploy option after the cheaper pre-loaded signals and its LP-wallet score would break the tie.
-4. deploy_position directly — it fetches the active bin internally, no separate get_active_bin needed.
-   Use ${deployAmount} SOL. Do NOT use a smaller amount — this is compounded from your ${currentBalance.sol.toFixed(3)} SOL wallet.
-5. Report: pool chosen, key signals, LP-wallet score takeaway, planner takeaway, deploy outcome.
-      `, config.llm.maxSteps, [], "SCREENER", config.llm.screeningModel, 4096);
+1. Pick the best candidate. If none pass, report why and stop.
+2. Call deploy_position with ${deployAmount} SOL. Set bins_below = round(35 + (volatility/5)*34) clamped to [35,69].
+3. Report result.
+      `, config.llm.maxSteps, [], "SCREENER", config.llm.screeningModel, 2048);
       screenReport = content;
     } catch (error) {
       log("cron_error", `Screening cycle failed: ${error.message}`);
       screenReport = `Screening cycle failed: ${error.message}`;
     } finally {
       _screeningBusy = false;
-      if (telegramEnabled()) {
+      if (!silent && telegramEnabled()) {
         if (screenReport) sendMessage(`🔍 Screening Cycle\n\n${screenReport}`).catch(() => {});
       }
     }
+    return screenReport;
+  }
+
+export function startCronJobs() {
+  stopCronJobs();
+
+  const mgmtTask = cron.schedule(`*/${Math.max(1, config.schedule.managementIntervalMin)} * * * *`, async () => {
+    if (_managementBusy) return;
+    _managementBusy = true;
+    timers.managementLastRun = Date.now();
+    try { await runManagementCycle(); }
+    finally { _managementBusy = false; }
   });
+
+  const screenTask = cron.schedule(`*/${Math.max(1, config.schedule.screeningIntervalMin)} * * * *`, runScreeningCycle);
 
   const healthTask = cron.schedule(`0 * * * *`, async () => {
     if (_managementBusy) return;
@@ -738,6 +783,53 @@ if (isTTY) {
       return;
     }
 
+    if (text === "/positions") {
+      try {
+        const { positions, total_positions } = await getMyPositions({ force: true });
+        if (total_positions === 0) { await sendMessage("No open positions."); return; }
+        const lines = positions.map((p, i) => {
+          const pnl = p.pnl_usd >= 0 ? `+$${p.pnl_usd}` : `-$${Math.abs(p.pnl_usd)}`;
+          const age = p.age_minutes != null ? `${p.age_minutes}m` : "?";
+          const oor = !p.in_range ? " ⚠️OOR" : "";
+          return `${i + 1}. ${p.pair} | $${p.total_value_usd} | PnL: ${pnl} | fees: $${p.unclaimed_fees_usd} | ${age}${oor}`;
+        });
+        await sendMessage(`📊 Open Positions (${total_positions}):\n\n${lines.join("\n")}\n\n/close <n> to close | /set <n> <note> to set instruction`);
+      } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
+      return;
+    }
+
+    const closeMatch = text.match(/^\/close\s+(\d+)$/i);
+    if (closeMatch) {
+      try {
+        const idx = parseInt(closeMatch[1]) - 1;
+        const { positions } = await getMyPositions({ force: true });
+        if (idx < 0 || idx >= positions.length) { await sendMessage(`Invalid number. Use /positions first.`); return; }
+        const pos = positions[idx];
+        await sendMessage(`Closing ${pos.pair}...`);
+        const result = await closePosition({ position_address: pos.position });
+        if (result.success) {
+          await sendMessage(`✅ Closed ${pos.pair}\nPnL: $${result.pnl_usd ?? "?"} | txs: ${result.txs?.join(", ")}`);
+        } else {
+          await sendMessage(`❌ Close failed: ${JSON.stringify(result)}`);
+        }
+      } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
+      return;
+    }
+
+    const setMatch = text.match(/^\/set\s+(\d+)\s+(.+)$/i);
+    if (setMatch) {
+      try {
+        const idx = parseInt(setMatch[1]) - 1;
+        const note = setMatch[2].trim();
+        const { positions } = await getMyPositions({ force: true });
+        if (idx < 0 || idx >= positions.length) { await sendMessage(`Invalid number. Use /positions first.`); return; }
+        const pos = positions[idx];
+        setPositionInstruction(pos.position, note);
+        await sendMessage(`✅ Note set for ${pos.pair}:\n"${note}"`);
+      } catch (e) { await sendMessage(`Error: ${e.message}`).catch(() => {}); }
+      return;
+    }
+
     busy = true;
     try {
       log("telegram", `Incoming: ${text}`);
@@ -856,12 +948,16 @@ Commands:
     if (input === "/thresholds") {
       const s = config.screening;
       console.log("\nCurrent screening thresholds:");
-      console.log(`  maxVolatility:    ${s.maxVolatility}`);
-      console.log(`  minFeeTvlRatio:   ${s.minFeeTvlRatio}`);
-      console.log(`  minOrganic:       ${s.minOrganic}`);
-      console.log(`  minHolders:       ${s.minHolders}`);
-      console.log(`  maxPriceChangePct: ${s.maxPriceChangePct}`);
-      console.log(`  timeframe:        ${s.timeframe}`);
+      console.log(`  minFeeActiveTvlRatio: ${s.minFeeActiveTvlRatio}`);
+      console.log(`  minOrganic:           ${s.minOrganic}`);
+      console.log(`  minHolders:           ${s.minHolders}`);
+      console.log(`  minTvl:               ${s.minTvl}`);
+      console.log(`  maxTvl:               ${s.maxTvl}`);
+      console.log(`  minVolume:            ${s.minVolume}`);
+      console.log(`  minTokenFeesSol:      ${s.minTokenFeesSol}`);
+      console.log(`  maxBundlersPct:       ${s.maxBundlersPct}`);
+      console.log(`  maxTop10Pct:          ${s.maxTop10Pct}`);
+      console.log(`  timeframe:            ${s.timeframe}`);
       const perf = getPerformanceSummary();
       if (perf) {
         console.log(`\n  Based on ${perf.total_positions_closed} closed positions`);

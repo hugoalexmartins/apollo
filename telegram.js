@@ -160,17 +160,18 @@ export async function notifyClose({ pair, pnlUsd, pnlPct }) {
   );
 }
 
+export async function notifySwap({ inputSymbol, outputSymbol, amountIn, amountOut, tx }) {
+  await sendHTML(
+    `🔄 <b>Swapped</b> ${inputSymbol} → ${outputSymbol}\n` +
+    `In: ${amountIn ?? "?"} | Out: ${amountOut ?? "?"}\n` +
+    `Tx: <code>${tx?.slice(0, 16)}...</code>`
+  );
+}
+
 export async function notifyOutOfRange({ pair, minutesOOR }) {
   await sendHTML(
     `⚠️ <b>Out of Range</b> ${pair}\n` +
     `Been OOR for ${minutesOOR} minutes`
-  );
-}
-
-export async function notifyCycleSummary({ cycleType, positions, walletSol }) {
-  await sendHTML(
-    `🔄 <b>${cycleType === "management" ? "Management" : "Screening"} cycle done</b>\n` +
-    `Positions: ${positions} open | SOL: ${walletSol}`
   );
 }
 
