@@ -7,16 +7,17 @@ import { getMyPositions, getPositionPnl } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
 import { getTopCandidates } from "./tools/screening.js";
 import { config, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
-import { evolveThresholds, getPerformanceSummary } from "./lessons.js";
+import { evolveThresholds, getPerformanceHistory, getPerformanceSummary } from "./lessons.js";
 import { executeTool, registerCronRestarter } from "./tools/executor.js";
 import { startPolling, stopPolling, sendMessage, sendHTML, notifyOutOfRange, isEnabled as telegramEnabled } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
-import { getLastBriefingDate, getTrackedPosition, recordCycleEvaluation, setLastBriefingDate, updatePnlAndCheckExits } from "./state.js";
+import { getEvaluationSummary, getLastBriefingDate, recordCycleEvaluation, setLastBriefingDate, updatePnlAndCheckExits } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
 import { recordPositionSnapshot, recallForPool } from "./pool-memory.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
 import { getTokenHolders, getTokenNarrative, getTokenInfo } from "./tools/token.js";
 import { getWalletScoreMemory, initMemory, recallForManagement, recallForScreening } from "./memory.js";
+import { deriveExpectedVolumeProfile, planManagementRuntimeAction, resolveTargetManagementInterval } from "./runtime-policy.js";
 
 log("startup", "DLMM LP Agent starting...");
 log("startup", `Mode: ${process.env.DRY_RUN === "true" ? "DRY RUN" : "LIVE"}`);
@@ -50,17 +51,6 @@ function formatCountdown(seconds) {
 function asNumber(value, fallback = 0) {
   const num = Number(value);
   return Number.isFinite(num) ? num : fallback;
-}
-
-function deriveExpectedVolumeProfile(snapshot = {}) {
-  const feeTvlRatio = asNumber(snapshot.fee_active_tvl_ratio ?? snapshot.fee_tvl_ratio, 0);
-  const volume = asNumber(snapshot.volume_window ?? snapshot.volume_24h, 0);
-  const volatility = asNumber(snapshot.six_hour_volatility ?? snapshot.volatility, 0);
-
-  if (volatility >= 18 || volume >= 250_000 || feeTvlRatio >= 1.5) return "bursty";
-  if (volatility >= 10 || volume >= 75_000 || feeTvlRatio >= 0.5) return "high";
-  if (volume >= Math.max(config.screening.minVolume * 8, 10_000) || feeTvlRatio >= 0.12) return "balanced";
-  return "low";
 }
 
 function deriveTrendBias(pool = {}, tokenInfo = null) {
@@ -205,15 +195,71 @@ function truncatePromptText(value, maxLength) {
   return `${normalized.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`;
 }
 
-function resolveTargetManagementInterval(positions) {
-  const maxVolatility = positions.reduce((max, position) => {
-    const tracked = getTrackedPosition(position.position);
-    const candidate = Number(position.volatility ?? tracked?.volatility ?? 0);
-    return Number.isFinite(candidate) ? Math.max(max, candidate) : max;
-  }, 0);
+function formatCandidateSummaryLine(pool, rank) {
+  return `${rank}. ${pool.name} | score=${roundMetric(pool.deterministic_score)} | fee_tvl=${pool.fee_active_tvl_ratio} | vol=$${pool.volume_window} | organic=${pool.organic_score}`;
+}
 
-  const interval = maxVolatility >= 5 ? 3 : maxVolatility >= 2 ? 5 : 10;
-  return { interval, maxVolatility: roundMetric(maxVolatility) };
+function formatCandidateInspection(candidate) {
+  const { pool, smartWallets, holders, narrative, poolMemory, activeBin, scoredLpers } = candidate;
+  const smartWalletCount = smartWallets?.in_pool?.length ?? 0;
+  const activeBinLine = activeBin?.binId != null ? activeBin.binId : "unknown";
+  const narrativeLine = truncatePromptText(narrative?.narrative, 240) || "none";
+  const memoryLine = truncatePromptText(poolMemory, 180) || "none";
+  const holderLine = holders
+    ? `top10=${holders.top_10_real_holders_pct ?? "?"}% | bundlers=${holders.bundlers_pct_in_top_100 ?? "?"}% | fees=${holders.global_fees_sol ?? "?"} SOL`
+    : "unavailable";
+
+  return [
+    `${pool.name} (${pool.pool})`,
+    `score=${roundMetric(pool.deterministic_score)} | fee_tvl=${pool.fee_active_tvl_ratio} | vol=$${pool.volume_window} | tvl=$${pool.active_tvl} | organic=${pool.organic_score}`,
+    `bin_step=${pool.bin_step} | active_bin=${activeBinLine}`,
+    `holders: ${holderLine}`,
+    `smart_wallets: ${smartWalletCount ? smartWallets.in_pool.map((wallet) => wallet.name).join(", ") : "none"}`,
+    `lp_wallet_scoring: ${formatLpWalletScore(scoredLpers)}`,
+    `narrative: ${narrativeLine}`,
+    `pool_memory: ${memoryLine}`,
+  ].join("\n");
+}
+
+async function inspectCandidate(pool, { includeWalletScore = true } = {}) {
+  const mint = pool.base?.mint;
+  const [smartWallets, holders, narrative, tokenInfo, poolMemory, activeBin] = await Promise.allSettled([
+    checkSmartWalletsOnPool({ pool_address: pool.pool }),
+    mint ? getTokenHolders({ mint, limit: 100 }) : Promise.resolve(null),
+    mint ? getTokenNarrative({ mint }) : Promise.resolve(null),
+    mint ? getTokenInfo({ query: mint }) : Promise.resolve(null),
+    Promise.resolve(recallForPool(pool.pool)),
+    executeTool("get_active_bin", { pool_address: pool.pool }),
+  ]);
+
+  let scoredLpers = null;
+  if (includeWalletScore) {
+    const cachedScore = getWalletScoreMemory(pool.pool);
+    scoredLpers = cachedScore.found && (cachedScore.age_minutes == null || cachedScore.age_minutes <= 360)
+      ? {
+          message: `reused wallet-score memory from ${cachedScore.age_minutes ?? 0} minute(s) ago`,
+          candidates: cachedScore.scored_wallets || [],
+        }
+      : await executeTool("score_top_lpers", { pool_address: pool.pool, limit: 4 }).catch(() => null);
+  }
+
+  const sw = smartWallets.status === "fulfilled" ? smartWallets.value : null;
+  const h = holders.status === "fulfilled" ? holders.value : null;
+  const n = narrative.status === "fulfilled" ? narrative.value : null;
+  const ti = tokenInfo.status === "fulfilled" ? tokenInfo.value?.results?.[0] : null;
+  const mem = poolMemory.status === "fulfilled" ? poolMemory.value : null;
+  const active = activeBin.status === "fulfilled" ? activeBin.value : null;
+
+  return {
+    pool,
+    smartWallets: sw,
+    holders: h,
+    narrative: n,
+    tokenInfo: ti,
+    poolMemory: mem,
+    activeBin: active,
+    scoredLpers,
+  };
 }
 
 function enforceManagementIntervalFromPositions(positions) {
@@ -230,63 +276,20 @@ function enforceManagementIntervalFromPositions(positions) {
   return { changed: true, interval, maxVolatility };
 }
 
-function shouldSkipManagedRuntimeAction(position) {
-  const pnlPct = Number.isFinite(Number(position.pnl?.pnl_pct ?? position.pnl_pct))
-    ? Number(position.pnl?.pnl_pct ?? position.pnl_pct)
-    : null;
-
-  return Boolean(
-    position.instruction
-    || position.exitAlert
-    || (pnlPct != null && pnlPct <= config.management.emergencyPriceDropPct)
-    || (pnlPct != null && pnlPct >= config.management.takeProfitFeePct)
-  );
-}
-
 async function runManagementRuntimeActions(positionData) {
   const runtimeActions = [];
 
   for (const position of positionData) {
-    if (shouldSkipManagedRuntimeAction(position)) continue;
+    const plannedAction = planManagementRuntimeAction(position, config);
+    if (!plannedAction) continue;
 
-    const feesUsd = asNumber(position.pnl?.unclaimed_fee_usd ?? position.unclaimed_fees_usd, 0);
-    const oorMinutes = asNumber(position.minutes_out_of_range, 0);
-    const expectedVolumeProfile = deriveExpectedVolumeProfile({
-      fee_tvl_ratio: position.fee_tvl_ratio,
-      volatility: position.pnl?.volatility ?? position.volatility,
-      volume_window: position.volume_window,
-    });
-
-    let toolName = null;
-    let args = null;
-    let reason = null;
-
-    if (position.in_range === false) {
-      toolName = "rebalance_on_exit";
-      args = {
-        position_address: position.position,
-        execute: true,
-        expected_volume_profile: expectedVolumeProfile,
-      };
-      reason = oorMinutes > 0 ? `out of range for ${oorMinutes}m` : "out of range";
-    } else if (feesUsd >= config.management.minClaimAmount) {
-      toolName = "auto_compound_fees";
-      args = {
-        position_address: position.position,
-        execute_reinvest: false,
-        expected_volume_profile: expectedVolumeProfile,
-      };
-      reason = `fees $${feesUsd.toFixed(2)} >= $${config.management.minClaimAmount}`;
-    }
-
-    if (!toolName) continue;
-
-    const result = await executeTool(toolName, args);
+    const result = await executeTool(plannedAction.toolName, plannedAction.args);
     runtimeActions.push({
       position: position.position,
       pair: position.pair,
-      toolName,
-      reason,
+      toolName: plannedAction.toolName,
+      reason: plannedAction.reason,
+      rule: plannedAction.rule,
       result,
     });
   }
@@ -306,6 +309,7 @@ function buildPrompt() {
 let _cronTasks = [];
 let _managementBusy = false; // prevents overlapping management cycles
 let _screeningBusy = false;  // prevents overlapping screening cycles
+let _screeningLastTriggered = 0;
 
 async function runBriefing() {
   log("cron", "Starting morning briefing");
@@ -345,6 +349,7 @@ function stopCronJobs() {
 }
 
 export function startCronJobs() {
+  const screeningCooldownMs = 5 * 60 * 1000;
   stopCronJobs(); // stop any running tasks before (re)starting
 
   const mgmtTask = cron.schedule(`*/${Math.max(1, config.schedule.managementIntervalMin)} * * * *`, async () => {
@@ -376,7 +381,9 @@ export function startCronJobs() {
           },
           positions: [],
         };
-        runScreeningCycle().catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
+        if (Date.now() - _screeningLastTriggered > screeningCooldownMs) {
+          runScreeningCycle().catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
+        }
         return;
       }
 
@@ -407,6 +414,7 @@ export function startCronJobs() {
       const handledRuntimeActionMap = new Map(handledRuntimeActions.map((action) => [action.position, action]));
       const attemptedRuntimeActionMap = new Map(attemptedRuntimeActions.map((action) => [action.position, action]));
       const pendingPositionData = positionData.filter((p) => !handledRuntimeActionMap.has(p.position));
+      const modelManagedPositions = pendingPositionData.filter((p) => Boolean(p.instruction));
       const pendingExitAlerts = pendingPositionData
         .filter((p) => p.exitAlert)
         .map((p) => `- ${p.pair}: ${p.exitAlert}`);
@@ -425,7 +433,7 @@ export function startCronJobs() {
         : "- none";
 
       // Build pre-loaded position blocks for the LLM
-      const positionBlocks = pendingPositionData.map((p) => {
+      const positionBlocks = modelManagedPositions.map((p) => {
         const pnl = p.pnl;
         const runtimeAttempt = attemptedRuntimeActionMap.get(p.position);
         const lines = [
@@ -467,6 +475,37 @@ export function startCronJobs() {
         return;
       }
 
+      if (modelManagedPositions.length === 0) {
+        mgmtReport = `RUNTIME ACTIONS ALREADY EXECUTED
+${handledRuntimeActionBlock}
+
+RUNTIME WRITE ATTEMPTS NOT COMPLETED
+${attemptedRuntimeActionBlock}
+
+No remaining positions required model evaluation this cycle.`;
+        managementEvaluation = {
+          cycle_type: "management",
+          status: "runtime_determined",
+          summary: {
+            positions_total: positions.length,
+            pending_positions: pendingPositionData.length,
+            model_positions: 0,
+            runtime_actions_handled: handledRuntimeActions.length,
+            runtime_actions_attempted: attemptedRuntimeActions.length,
+            enforced_management_interval_min: intervalAdjustment.interval,
+            max_open_position_volatility: intervalAdjustment.maxVolatility,
+          },
+          positions: pendingPositionData.slice(0, 8).map((p) => ({
+            pair: p.pair,
+            position: p.position,
+            in_range: p.in_range,
+            instruction: p.instruction || null,
+            runtime_attempted: attemptedRuntimeActionMap.has(p.position),
+          })),
+        };
+        return;
+      }
+
       // Hive mind pattern consensus (if enabled)
       let hivePatterns = "";
       try {
@@ -481,7 +520,7 @@ export function startCronJobs() {
       } catch { /* hive is best-effort */ }
 
       const { content } = await agentLoop(`
-MANAGEMENT CYCLE — ${positions.length} position(s), ${pendingPositionData.length} still actionable after runtime orchestration
+        MANAGEMENT CYCLE — ${positions.length} position(s), ${modelManagedPositions.length} still require model evaluation after runtime orchestration
 
 RUNTIME ACTIONS ALREADY EXECUTED THIS CYCLE (do not repeat any write action for these positions):
 ${handledRuntimeActionBlock}
@@ -492,32 +531,24 @@ ${attemptedRuntimeActionBlock}
 PRE-LOADED POSITION DATA (no fetching needed):
 ${positionBlocks}${hivePatterns}
 
-${pendingExitAlerts.length ? `AUTOMATIC EXIT ALERTS (highest priority — close these immediately):
+${pendingExitAlerts.length ? `AUTOMATIC EXIT ALERTS (already handled by runtime this cycle):
 ${pendingExitAlerts.join("\n")}
 
-` : ""}HARD CLOSE RULES — apply in order, first match wins:
+` : ""}INSTRUCTION RULES ONLY:
 1. instruction set AND condition met → CLOSE (highest priority)
-2. instruction set AND condition NOT met → HOLD, skip remaining rules
-3. pnl_pct <= ${config.management.emergencyPriceDropPct}% → CLOSE (stop loss)
-4. pnl_pct >= ${config.management.takeProfitFeePct}% → CLOSE (take profit)
-5. in_range = false → REBALANCE with rebalance_on_exit immediately, unless a higher-priority close rule already fired
-6. fee_per_tvl_24h < ${config.management.minFeePerTvl24h} AND age_minutes >= 60 → CLOSE (fee yield too low)
-7. fee_active_tvl_ratio < ${config.screening.minFeeActiveTvlRatio} AND volume < $${config.screening.minVolume} → CLOSE (yield dead)
-
-CLAIM RULE: If a position is staying open and unclaimed_fee_usd >= ${config.management.minClaimAmount}, use auto_compound_fees with execute_reinvest=false. Do not call claim_fees directly unless auto_compound_fees is unavailable.
+2. instruction set AND condition NOT met → HOLD
 
 INSTRUCTIONS:
 All data is pre-loaded above — do NOT call get_my_positions or get_position_pnl.
-Apply the rules to each position and write your report immediately.
+Only evaluate positions that still carry an instruction.
 Never repeat a write action for any position already listed in RUNTIME ACTIONS ALREADY EXECUTED.
 If a position shows runtime_attempt_this_cycle, do not retry that same tool again this cycle. You may still choose a different action or report why no further action is safe.
-Only call tools if a remaining position needs to be CLOSED, REBALANCED, or fees need safe-mode compounding.
-If you use auto_compound_fees, keep execute_reinvest=false because in-place compounding is still blocked; safe mode claims fees and returns a non-executed reinvest plan.
+Only call tools if an instruction condition is met and a close is required.
 If all positions STAY and no fees to claim, just write the report with no tool calls.
 
 REPORT FORMAT (one per position):
 **[PAIR]** | Age: [X]m | Unclaimed: $[X] | Claimed: $[X] | PnL: [X]%
-**Rule:** [number or "none"] | **Decision:** STAY/CLOSE/REBALANCE/COMPOUND | **Reason:** [1 sentence]
+**Instruction:** [met / not met] | **Decision:** STAY/CLOSE | **Reason:** [1 sentence]
       `, config.llm.maxSteps, [], "MANAGER", config.llm.managementModel, 4096);
       mgmtReport = runtimeActions.length > 0
         ? `RUNTIME ACTIONS ALREADY EXECUTED\n${handledRuntimeActionBlock}\n\nRUNTIME WRITE ATTEMPTS NOT COMPLETED\n${attemptedRuntimeActionBlock}\n\n${content}`
@@ -526,8 +557,9 @@ REPORT FORMAT (one per position):
         cycle_type: "management",
         status: "completed",
         summary: {
-          positions_total: positions.length,
+            positions_total: positions.length,
             pending_positions: pendingPositionData.length,
+            model_positions: modelManagedPositions.length,
             runtime_actions_handled: handledRuntimeActions.length,
             runtime_actions_attempted: attemptedRuntimeActions.length,
             exit_alerts: pendingExitAlerts.length,
@@ -571,6 +603,8 @@ REPORT FORMAT (one per position):
 
   async function runScreeningCycle() {
     if (_screeningBusy) return;
+    _screeningBusy = true;
+    _screeningLastTriggered = Date.now();
 
     // Hard guards — don't even run the agent if preconditions aren't met
     let prePositions, preBalance;
@@ -614,7 +648,6 @@ REPORT FORMAT (one per position):
       return;
     }
 
-    _screeningBusy = true;
     timers.screeningLastRun = Date.now();
     log("cron", `Starting screening cycle [model: ${config.llm.screeningModel}]`);
     let screenReport = null;
@@ -634,31 +667,28 @@ REPORT FORMAT (one per position):
         : `No active strategy — use default bid_ask, bins_above: 0, SOL only.`;
 
       // Pre-load top candidates + all recon data in parallel (saves 4-6 LLM steps)
-      screeningTopCandidates = await getTopCandidates({ limit: 5 }).catch(() => null);
+      screeningTopCandidates = await getTopCandidates({ limit: 8 }).catch(() => null);
       const candidates = screeningTopCandidates?.candidates || screeningTopCandidates?.pools || [];
       const totalEligible = screeningTopCandidates?.total_eligible ?? candidates.length;
       const blockedSummary = screeningTopCandidates?.blocked_summary || {};
+      const shortlist = candidates.slice(0, Math.min(5, candidates.length));
+      const finalists = shortlist.slice(0, Math.min(2, shortlist.length));
 
-      const scorePreloadLimit = Math.min(2, candidates.length);
-      const preloadedLpScores = new Map();
-      for (const pool of candidates.slice(0, scorePreloadLimit)) {
-        const cachedScore = getWalletScoreMemory(pool.pool);
-        const scoreResult = cachedScore.found && (cachedScore.age_minutes == null || cachedScore.age_minutes <= 360)
-          ? {
-              message: `reused wallet-score memory from ${cachedScore.age_minutes ?? 0} minute(s) ago`,
-              candidates: cachedScore.scored_wallets || [],
-              source_status: {
-                lpagent: { status: "cached_memory" },
-                dune: { status: "cached_memory" },
-              },
-            }
-          : await executeTool("score_top_lpers", { pool_address: pool.pool, limit: 4 });
-        preloadedLpScores.set(pool.pool, scoreResult);
-      }
+      candidateEvaluations = shortlist.map((pool) => ({
+        pool: pool.pool,
+        name: pool.name,
+        ranking_score: roundMetric(pool.deterministic_score),
+        context_score: roundMetric(pool.deterministic_score),
+        hard_blocked: false,
+        hard_blocks: [],
+        smart_wallet_count: 0,
+        holder_metrics: null,
+        wallet_score_source: finalists.some((candidate) => candidate.pool === pool.pool) ? "finalist_preload" : "not_loaded",
+        wallet_score_age_minutes: null,
+      }));
 
-      const candidateBlocks = [];
-      candidateEvaluations = [];
-      for (const pool of candidates.slice(0, 5)) {
+      const finalistBlocks = [];
+      for (const pool of finalists) {
         const mint = pool.base?.mint;
         const planningPoolData = {
           six_hour_volatility: asNumber(pool.six_hour_volatility ?? pool.volatility, 0),
@@ -671,97 +701,94 @@ REPORT FORMAT (one per position):
           volume_24h: asNumber(pool.volume_24h ?? pool.volume_window, 0),
         };
         const expectedVolumeProfile = deriveExpectedVolumeProfile(pool);
-        const [smartWallets, holders, narrative, tokenInfo, poolMemory, distributionPlan, tierPlan] = await Promise.allSettled([
-            checkSmartWalletsOnPool({ pool_address: pool.pool }),
-            mint ? getTokenHolders({ mint, limit: 100 }) : Promise.resolve(null),
-            mint ? getTokenNarrative({ mint }) : Promise.resolve(null),
-            mint ? getTokenInfo({ query: mint }) : Promise.resolve(null),
-            Promise.resolve(recallForPool(pool.pool)),
-            executeTool("choose_distribution_strategy", {
-              pool_data: planningPoolData,
-              expected_volume_profile: expectedVolumeProfile,
-            }),
-            executeTool("calculate_dynamic_bin_tiers", {
-              six_hour_volatility: planningPoolData.six_hour_volatility,
-              trend_bias: deriveTrendBias(pool),
-            }),
-          ]);
+        const [inspection, distributionPlan, tierPlan] = await Promise.all([
+          inspectCandidate(pool),
+          executeTool("choose_distribution_strategy", {
+            pool_data: planningPoolData,
+            expected_volume_profile: expectedVolumeProfile,
+          }),
+          executeTool("calculate_dynamic_bin_tiers", {
+            six_hour_volatility: planningPoolData.six_hour_volatility,
+            trend_bias: deriveTrendBias(pool, null),
+          }),
+        ]);
 
-          const sw   = smartWallets.status === "fulfilled" ? smartWallets.value : null;
-          const h    = holders.status === "fulfilled" ? holders.value : null;
-          const n    = narrative.status === "fulfilled" ? narrative.value : null;
-          const ti   = tokenInfo.status === "fulfilled" ? tokenInfo.value?.results?.[0] : null;
-          const mem  = poolMemory.value;
-          const scoredLpers = preloadedLpScores.get(pool.pool) || {
-            message: `not preloaded (rate-safe budget reserved for top ${scorePreloadLimit} candidate${scorePreloadLimit === 1 ? "" : "s"}; fetch only if decisive)`,
-            candidates: [],
-          };
-          const planner = distributionPlan.status === "fulfilled" ? distributionPlan.value : null;
-          const tiering = tierPlan.status === "fulfilled" ? tierPlan.value : null;
-          const candidateIntel = evaluateCandidateIntel(pool, {
-            smartWallets: sw,
-            holders: h,
-            narrative: n,
-            scoredLpers,
-          });
-          const memoryHits = recallForScreening({
-            name: pool.name,
-            pair: pool.name,
-            base_token: mint,
-            bin_step: pool.bin_step,
-          });
-          const learnedMemory = memoryHits.length
-            ? memoryHits.map((hit) => `[${hit.source}] ${hit.key}: ${hit.answer}`).join(" | ")
-            : null;
+        const sw = inspection.smartWallets;
+        const h = inspection.holders;
+        const n = inspection.narrative;
+        const ti = inspection.tokenInfo;
+        const mem = inspection.poolMemory;
+        const scoredLpers = inspection.scoredLpers || {
+          message: "wallet score unavailable",
+          candidates: [],
+        };
+        const planner = distributionPlan;
+        const tiering = tierPlan;
+        const candidateIntel = evaluateCandidateIntel(pool, {
+          smartWallets: sw,
+          holders: h,
+          narrative: n,
+          scoredLpers,
+        });
+        const memoryHits = recallForScreening({
+          name: pool.name,
+          pair: pool.name,
+          base_token: mint,
+          bin_step: pool.bin_step,
+        });
+        const learnedMemory = memoryHits.length
+          ? memoryHits.map((hit) => `[${hit.source}] ${hit.key}: ${hit.answer}`).join(" | ")
+          : null;
 
-          const momentum = ti?.stats_1h
-            ? `1h: price${ti.stats_1h.price_change >= 0 ? "+" : ""}${ti.stats_1h.price_change}%, buyers=${ti.stats_1h.buyers}, net_buyers=${ti.stats_1h.net_buyers}`
-            : null;
-          const smartWalletCount = sw?.in_pool?.length ?? 0;
-          const smartWalletLine = smartWalletCount
-            ? `  smart_wallets: ${smartWalletCount} present → CONFIDENCE BOOST (${sw.in_pool.map(w => w.name).join(", ")})`
-            : null;
-          const holderLine = h
-            ? `  holders: top_10_pct=${h.top_10_real_holders_pct ?? "?"}%, bundlers_pct=${h.bundlers_pct_in_top_100 ?? "?"}%, global_fees_sol=${h.global_fees_sol ?? "?"}`
-            : null;
-          const narrativeLine = truncatePromptText(n?.narrative, 200);
-          const poolMemoryLine = truncatePromptText(mem, 140);
-          const learnedMemoryLine = truncatePromptText(learnedMemory, 140);
+        const momentum = ti?.stats_1h
+          ? `1h: price${ti.stats_1h.price_change >= 0 ? "+" : ""}${ti.stats_1h.price_change}%, buyers=${ti.stats_1h.buyers}, net_buyers=${ti.stats_1h.net_buyers}`
+          : null;
+        const smartWalletCount = sw?.in_pool?.length ?? 0;
+        const smartWalletLine = smartWalletCount
+          ? `  smart_wallets: ${smartWalletCount} present → CONFIDENCE BOOST (${sw.in_pool.map(w => w.name).join(", ")})`
+          : null;
+        const holderLine = h
+          ? `  holders: top_10_pct=${h.top_10_real_holders_pct ?? "?"}%, bundlers_pct=${h.bundlers_pct_in_top_100 ?? "?"}%, global_fees_sol=${h.global_fees_sol ?? "?"}`
+          : null;
+        const narrativeLine = truncatePromptText(n?.narrative, 200);
+        const poolMemoryLine = truncatePromptText(mem, 140);
+        const learnedMemoryLine = truncatePromptText(learnedMemory, 140);
 
-          // Build compact block
-          const lines = [
-            `POOL: ${pool.name} (${pool.pool})`,
-            `  metrics: bin_step=${pool.bin_step}, fee_tvl=${pool.fee_active_tvl_ratio}, vol=$${pool.volume_window}, tvl=$${pool.active_tvl}, organic=${pool.organic_score}`,
-            `  ranking_score: ${roundMetric(pool.deterministic_score)} | context_score: ${candidateIntel.score.context_score}`,
-            `  hard_gate: ${candidateIntel.hard_blocked ? `BLOCKED (${candidateIntel.hard_blocks.join(", ")})` : "pass"}`,
-            smartWalletLine,
-            holderLine,
-            momentum ? `  momentum: ${momentum}` : null,
-            narrativeLine ? `  narrative: ${narrativeLine}` : null,
-            `  lp_wallet_scoring: ${formatLpWalletScore(scoredLpers)}`,
-            `  planner: ${formatPlannerContext(planner, tiering)}`,
-            poolMemoryLine ? `  pool_memory: ${poolMemoryLine}` : null,
-            learnedMemoryLine ? `  learned_memory: ${learnedMemoryLine}` : null,
-          ].filter(Boolean);
+        const evalEntry = candidateEvaluations.find((entry) => entry.pool === pool.pool);
+        if (evalEntry) {
+          evalEntry.context_score = candidateIntel.score.context_score;
+          evalEntry.hard_blocked = candidateIntel.hard_blocked;
+          evalEntry.hard_blocks = candidateIntel.hard_blocks;
+          evalEntry.smart_wallet_count = candidateIntel.smart_wallet_count;
+          evalEntry.holder_metrics = candidateIntel.holder_metrics;
+          evalEntry.wallet_score_source = candidateIntel.wallet_score_source;
+          evalEntry.wallet_score_age_minutes = candidateIntel.wallet_score_age_minutes;
+        }
 
-          candidateEvaluations.push({
-            pool: pool.pool,
-            name: pool.name,
-            ranking_score: candidateIntel.score.ranking_score,
-            context_score: candidateIntel.score.context_score,
-            hard_blocked: candidateIntel.hard_blocked,
-            hard_blocks: candidateIntel.hard_blocks,
-            smart_wallet_count: candidateIntel.smart_wallet_count,
-            holder_metrics: candidateIntel.holder_metrics,
-            wallet_score_source: candidateIntel.wallet_score_source,
-            wallet_score_age_minutes: candidateIntel.wallet_score_age_minutes,
-          });
-          candidateBlocks.push(lines.join("\n"));
+        finalistBlocks.push([
+          `FINALIST: ${pool.name} (${pool.pool})`,
+          `  metrics: bin_step=${pool.bin_step}, fee_tvl=${pool.fee_active_tvl_ratio}, vol=$${pool.volume_window}, tvl=$${pool.active_tvl}, organic=${pool.organic_score}`,
+          `  ranking_score: ${roundMetric(pool.deterministic_score)} | context_score: ${candidateIntel.score.context_score}`,
+          `  hard_gate: ${candidateIntel.hard_blocked ? `BLOCKED (${candidateIntel.hard_blocks.join(", ")})` : "pass"}`,
+          smartWalletLine,
+          holderLine,
+          inspection.activeBin?.binId != null ? `  active_bin: ${inspection.activeBin.binId}` : null,
+          momentum ? `  momentum: ${momentum}` : null,
+          narrativeLine ? `  narrative: ${narrativeLine}` : null,
+          `  lp_wallet_scoring: ${formatLpWalletScore(scoredLpers)}`,
+          `  planner: ${formatPlannerContext(planner, tiering)}`,
+          poolMemoryLine ? `  pool_memory: ${poolMemoryLine}` : null,
+          learnedMemoryLine ? `  learned_memory: ${learnedMemoryLine}` : null,
+        ].filter(Boolean).join("\n"));
       }
 
-      let candidateContext = candidateBlocks.length > 0
-        ? `\nPRE-LOADED CANDIDATE ANALYSIS (smart wallets, 100-holder distribution, narrative, planner context, and conservative LP-wallet scoring for the top ${scorePreloadLimit} candidate${scorePreloadLimit === 1 ? "" : "s"}):\n${candidateBlocks.join("\n\n")}\n`
-        : "";
+      const rankedShortlist = shortlist.length > 0
+        ? shortlist.map((pool, index) => formatCandidateSummaryLine(pool, index + 1)).join("\n")
+        : "none";
+      let candidateContext = `\nRANKED SHORTLIST (deterministic rank before enrichment):\n${rankedShortlist}\n`;
+      if (finalistBlocks.length > 0) {
+        candidateContext += `\nFINALIST ANALYSIS (only top ${finalists.length} candidate${finalists.length === 1 ? "" : "s"} were enriched with smart wallets, holders, narrative, planner context, and LP-wallet scoring):\n${finalistBlocks.join("\n\n")}\n`;
+      }
 
       // Hive mind consensus (if enabled)
       try {
@@ -770,7 +797,7 @@ REPORT FORMAT (one per position):
           const poolAddrs = candidates.map(c => c.pool).filter(Boolean);
           if (poolAddrs.length > 0) {
             const hive = await hiveMind.formatPoolConsensusForPrompt(poolAddrs);
-            if (hive) candidateContext += "\n" + hive + "\n";
+            if (hive) candidateContext += `\n${hive}\n`;
           }
         }
       } catch { /* hive is best-effort */ }
@@ -783,12 +810,12 @@ ${candidateContext}
 DECISION RULES (apply to the pre-loaded candidates above, no re-fetching needed):
 - Respect hard_gate=BLOCKED. Never deploy a blocked candidate.
 - Ranking precedence: use ranking_score first. context_score is explanatory context only; it must not override a blocked candidate.
-- LP-wallet scoring preload is conservative and rate-aware. It is only preloaded for the top ${scorePreloadLimit} candidate${scorePreloadLimit === 1 ? "" : "s"}; for later candidates, only fetch score_top_lpers if the cheaper signals already make that pool a serious finalist.
+- Only the top ${finalists.length} finalist candidate${finalists.length === 1 ? "" : "s"} were enriched with heavy signals. Treat the remaining ranked shortlist as cheap deterministic context unless you have a strong reason to fetch more.
 
 STEPS:
 1. Pick the best candidate from the pre-loaded analysis above. If none pass, report why and stop.
 2. Reuse the pre-loaded LP-wallet scoring and planner context in your reasoning. Do not call choose_distribution_strategy or calculate_dynamic_bin_tiers again unless a candidate block explicitly failed to load and the missing data is decisive.
-3. Only call score_top_lpers for a later candidate if that pool is already a leading deploy option after the cheaper pre-loaded signals and its LP-wallet score would break the tie.
+3. Only call score_top_lpers or other heavy enrichment for a later ranked candidate if that pool is already a leading deploy option after the cheap deterministic signals and the missing data would break the tie.
 4. deploy_position directly — it fetches the active bin internally, no separate get_active_bin needed.
    Use ${deployAmount} SOL. Do NOT use a smaller amount — this is compounded from your ${currentBalance.sol.toFixed(3)} SOL wallet.
 5. Report: pool chosen, key signals, LP-wallet score takeaway, planner takeaway, deploy outcome.
@@ -884,16 +911,17 @@ function formatCandidates(candidates) {
 
   const lines = candidates.map((p, i) => {
     const name   = (p.name || "unknown").padEnd(20);
+    const score  = `${roundMetric(p.deterministic_score ?? 0)}`.padStart(6);
     const ftvl   = `${p.fee_active_tvl_ratio ?? p.fee_tvl_ratio}%`.padStart(8);
     const vol    = `$${((p.volume_24h || 0) / 1000).toFixed(1)}k`.padStart(8);
     const active = `${p.active_pct}%`.padStart(6);
     const org    = String(p.organic_score).padStart(4);
-    return `  [${i + 1}]  ${name}  fee/aTVL:${ftvl}  vol:${vol}  in-range:${active}  organic:${org}`;
+    return `  [${i + 1}]  ${name}  score:${score}  fee/aTVL:${ftvl}  vol:${vol}  in-range:${active}  organic:${org}`;
   });
 
   return [
-    "  #   pool                  fee/aTVL     vol    in-range  organic",
-    "  " + "─".repeat(68),
+    "  #   pool                  score  fee/aTVL     vol    in-range  organic",
+    `  ${"─".repeat(76)}`,
     ...lines,
   ].join("\n");
 }
@@ -1042,6 +1070,9 @@ Commands:
   auto           Let the agent pick and deploy automatically
   /status        Refresh wallet + positions
   /candidates    Refresh top pool list
+  /candidate <n> Inspect one ranked candidate with richer signals
+  /evaluation    Show recent cycle/tool evaluation summary
+  /performance   Show recent closed-position performance history
   /briefing      Show morning briefing (last 24h)
   /learn         Study top LPers from the best current pool and save lessons
   /learn <addr>  Study top LPers from a specific pool address
@@ -1057,8 +1088,8 @@ Commands:
     if (!input) { rl.prompt(); return; }
 
     // ── Number pick: deploy into pool N ─────
-    const pick = parseInt(input);
-    if (!isNaN(pick) && pick >= 1 && pick <= startupCandidates.length) {
+    const pick = Number.parseInt(input, 10);
+    if (!Number.isNaN(pick) && pick >= 1 && pick <= startupCandidates.length) {
       await runBusy(async () => {
         const pool = startupCandidates[pick - 1];
         console.log(`\nDeploying ${DEPLOY} SOL into ${pool.name}...\n`);
@@ -1128,6 +1159,84 @@ Commands:
         startupCandidates = candidates;
         console.log(`\nTop pools (${total_eligible} eligible from ${total_screened} screened):\n`);
         console.log(formatCandidates(candidates));
+        console.log();
+      });
+      return;
+    }
+
+    const candidateMatch = input.match(/^\/candidate\s+(\d+)$/i);
+    if (candidateMatch) {
+      await runBusy(async () => {
+        const idx = Number(candidateMatch[1]) - 1;
+        if (idx < 0 || idx >= startupCandidates.length) {
+          console.log("\nInvalid candidate number. Use /candidates first.\n");
+          return;
+        }
+
+        const inspection = await inspectCandidate(startupCandidates[idx]);
+        console.log(`\n${formatCandidateInspection(inspection)}\n`);
+      });
+      return;
+    }
+
+    if (input === "/evaluation") {
+      await runBusy(async () => {
+        const evaluation = getEvaluationSummary(5);
+        console.log("\nRecent evaluation summary:\n");
+        console.log(`  management_cycles: ${evaluation.counters.management_cycles}`);
+        console.log(`  screening_cycles:  ${evaluation.counters.screening_cycles}`);
+        console.log(`  candidates_scored: ${evaluation.counters.candidates_scored}`);
+        console.log(`  candidates_blocked:${evaluation.counters.candidates_blocked}`);
+        console.log(`  runtime_handled:   ${evaluation.counters.runtime_actions_handled}`);
+        console.log(`  runtime_attempted: ${evaluation.counters.runtime_actions_attempted}`);
+        console.log(`  tool_blocks:       ${evaluation.counters.tool_blocks}`);
+        console.log(`  tool_errors:       ${evaluation.counters.tool_errors}`);
+        console.log(`  write_successes:   ${evaluation.counters.write_successes}`);
+
+        if (evaluation.recent_cycles.length > 0) {
+          console.log("\n  Recent cycles:");
+          for (const cycle of evaluation.recent_cycles) {
+            console.log(`    - ${cycle.ts}: ${cycle.cycle_type} / ${cycle.status} / ${JSON.stringify(cycle.summary)}`);
+          }
+        }
+
+        if (evaluation.recent_tool_outcomes.length > 0) {
+          console.log("\n  Recent tool outcomes:");
+          for (const outcome of evaluation.recent_tool_outcomes) {
+            console.log(`    - ${outcome.ts}: ${outcome.tool} / ${outcome.outcome}${outcome.reason ? ` / ${outcome.reason}` : ""}`);
+          }
+        }
+        console.log();
+      });
+      return;
+    }
+
+    if (input === "/performance") {
+      await runBusy(async () => {
+        const summary = getPerformanceSummary();
+        const history = getPerformanceHistory({ hours: 168, limit: 5 });
+
+        if (!summary) {
+          console.log("\nNo closed-position performance recorded yet.\n");
+          return;
+        }
+
+        console.log("\nPerformance summary:\n");
+        console.log(`  total_positions_closed:   ${summary.total_positions_closed}`);
+        console.log(`  total_pnl_usd:            ${summary.total_pnl_usd}`);
+        console.log(`  total_inventory_pnl_usd:  ${summary.total_inventory_pnl_usd}`);
+        console.log(`  total_fee_component_usd:  ${summary.total_fee_component_usd}`);
+        console.log(`  avg_pnl_pct:              ${summary.avg_pnl_pct}%`);
+        console.log(`  avg_range_efficiency_pct: ${summary.avg_range_efficiency_pct}%`);
+        console.log(`  avg_operational_touches:  ${summary.avg_operational_touch_count}`);
+        console.log(`  win_rate_pct:             ${summary.win_rate_pct}%`);
+
+        if (history.positions.length > 0) {
+          console.log("\n  Recent closes:");
+          for (const row of history.positions) {
+            console.log(`    - ${row.pool_name}: pnl=${row.pnl_usd} usd | inventory=${row.inventory_pnl_usd} | fees=${row.fee_component_usd} | touches=${row.operational_touch_count} | reason=${row.close_reason}`);
+          }
+        }
         console.log();
       });
       return;
@@ -1218,7 +1327,7 @@ Focus on: hold duration, entry/exit timing, what win rates look like, whether sc
           console.log(`\nNeed at least 5 closed positions to evolve. ${needed} more needed.\n`);
           return;
         }
-        const fs = await import("fs");
+        const fs = await import("node:fs");
         const lessonsData = JSON.parse(fs.default.readFileSync("./lessons.json", "utf8"));
         const result = evolveThresholds(lessonsData.performance, config);
         if (!result || Object.keys(result.changes).length === 0) {
@@ -1226,7 +1335,7 @@ Focus on: hold duration, entry/exit timing, what win rates look like, whether sc
         } else {
           reloadScreeningThresholds();
           console.log("\nThresholds evolved:");
-          for (const [key, val] of Object.entries(result.changes)) {
+          for (const [key] of Object.entries(result.changes)) {
             console.log(`  ${key}: ${result.rationale[key]}`);
           }
           console.log("\nSaved to user-config.json. Applied immediately.\n");
