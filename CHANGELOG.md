@@ -4,6 +4,17 @@ This file documents the major additions and behavior changes present in this for
 
 ## Recent updates
 
+### 2026-03-25
+
+- Hardened staged screening so the bot cheap-ranks a wider candidate set, surfaces a deterministic shortlist, and deeply enriches only the strongest finalists.
+- Shifted more management behavior into deterministic runtime policy so obvious close / rebalance / fee-threshold actions are resolved before the LLM is asked to reason.
+- Added richer operator-facing reporting with `/candidate <n>`, `/evaluation`, and `/performance` surfaces for finalist inspection, cycle telemetry, and closed-position attribution.
+- Improved post-trade attribution by storing inventory contribution, fee contribution, and operational touch counts in lessons/performance history.
+- Fixed adaptive threshold drift so threshold evolution now updates live screening keys actually used by the runtime.
+- Improved inventory-aware safety by carrying `base_mint` through tracked/open positions, strengthening duplicate-token awareness.
+- Added provider-free focused tests for runtime policy and threshold evolution (`runtime-policy.test.js`, `lessons.test.js`).
+- Updated the screening smoke harness so it reflects the current ranked-candidate flow and exits cleanly.
+
 - Added deterministic LP planning flows with `choose_distribution_strategy` and `calculate_dynamic_bin_tiers`, plus runtime reuse of preloaded planner context during screening and rebalance decisions.
 - Added LP-agent wallet scoring with `score_top_lpers`, wallet-score memory per pool, and conservative score preloading for top candidates to stay rate-aware.
 - Added distribution success-rate memory from closed positions so future cycles can reuse prior outcomes by distribution key.

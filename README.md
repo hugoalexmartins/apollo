@@ -2,6 +2,8 @@
 
 **Autonomous Meteora DLMM liquidity management agent for Solana, powered by LLM-guided runtime orchestration.**
 
+Implementation status updated: `2026-03-25`
+
 ---
 
 ## What it does
@@ -30,12 +32,14 @@ Two specialized agents run on independent schedules:
 A third health check runs hourly to summarize portfolio state.
 
 **Current runtime behavior:**
-- Screening cycles rank candidates in code first, then preload LP-wallet scoring and planner context for the strongest finalists instead of refetching `score_top_lpers`, `choose_distribution_strategy`, or `calculate_dynamic_bin_tiers` blindly
-- Management cycles prefer `rebalance_on_exit` immediately when a position is out of range and no higher-priority stop-loss / trailing-take-profit / instruction-driven exit already fired
+- Screening cycles now use a staged funnel: cheap deterministic ranking across a wider candidate set, a visible ranked shortlist, and deep enrichment only for top finalists instead of enriching every candidate equally
+- Management cycles now resolve obvious runtime actions first (stop-loss closes, take-profit closes, low-yield closes, fee-threshold handling, and out-of-range rebalances) and leave the LLM mainly with instruction-bound edge cases
 - Management cadence is runtime-owned and auto-adjusts from the most volatile open position: `>= 5 -> 3m`, `>= 2 -> 5m`, otherwise `10m`
 - Fee handling prefers `auto_compound_fees` in safe mode with `execute_reinvest=false`; this claims fees and returns a reinvest plan, but does **not** perform true in-place compounding
 - Runtime protections prevent duplicate close/claim/rebalance/compound actions for the same position within the same cycle
 - Screening prompts are intentionally slimmer: deterministic control signals stay visible, but narrative and memory context are truncated so the model sees less noise
+- Closed-position learning now records inventory-vs-fee contribution and operational touch counts so later evaluation is less likely to confuse extra actions with better outcomes
+- Threshold evolution now only mutates live screening keys that the runtime actually uses
 
 **Data sources used by the agent:**
 - `@meteora-ag/dlmm` SDK — on-chain position data, active bin, deploy/close flows
@@ -163,6 +167,9 @@ After startup, an interactive prompt is available. The prompt shows a live count
 | `auto` | Let the agent pick the best pool and deploy automatically |
 | `/status` | Refresh and display wallet balance and open positions |
 | `/candidates` | Re-screen and display the current top candidates |
+| `/candidate <n>` | Inspect one ranked candidate with richer signals on demand |
+| `/evaluation` | Show recent cycle/tool evaluation summaries |
+| `/performance` | Show recent closed-position attribution and history |
 | `/learn` | Study top LPers across current candidate pools and save lessons |
 | `/learn <pool_address>` | Study top LPers for one specific pool |
 | `<wallet_address>` | Inspect a wallet's positions or a pool's LP-wallet context |
@@ -218,6 +225,8 @@ Strategy memory no longer depends only on exact `strategy + bin step` pairings. 
 
 Zenith now also keeps bounded evaluation summaries in local state: recent management/screening cycles, recent tool outcomes, and compact counters such as candidates scored, candidates blocked, runtime actions handled, and write-tool blocks/errors. These are meant for operator visibility and auditability, not as a second hidden strategy engine.
 
+Closed-position performance summaries now expose a slightly more honest decomposition of outcomes: inventory contribution, fee contribution, and operational touch counts are stored alongside headline PnL so the operator can distinguish cleaner wins from high-touch wins.
+
 ### Candidate quality gates
 
 Holder-quality checks now rely on stronger signals such as `common_funder` and `funded_same_window`. The older `similar_amount` heuristic was removed because it over-flagged legitimate small holders at top-100 scale.
@@ -233,6 +242,20 @@ Compounding is currently **safe-mode claim/planning**, not true in-place compoun
 - The current runtime intentionally blocks duplicate same-pool deployment and does not claim that an in-place compound happened when it did not
 
 Treat the compounding output as a claim plus a suggested next action, not as a completed in-position reinvest.
+
+---
+
+## Verification surfaces
+
+Zenith now has focused provider-free checks for important deterministic control paths:
+- `state.test.js` — bounded state/evaluation summaries
+- `tools/screening.test.js` — deterministic ranking and hard gates
+- `memory.test.js` — broader strategy-memory buckets
+- `prompt.test.js` — prompt/runtime contract expectations
+- `lessons.test.js` — threshold-evolution key alignment and attribution summaries
+- `runtime-policy.test.js` — runtime management policy decisions
+
+Smoke scripts still exist for screening and startup, but the focused tests are the stronger signal for the deterministic control plane.
 
 ---
 
