@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { evaluateCandidateSnapshot, rankCandidateSnapshots } from "./screening.js";
+import { discoverPools, evaluateCandidateSnapshot, rankCandidateSnapshots, resetDiscoveryCache } from "./screening.js";
 
 function buildPool(overrides = {}) {
   return {
@@ -48,4 +48,58 @@ test("rankCandidateSnapshots sorts eligible pools by deterministic score", () =>
   assert.equal(ranked.candidates[0].pool, "pool-high");
   assert.ok(ranked.candidates[0].deterministic_score > ranked.candidates[1].deterministic_score);
   assert.equal(ranked.blocked_summary.pool_already_open, 1);
+});
+
+test("discoverPools reuses short-lived cache for identical requests", async () => {
+  const originalFetch = global.fetch;
+  let calls = 0;
+
+  global.fetch = async () => {
+    calls += 1;
+    return {
+      ok: true,
+      json: async () => ({
+        total: 1,
+        data: [{
+          pool_address: "pool-a",
+          name: "Alpha-SOL",
+          token_x: { address: "mint-a", symbol: "ALPHA", organic_score: 80, warnings: [] },
+          token_y: { address: "So11111111111111111111111111111111111111112", symbol: "SOL" },
+          pool_type: "dlmm",
+          dlmm_params: { bin_step: 80 },
+          fee_pct: 1,
+          active_tvl: 15000,
+          fee: 200,
+          volume: 50000,
+          fee_active_tvl_ratio: 1.33,
+          volatility: 3,
+          base_token_holders: 1200,
+          active_positions: 15,
+          active_positions_pct: 60,
+          open_positions: 10,
+          pool_price: 1,
+          pool_price_change_pct: 2,
+          price_trend: [],
+          min_price: 0.8,
+          max_price: 1.2,
+          volume_change_pct: 5,
+          fee_change_pct: 2,
+          swap_count: 10,
+          unique_traders: 7,
+        }],
+      }),
+    };
+  };
+
+  try {
+    resetDiscoveryCache();
+    const first = await discoverPools({ page_size: 5, timeframe: "5m", category: "trending", force: true });
+    const second = await discoverPools({ page_size: 5, timeframe: "5m", category: "trending" });
+    assert.equal(calls, 1);
+    assert.equal(first.pools.length, 1);
+    assert.equal(second.pools.length, 1);
+  } finally {
+    resetDiscoveryCache();
+    global.fetch = originalFetch;
+  }
 });

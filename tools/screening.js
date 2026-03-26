@@ -3,6 +3,17 @@ import { isBlacklisted } from "../token-blacklist.js";
 import { log } from "../logger.js";
 
 const POOL_DISCOVERY_BASE = "https://pool-discovery-api.datapi.meteora.ag";
+const DISCOVERY_CACHE_TTL_MS = 15 * 1000;
+
+const discoveryCache = new Map();
+
+function getDiscoveryCacheKey({ page_size, timeframe, category }) {
+  return JSON.stringify({ page_size, timeframe, category });
+}
+
+export function resetDiscoveryCache() {
+  discoveryCache.clear();
+}
 
 
 
@@ -14,7 +25,14 @@ export async function discoverPools({
   page_size = 50,
   timeframe = config.screening.timeframe,
   category = config.screening.category,
+  force = false,
 } = {}) {
+  const cacheKey = getDiscoveryCacheKey({ page_size, timeframe, category });
+  const cached = discoveryCache.get(cacheKey);
+  if (!force && cached && Date.now() - cached.cachedAt < DISCOVERY_CACHE_TTL_MS) {
+    return cached.value;
+  }
+
   const s = config.screening;
   const filters = [
     "base_token_has_critical_warnings=false",
@@ -64,10 +82,17 @@ export async function discoverPools({
     log("blacklist", `Filtered ${filtered} pool(s) with blacklisted tokens`);
   }
 
-  return {
+  const result = {
     total: data.total,
     pools,
   };
+
+  discoveryCache.set(cacheKey, {
+    cachedAt: Date.now(),
+    value: result,
+  });
+
+  return result;
 }
 
 /**
