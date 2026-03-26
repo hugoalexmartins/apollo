@@ -804,13 +804,13 @@ export async function getMyPositions({ force = false } = {}) {
     const positions = raw.map((r) => {
       const p = pnlByPool[r.pool]?.[r.position] || null;
 
-      const inRange = p ? !p.isOutOfRange : true;
-      if (inRange) markInRange(r.position);
-      else markOutOfRange(r.position);
-
       const lowerBin  = p?.lowerBinId      ?? r.lower_bin;
       const upperBin  = p?.upperBinId      ?? r.upper_bin;
       const activeBin = p?.poolActiveBinId ?? null;
+      const oorDirection = getOutOfRangeDirection(lowerBin, upperBin, activeBin);
+      const inRange = p ? !p.isOutOfRange : true;
+      if (inRange) markInRange(r.position);
+      else markOutOfRange(r.position, oorDirection);
 
       const unclaimedFees = p ? (parseFloat(p.unrealizedPnl?.unclaimedFeeTokenX?.usd || 0) + parseFloat(p.unrealizedPnl?.unclaimedFeeTokenY?.usd || 0)) : 0;
       const totalValue    = p ? parseFloat(p.unrealizedPnl?.balances || 0) : 0;
@@ -844,6 +844,7 @@ export async function getMyPositions({ force = false } = {}) {
         upper_bin: upperBin,
         active_bin: activeBin,
         in_range: inRange,
+        out_of_range_direction: oorDirection,
         unclaimed_fees_usd: Math.round(unclaimedFees * 100) / 100,
         total_value_usd: Math.round(totalValue * 100) / 100,
         collected_fees_usd: Math.round(collectedFees * 100) / 100,
@@ -902,6 +903,7 @@ export async function getWalletPositions({ wallet_address }) {
     const positions = raw.map((r) => {
       const p = pnlByPool[r.pool]?.[r.position] || null;
       const poolMints = mintsByPool[r.pool] || null;
+      const oorDirection = getOutOfRangeDirection(p?.lowerBinId ?? null, p?.upperBinId ?? null, p?.poolActiveBinId ?? null);
 
       return {
         position:           r.position,
@@ -911,6 +913,7 @@ export async function getWalletPositions({ wallet_address }) {
         upper_bin:          p?.upperBinId      ?? null,
         active_bin:         p?.poolActiveBinId ?? null,
         in_range:           p ? !p.isOutOfRange : null,
+        out_of_range_direction: oorDirection,
         unclaimed_fees_usd: Math.round((p ? (parseFloat(p.unrealizedPnl?.unclaimedFeeTokenX?.usd || 0) + parseFloat(p.unrealizedPnl?.unclaimedFeeTokenY?.usd || 0)) : 0) * 100) / 100,
         total_value_usd:    Math.round((p ? parseFloat(p.unrealizedPnl?.balances || 0) : 0) * 100) / 100,
         pnl_usd:            Math.round((p?.pnlUsd ?? 0) * 100) / 100,
@@ -975,6 +978,15 @@ function inferTrendBiasFromBins(lowerBin, upperBin, activeBin) {
   if (ratio >= 0.6) return "bullish";
   if (ratio <= 0.4) return "bearish";
   return "neutral";
+}
+
+function getOutOfRangeDirection(lowerBin, upperBin, activeBin) {
+  if (!Number.isFinite(lowerBin) || !Number.isFinite(upperBin) || !Number.isFinite(activeBin)) {
+    return null;
+  }
+  if (activeBin > upperBin) return "above";
+  if (activeBin < lowerBin) return "below";
+  return null;
 }
 
 function classifyRangeLocation({ lowerBin, upperBin, activeBin }) {
@@ -1832,6 +1844,7 @@ export async function closePosition({ position_address, reason = "agent decision
       txHashes.push(txHash);
     }
     log("close", `SUCCESS txs: ${txHashes.join(", ")}`);
+    await new Promise((resolve) => setTimeout(resolve, 5000));
     recordClose(position_address, reason);
 
     // Record performance for learning

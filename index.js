@@ -78,6 +78,14 @@ function summarizeRuntimeActionResult(result) {
   return "completed";
 }
 
+function formatRangeStatus(position) {
+  if (position.in_range) return "in-range ✓";
+  if (position.out_of_range_direction) {
+    return `OUT OF RANGE ${position.out_of_range_direction.toUpperCase()} ⚠`;
+  }
+  return "OUT OF RANGE ⚠";
+}
+
 function didRuntimeHandleManagementAction(result) {
   return Boolean(
     result
@@ -312,6 +320,23 @@ let _cronTasks = [];
 let _managementBusy = false; // prevents overlapping management cycles
 let _screeningBusy = false;  // prevents overlapping screening cycles
 let _screeningLastTriggered = 0;
+let _startupSnapshotCache = null;
+let _startupSnapshotAt = 0;
+const STARTUP_SNAPSHOT_TTL_MS = 15 * 1000;
+
+async function getStartupSnapshot({ force = false } = {}) {
+  if (!force && _startupSnapshotCache && Date.now() - _startupSnapshotAt < STARTUP_SNAPSHOT_TTL_MS) {
+    return _startupSnapshotCache;
+  }
+
+  const wallet = await getWalletBalances();
+  const positions = await getMyPositions();
+  const candidates = await getTopCandidates({ limit: 5 });
+
+  _startupSnapshotCache = { wallet, positions, ...candidates };
+  _startupSnapshotAt = Date.now();
+  return _startupSnapshotCache;
+}
 
 async function runBriefing() {
   log("cron", "Starting morning briefing");
@@ -470,6 +495,7 @@ export function startCronJobs() {
             pair: p.pair,
             position: p.position,
             in_range: p.in_range,
+            out_of_range_direction: p.out_of_range_direction || null,
             unclaimed_fee_usd: roundMetric(p.pnl?.unclaimed_fee_usd ?? p.unclaimed_fees_usd),
             exit_alert: p.exitAlert || null,
           })),
@@ -501,6 +527,7 @@ No remaining positions required model evaluation this cycle.`;
             pair: p.pair,
             position: p.position,
             in_range: p.in_range,
+            out_of_range_direction: p.out_of_range_direction || null,
             instruction: p.instruction || null,
             runtime_attempted: attemptedRuntimeActionMap.has(p.position),
           })),
@@ -572,6 +599,7 @@ REPORT FORMAT (one per position):
           pair: p.pair,
           position: p.position,
           in_range: p.in_range,
+          out_of_range_direction: p.out_of_range_direction || null,
           unclaimed_fee_usd: roundMetric(p.pnl?.unclaimed_fee_usd ?? p.unclaimed_fees_usd),
           exit_alert: p.exitAlert || null,
           memory_hits: p.memoryRecall ? 1 : 0,
@@ -675,6 +703,22 @@ REPORT FORMAT (one per position):
       const blockedSummary = screeningTopCandidates?.blocked_summary || {};
       const shortlist = candidates.slice(0, Math.min(5, candidates.length));
       const finalists = shortlist.slice(0, Math.min(2, shortlist.length));
+
+      if (shortlist.length === 0) {
+        log("cron", "Screening skipped — no eligible candidates after deterministic filters");
+        screenReport = "Screening skipped — no eligible candidates passed deterministic filters.";
+        screeningEvaluation = {
+          cycle_type: "screening",
+          status: "skipped_no_candidates",
+          summary: {
+            total_screened: screeningTopCandidates?.total_screened ?? 0,
+            total_eligible: totalEligible,
+            blocked_summary: blockedSummary,
+          },
+          candidates: [],
+        };
+        return;
+      }
 
       candidateEvaluations = shortlist.map((pool) => ({
         pool: pool.pool,
@@ -998,11 +1042,7 @@ if (isTTY) {
   let startupCandidates = [];
 
   try {
-    const [wallet, positions, { candidates, total_eligible, total_screened }] = await Promise.all([
-      getWalletBalances(),
-      getMyPositions(),
-      getTopCandidates({ limit: 5 }),
-    ]);
+    const { wallet, positions, candidates, total_eligible, total_screened } = await getStartupSnapshot({ force: true });
 
     startupCandidates = candidates;
 
@@ -1012,7 +1052,7 @@ if (isTTY) {
     if (positions.total_positions > 0) {
       console.log("Open positions:");
       for (const p of positions.positions) {
-        const status = p.in_range ? "in-range ✓" : "OUT OF RANGE ⚠";
+        const status = formatRangeStatus(p);
         console.log(`  ${p.pair.padEnd(16)} ${status}  fees: $${p.unclaimed_fees_usd}`);
       }
       console.log();
@@ -1135,11 +1175,11 @@ Commands:
 
     if (input === "/status") {
       await runBusy(async () => {
-        const [wallet, positions] = await Promise.all([getWalletBalances(), getMyPositions()]);
+        const { wallet, positions } = await getStartupSnapshot();
         console.log(`\nWallet: ${wallet.sol} SOL  ($${wallet.sol_usd})`);
         console.log(`Positions: ${positions.total_positions}`);
         for (const p of positions.positions) {
-          const status = p.in_range ? "in-range ✓" : "OUT OF RANGE ⚠";
+          const status = formatRangeStatus(p);
           console.log(`  ${p.pair.padEnd(16)} ${status}  fees: $${p.unclaimed_fees_usd}`);
         }
         console.log();
@@ -1157,7 +1197,7 @@ Commands:
 
     if (input === "/candidates") {
       await runBusy(async () => {
-        const { candidates, total_eligible, total_screened } = await getTopCandidates({ limit: 5 });
+        const { candidates, total_eligible, total_screened } = await getStartupSnapshot({ force: true });
         startupCandidates = candidates;
         console.log(`\nTop pools (${total_eligible} eligible from ${total_screened} screened):\n`);
         console.log(formatCandidates(candidates));

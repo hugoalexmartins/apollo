@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { getEvaluationSummary, getStateSummary, recordCycleEvaluation, recordToolOutcome } from "./state.js";
+import { getEvaluationSummary, getStateSummary, markOutOfRange, markInRange, recordCycleEvaluation, recordToolOutcome, trackPosition } from "./state.js";
 
 test("state evaluation records stay bounded and aggregated", () => {
   const originalCwd = process.cwd();
@@ -12,6 +12,7 @@ test("state evaluation records stay bounded and aggregated", () => {
 
   try {
     process.chdir(tempDir);
+    fs.mkdirSync(path.join(tempDir, "logs"), { recursive: true });
 
     for (let index = 0; index < 30; index += 1) {
       recordCycleEvaluation({
@@ -43,6 +44,36 @@ test("state evaluation records stay bounded and aggregated", () => {
     const stateSummary = getStateSummary();
     assert.equal(stateSummary.evaluation.counters.screening_cycles, 30);
     assert.equal(stateSummary.evaluation.recent_cycles.length, 3);
+  } finally {
+    process.chdir(originalCwd);
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+});
+
+test("state tracks explicit out-of-range direction", () => {
+  const originalCwd = process.cwd();
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "zenith-state-direction-test-"));
+
+  try {
+    process.chdir(tempDir);
+    fs.mkdirSync(path.join(tempDir, "logs"), { recursive: true });
+    trackPosition({
+      position: "pos-1",
+      pool: "pool-1",
+      pool_name: "Pool One",
+      strategy: "bid_ask",
+      amount_sol: 0.5,
+      active_bin: 10,
+      initial_value_usd: 100,
+    });
+
+    markOutOfRange("pos-1", "above");
+    let summary = getStateSummary();
+    assert.equal(summary.positions[0].out_of_range_direction, "above");
+
+    markInRange("pos-1");
+    summary = getStateSummary();
+    assert.equal(summary.positions[0].out_of_range_direction, null);
   } finally {
     process.chdir(originalCwd);
     fs.rmSync(tempDir, { recursive: true, force: true });

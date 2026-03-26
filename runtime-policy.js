@@ -7,6 +7,15 @@ function roundMetric(value) {
   return Number(Number(value || 0).toFixed(2));
 }
 
+export const MANAGEMENT_SUBREASONS = Object.freeze({
+  EXIT_ALERT: "exit_alert",
+  STOP_LOSS: "stop_loss_pct_breached",
+  TAKE_PROFIT: "take_profit_pct_reached",
+  OUT_OF_RANGE: "out_of_range_rebalance",
+  LOW_FEE_YIELD: "fee_yield_below_floor",
+  FEE_THRESHOLD: "fee_threshold_reached",
+});
+
 export function deriveExpectedVolumeProfile(snapshot = {}) {
   const feeTvlRatio = asNumber(snapshot.fee_active_tvl_ratio ?? snapshot.fee_tvl_ratio, 0);
   const volume = asNumber(snapshot.volume_window ?? snapshot.volume_24h, 0);
@@ -50,7 +59,7 @@ export function planManagementRuntimeAction(position, config, expectedVolumeProf
       toolName: "close_position",
       args: { position_address: position.position, reason: position.exitAlert },
       reason: position.exitAlert,
-      rule: "exit_alert",
+      rule: MANAGEMENT_SUBREASONS.EXIT_ALERT,
     };
   }
 
@@ -59,7 +68,7 @@ export function planManagementRuntimeAction(position, config, expectedVolumeProf
       toolName: "close_position",
       args: { position_address: position.position, reason: "emergency stop loss" },
       reason: `pnl ${pnlPct.toFixed(2)}% <= ${config.management.emergencyPriceDropPct}%`,
-      rule: "stop_loss",
+      rule: MANAGEMENT_SUBREASONS.STOP_LOSS,
     };
   }
 
@@ -68,7 +77,7 @@ export function planManagementRuntimeAction(position, config, expectedVolumeProf
       toolName: "close_position",
       args: { position_address: position.position, reason: "fixed take profit" },
       reason: `pnl ${pnlPct.toFixed(2)}% >= ${config.management.takeProfitFeePct}%`,
-      rule: "take_profit",
+      rule: MANAGEMENT_SUBREASONS.TAKE_PROFIT,
     };
   }
 
@@ -81,7 +90,7 @@ export function planManagementRuntimeAction(position, config, expectedVolumeProf
         expected_volume_profile: derivedVolumeProfile,
       },
       reason: oorMinutes > 0 ? `out of range for ${oorMinutes}m` : "out of range",
-      rule: "out_of_range_rebalance",
+      rule: MANAGEMENT_SUBREASONS.OUT_OF_RANGE,
     };
   }
 
@@ -90,7 +99,7 @@ export function planManagementRuntimeAction(position, config, expectedVolumeProf
       toolName: "close_position",
       args: { position_address: position.position, reason: "fee yield too low" },
       reason: `fee_per_tvl_24h ${feePerTvl24h.toFixed(2)} < ${config.management.minFeePerTvl24h}`,
-      rule: "low_fee_yield",
+      rule: MANAGEMENT_SUBREASONS.LOW_FEE_YIELD,
     };
   }
 
@@ -103,7 +112,7 @@ export function planManagementRuntimeAction(position, config, expectedVolumeProf
         expected_volume_profile: derivedVolumeProfile,
       },
       reason: `fees $${feesUsd.toFixed(2)} >= $${config.management.minClaimAmount}`,
-      rule: "fee_threshold",
+      rule: MANAGEMENT_SUBREASONS.FEE_THRESHOLD,
     };
   }
 

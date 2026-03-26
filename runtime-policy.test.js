@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { deriveExpectedVolumeProfile, planManagementRuntimeAction, resolveTargetManagementInterval } from "./runtime-policy.js";
+import { deriveExpectedVolumeProfile, MANAGEMENT_SUBREASONS, planManagementRuntimeAction, resolveTargetManagementInterval } from "./runtime-policy.js";
 
 const config = {
   management: {
@@ -32,8 +32,21 @@ test("planManagementRuntimeAction favors rebalance when out of range", () => {
   }, config, "high");
 
   assert.equal(result.toolName, "rebalance_on_exit");
-  assert.equal(result.rule, "out_of_range_rebalance");
+  assert.equal(result.rule, MANAGEMENT_SUBREASONS.OUT_OF_RANGE);
   assert.equal(result.args.expected_volume_profile, "high");
+});
+
+test("planManagementRuntimeAction exposes explicit subreason for fee-threshold claims", () => {
+  const result = planManagementRuntimeAction({
+    position: "pos-3",
+    in_range: true,
+    age_minutes: 120,
+    pnl: { pnl_pct: 1.2, fee_per_tvl_24h: 12, unclaimed_fee_usd: 8 },
+    unclaimed_fees_usd: 8,
+  }, config);
+
+  assert.equal(result.toolName, "auto_compound_fees");
+  assert.equal(result.rule, MANAGEMENT_SUBREASONS.FEE_THRESHOLD);
 });
 
 test("planManagementRuntimeAction only escalates to model when no deterministic rule applies", () => {

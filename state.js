@@ -142,6 +142,7 @@ export function trackPosition({
     initial_value_usd,
     deployed_at: new Date().toISOString(),
     out_of_range_since: null,
+    out_of_range_direction: null,
     last_claim_at: null,
     total_fees_claimed_usd: 0,
     claim_count: 0,
@@ -160,15 +161,16 @@ export function trackPosition({
 /**
  * Mark a position as out of range (sets timestamp on first detection).
  */
-export function markOutOfRange(position_address) {
+export function markOutOfRange(position_address, direction = null) {
   const state = load();
   const pos = state.positions[position_address];
   if (!pos) return;
   if (!pos.out_of_range_since) {
     pos.out_of_range_since = new Date().toISOString();
-    save(state);
-    log("state", `Position ${position_address} marked out of range`);
   }
+  pos.out_of_range_direction = direction || pos.out_of_range_direction || null;
+  save(state);
+  log("state", `Position ${position_address} marked out of range${pos.out_of_range_direction ? ` (${pos.out_of_range_direction})` : ""}`);
 }
 
 /**
@@ -180,6 +182,7 @@ export function markInRange(position_address) {
   if (!pos) return;
   if (pos.out_of_range_since) {
     pos.out_of_range_since = null;
+    pos.out_of_range_direction = null;
     save(state);
     log("state", `Position ${position_address} back in range`);
   }
@@ -425,6 +428,7 @@ export function getStateSummary() {
       deployed_at: p.deployed_at,
       out_of_range_since: p.out_of_range_since,
       minutes_out_of_range: minutesOutOfRange(p.position),
+      out_of_range_direction: p.out_of_range_direction || null,
       total_fees_claimed_usd: p.total_fees_claimed_usd,
       initial_fee_tvl_24h: p.initial_fee_tvl_24h,
       rebalance_count: p.rebalance_count,
