@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { getEffectiveMinSolToOpen, getRequiredSolBalance, getScreeningThresholdSummary } from "../runtime-helpers.js";
+import { estimateInitialValueUsd, getEffectiveMinSolToOpen, getRequiredSolBalance, getScreeningThresholdSummary } from "../runtime-helpers.js";
 
 test("effective min SOL always covers deploy amount plus gas reserve", () => {
   assert.equal(getRequiredSolBalance({ deployAmountSol: 0.5, gasReserve: 0.2 }), 0.7);
@@ -37,4 +37,10 @@ test("screening threshold summary uses canonical live keys", () => {
     "minVolume",
     "timeframe",
   ]);
+});
+
+test("initial deploy value estimate prefers SOL leg and falls back to token leg", () => {
+  assert.equal(estimateInitialValueUsd({ amountSol: 0.5, solPrice: 120 }), 60);
+  assert.equal(estimateInitialValueUsd({ amountSol: 0, amountToken: 1200, activePrice: 600, solPrice: 100 }), 200);
+  assert.equal(estimateInitialValueUsd({ amountSol: 0, amountToken: 1200, activePrice: 0, solPrice: 100 }), 0);
 });

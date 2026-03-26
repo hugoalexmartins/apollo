@@ -24,6 +24,7 @@ import { addToBlacklist, removeFromBlacklist, listBlacklist } from "../token-bla
 import { addSmartWallet, removeSmartWallet, listSmartWallets, checkSmartWalletsOnPool } from "../smart-wallets.js";
 import { getTokenInfo, getTokenHolders, getTokenNarrative } from "./token.js";
 import { config } from "../config.js";
+import { estimateInitialValueUsd } from "../runtime-helpers.js";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -263,6 +264,7 @@ const WRITE_TOOLS = new Set([
  */
 export async function executeTool(name, args) {
   const startTime = Date.now();
+  let normalizedArgs = args;
 
   // ─── Validate tool exists ─────────────────
   const fn = toolMap[name];
@@ -272,9 +274,22 @@ export async function executeTool(name, args) {
     return { error };
   }
 
+  if (name === "deploy_position" && normalizedArgs && normalizedArgs.initial_value_usd == null) {
+    const wallet = await getWalletBalances({}).catch(() => null);
+    const solPrice = Number(wallet?.sol_price) || 0;
+    const solLeg = Number(normalizedArgs.amount_y ?? normalizedArgs.amount_sol ?? 0);
+    if (solPrice > 0 && solLeg > 0) {
+      normalizedArgs = {
+        ...normalizedArgs,
+        initial_value_usd: estimateInitialValueUsd({ amountSol: solLeg, solPrice }),
+      };
+      log("executor", `Derived initial_value_usd=$${normalizedArgs.initial_value_usd} from SOL leg for deploy_position`);
+    }
+  }
+
   // ─── Pre-execution safety checks ──────────
     if (WRITE_TOOLS.has(name)) {
-      const safetyCheck = await runSafetyChecks(name, args);
+      const safetyCheck = await runSafetyChecks(name, normalizedArgs);
       if (!safetyCheck.pass) {
         log("safety_block", `${name} blocked: ${safetyCheck.reason}`);
         recordToolOutcome({
@@ -282,8 +297,8 @@ export async function executeTool(name, args) {
           outcome: "blocked",
           reason: safetyCheck.reason,
           metadata: {
-            pool_address: args?.pool_address || null,
-            position_address: args?.position_address || null,
+            pool_address: normalizedArgs?.pool_address || null,
+            position_address: normalizedArgs?.position_address || null,
           },
         });
         return {
@@ -295,13 +310,13 @@ export async function executeTool(name, args) {
 
   // ─── Execute ──────────────────────────────
   try {
-    const result = await fn(args);
+    const result = await fn(normalizedArgs);
     const duration = Date.now() - startTime;
     const success = result?.success !== false && !result?.error;
 
     logAction({
       tool: name,
-      args,
+      args: normalizedArgs,
       result: summarizeResult(result),
       duration_ms: duration,
       success,
@@ -314,18 +329,18 @@ export async function executeTool(name, args) {
           outcome: "success",
           metadata: {
             pool_address: args?.pool_address || result?.pool_address || null,
-            position_address: args?.position_address || result?.position || null,
+            position_address: normalizedArgs?.position_address || result?.position || null,
           },
         });
       }
       if (name === "swap_token" && result.tx) {
-        notifySwap({ inputSymbol: args.input_mint?.slice(0, 8), outputSymbol: args.output_mint === "So11111111111111111111111111111111111111112" || args.output_mint === "SOL" ? "SOL" : args.output_mint?.slice(0, 8), amountIn: result.amount_in, amountOut: result.amount_out, tx: result.tx }).catch(() => {});
+        notifySwap({ inputSymbol: normalizedArgs.input_mint?.slice(0, 8), outputSymbol: normalizedArgs.output_mint === "So11111111111111111111111111111111111111112" || normalizedArgs.output_mint === "SOL" ? "SOL" : normalizedArgs.output_mint?.slice(0, 8), amountIn: result.amount_in, amountOut: result.amount_out, tx: result.tx }).catch(() => {});
       } else if (name === "deploy_position") {
-        notifyDeploy({ pair: result.pool_name || args.pool_name || args.pool_address?.slice(0, 8), amountSol: args.amount_y ?? args.amount_sol ?? 0, position: result.position, tx: result.txs?.[0] ?? result.tx, priceRange: result.price_range, binStep: result.bin_step, baseFee: result.base_fee }).catch(() => {});
+        notifyDeploy({ pair: result.pool_name || normalizedArgs.pool_name || normalizedArgs.pool_address?.slice(0, 8), amountSol: normalizedArgs.amount_y ?? normalizedArgs.amount_sol ?? 0, position: result.position, tx: result.txs?.[0] ?? result.tx, priceRange: result.price_range, binStep: result.bin_step, baseFee: result.base_fee }).catch(() => {});
       } else if (name === "close_position") {
-        notifyClose({ pair: result.pool_name || args.position_address?.slice(0, 8), pnlUsd: result.pnl_usd ?? 0, pnlPct: result.pnl_pct ?? 0 }).catch(() => {});
+        notifyClose({ pair: result.pool_name || normalizedArgs.position_address?.slice(0, 8), pnlUsd: result.pnl_usd ?? 0, pnlPct: result.pnl_pct ?? 0 }).catch(() => {});
         // Auto-swap base token back to SOL unless user said to hold
-        if (!args.skip_swap && result.base_mint) {
+        if (!normalizedArgs.skip_swap && result.base_mint) {
           try {
             const balances = await getWalletBalances({});
             const token = balances.tokens?.find(t => t.mint === result.base_mint);
@@ -360,16 +375,16 @@ export async function executeTool(name, args) {
         tool: name,
         outcome: "error",
         reason: error.message,
-        metadata: {
-          pool_address: args?.pool_address || null,
-          position_address: args?.position_address || null,
+          metadata: {
+          pool_address: normalizedArgs?.pool_address || null,
+          position_address: normalizedArgs?.position_address || null,
         },
       });
     }
 
     logAction({
       tool: name,
-      args,
+      args: normalizedArgs,
       error: error.message,
       duration_ms: duration,
       success: false,

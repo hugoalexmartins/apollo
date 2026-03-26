@@ -20,6 +20,7 @@ import {
   syncOpenPositions,
 } from "../state.js";
 import { recordPerformance } from "../lessons.js";
+import { estimateInitialValueUsd } from "../runtime-helpers.js";
 import { getWalletBalances, normalizeMint } from "./wallet.js";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
@@ -556,6 +557,18 @@ export async function deployPosition({
   // If amount_y is not provided but amount_sol is, use amount_sol (for backward compatibility)
   const finalAmountY = amount_y ?? amount_sol ?? 0;
   const finalAmountX = amount_x ?? 0;
+  let deployValueUsd = initial_value_usd ?? null;
+
+  if (deployValueUsd == null) {
+    const walletBalances = await getWalletBalances({}).catch(() => null);
+    const solPrice = Number(walletBalances?.sol_price) || 0;
+    deployValueUsd = estimateInitialValueUsd({
+      amountSol: finalAmountY,
+      solPrice,
+      amountToken: finalAmountX,
+      activePrice: Number(activeBin.price),
+    });
+  }
 
   const totalYLamports = new BN(Math.floor(finalAmountY * 1e9));
   // For X, we assume it's also 9 decimals for now, or we'd need to fetch mint decimals.
@@ -647,7 +660,7 @@ export async function deployPosition({
       amount_sol: finalAmountY,
       amount_x: finalAmountX,
       active_bin: activeBin.binId,
-      initial_value_usd,
+      initial_value_usd: deployValueUsd,
     });
 
     const actualBinStep = pool.lbPair.binStep;
@@ -1844,7 +1857,13 @@ export async function closePosition({ position_address, reason = "agent decision
       txHashes.push(txHash);
     }
     log("close", `SUCCESS txs: ${txHashes.join(", ")}`);
-    await new Promise((resolve) => setTimeout(resolve, 5000));
+    const settlement = await waitForPostCloseSettlement({
+      walletPubkey: wallet.publicKey,
+      baseMint: pool.lbPair.tokenXMint.toString(),
+    });
+    if (!settlement.settled) {
+      log("close_warn", `Post-close settlement not observed before timeout (${settlement.reason})`);
+    }
     recordClose(position_address, reason);
 
     // Record performance for learning
@@ -1930,4 +1949,30 @@ async function lookupPoolForPosition(position_address, walletAddress) {
   }
 
   throw new Error(`Position ${position_address} not found in open positions`);
+}
+
+async function waitForPostCloseSettlement({ walletPubkey, baseMint, maxAttempts = 6, delayMs = 1000 }) {
+  if (!baseMint) return { settled: false, reason: "missing_base_mint" };
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    try {
+      const response = await getConnection().getParsedTokenAccountsByOwner(walletPubkey, { mint: new PublicKey(baseMint) });
+      const totalBalance = (response.value || []).reduce((sum, account) => {
+        const amount = Number(account.account.data.parsed.info.tokenAmount.uiAmount || 0);
+        return sum + (Number.isFinite(amount) ? amount : 0);
+      }, 0);
+
+      if (totalBalance > 0) {
+        return { settled: true, observed_balance: totalBalance, attempts: attempt };
+      }
+    } catch (error) {
+      log("close_warn", `Settlement check attempt ${attempt}/${maxAttempts} failed: ${error.message}`);
+    }
+
+    if (attempt < maxAttempts) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+
+  return { settled: false, reason: "balance_not_observed" };
 }

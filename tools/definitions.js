@@ -176,6 +176,8 @@ Returns lower, center, and upper tier metadata that can later drive live LP plac
       name: "deploy_position",
       description: `Open a new DLMM liquidity position.
 
+This tool already fetches the active bin internally. Do not pre-call get_active_bin unless you explicitly need a standalone bin read for analysis.
+
 PRIORITY ORDER for strategy and bins:
 1. User explicitly specifies → always follow exactly (user override is absolute)
 2. No user spec → use active strategy's lp_strategy and choose bins based on volatility
@@ -231,7 +233,7 @@ WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,
           organic_score: { type: "number", description: "Base token organic score at deploy time" },
           initial_value_usd: { type: "number", description: "Estimated USD value being deployed" }
         },
-        required: ["pool_address"]
+        required: ["pool_address", "initial_value_usd"]
       }
     }
   },

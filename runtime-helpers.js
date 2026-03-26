@@ -23,3 +23,18 @@ export function getScreeningThresholdSummary(screening) {
     ["timeframe", screening.timeframe],
   ];
 }
+
+export function estimateInitialValueUsd({ amountSol = 0, solPrice = 0, amountToken = 0, activePrice = 0 }) {
+  const solLeg = Number(amountSol) || 0;
+  const tokenLeg = Number(amountToken) || 0;
+  const price = Number(activePrice) || 0;
+  const usdPerSol = Number(solPrice) || 0;
+
+  if (usdPerSol <= 0) return 0;
+  if (solLeg > 0) return Math.round(solLeg * usdPerSol * 100) / 100;
+  if (tokenLeg > 0 && price > 0) {
+    const estimatedSol = tokenLeg / price;
+    return Math.round(estimatedSol * usdPerSol * 100) / 100;
+  }
+  return 0;
+}
