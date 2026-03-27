@@ -21,6 +21,7 @@ import {
 } from "../state.js";
 import { recordPerformance } from "../lessons.js";
 import { estimateInitialValueUsd } from "../runtime-helpers.js";
+import { appendActionLifecycle } from "../action-journal.js";
 import { getWalletBalances, normalizeMint } from "./wallet.js";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
@@ -1286,6 +1287,7 @@ export async function rebalanceOnExit({
   force_rebalance = false,
   expected_volume_profile,
   execute = true,
+  journal_workflow_id = null,
 } = {}) {
   position_address = normalizeMint(position_address);
   if (!position_address) {
@@ -1418,6 +1420,16 @@ export async function rebalanceOnExit({
       close_result: closeResult,
       action_plan: actionPlan,
     };
+  }
+
+  if (journal_workflow_id) {
+    appendActionLifecycle({
+      workflow_id: journal_workflow_id,
+      lifecycle: "close_observed_pending_redeploy",
+      tool: "rebalance_on_exit",
+      position_address,
+      pool_address: context.position.pool,
+    });
   }
 
   const afterCloseSnapshot = await captureBalanceSnapshotForMints({
@@ -1860,6 +1872,7 @@ export async function closePosition({ position_address, reason = "agent decision
     const settlement = await waitForPostCloseSettlement({
       walletPubkey: wallet.publicKey,
       baseMint: pool.lbPair.tokenXMint.toString(),
+      positionAddress: position_address,
     });
     if (!settlement.settled) {
       log("close_warn", `Post-close settlement not observed before timeout (${settlement.reason})`);
@@ -1951,22 +1964,72 @@ async function lookupPoolForPosition(position_address, walletAddress) {
   throw new Error(`Position ${position_address} not found in open positions`);
 }
 
-async function waitForPostCloseSettlement({ walletPubkey, baseMint, maxAttempts = 6, delayMs = 1000 }) {
-  if (!baseMint) return { settled: false, reason: "missing_base_mint" };
+export function evaluatePostCloseSettlementObservation({ observedBaseBalance, positionStillOpen }) {
+  if (Number.isFinite(observedBaseBalance) && observedBaseBalance > 0) {
+    return {
+      settled: true,
+      signal: "base_balance_observed",
+      observed_balance: observedBaseBalance,
+    };
+  }
+
+  if (positionStillOpen === false) {
+    return {
+      settled: true,
+      signal: "position_absent_from_open_positions",
+    };
+  }
+
+  return {
+    settled: false,
+    reason: "settlement_signal_not_observed",
+  };
+}
+
+async function waitForPostCloseSettlement({ walletPubkey, baseMint, positionAddress, maxAttempts = 6, delayMs = 1000 }) {
+  if (!baseMint && !positionAddress) {
+    return { settled: false, reason: "missing_settlement_observation_targets" };
+  }
 
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
-    try {
-      const response = await getConnection().getParsedTokenAccountsByOwner(walletPubkey, { mint: new PublicKey(baseMint) });
-      const totalBalance = (response.value || []).reduce((sum, account) => {
-        const amount = Number(account.account.data.parsed.info.tokenAmount.uiAmount || 0);
-        return sum + (Number.isFinite(amount) ? amount : 0);
-      }, 0);
+    let observedBaseBalance = null;
+    let positionStillOpen = null;
 
-      if (totalBalance > 0) {
-        return { settled: true, observed_balance: totalBalance, attempts: attempt };
+    try {
+      if (baseMint) {
+        const response = await getConnection().getParsedTokenAccountsByOwner(walletPubkey, { mint: new PublicKey(baseMint) });
+        observedBaseBalance = (response.value || []).reduce((sum, account) => {
+          const amount = Number(account.account.data.parsed.info.tokenAmount.uiAmount || 0);
+          return sum + (Number.isFinite(amount) ? amount : 0);
+        }, 0);
       }
     } catch (error) {
       log("close_warn", `Settlement check attempt ${attempt}/${maxAttempts} failed: ${error.message}`);
+    }
+
+    try {
+      if (positionAddress) {
+        const openPositions = await getMyPositions({ force: true });
+        if (Array.isArray(openPositions?.positions)) {
+          positionStillOpen = openPositions.positions.some((position) => position.position === positionAddress);
+        }
+      }
+    } catch (error) {
+      log("close_warn", `Settlement open-position check ${attempt}/${maxAttempts} failed: ${error.message}`);
+    }
+
+    const observed = evaluatePostCloseSettlementObservation({
+      observedBaseBalance,
+      positionStillOpen,
+    });
+    if (observed.settled) {
+      return {
+        settled: true,
+        signal: observed.signal,
+        observed_balance: observed.observed_balance ?? null,
+        position_still_open: positionStillOpen,
+        attempts: attempt,
+      };
     }
 
     if (attempt < maxAttempts) {
@@ -1974,5 +2037,5 @@ async function waitForPostCloseSettlement({ walletPubkey, baseMint, maxAttempts 
     }
   }
 
-  return { settled: false, reason: "balance_not_observed" };
+  return { settled: false, reason: "settlement_signal_not_observed" };
 }

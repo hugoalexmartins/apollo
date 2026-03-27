@@ -99,12 +99,27 @@ export async function discoverPools({
  * Returns eligible pools for the agent to evaluate and pick from.
  * Hard filters applied in code, agent decides which to deploy into.
  */
-export async function getTopCandidates({ limit = 10 } = {}) {
-  const { pools } = await discoverPools({ page_size: 50 });
+export async function getTopCandidates({
+  limit = 10,
+  discoverPoolsFn,
+  getMyPositionsFn,
+} = {}) {
+  const discover = discoverPoolsFn || discoverPools;
+  const { pools } = await discover({ page_size: 50 });
 
   // Exclude pools where the wallet already has an open position
-  const { getMyPositions } = await import("./dlmm.js");
-  const { positions } = await getMyPositions();
+  const readPositions = getMyPositionsFn || (await import("./dlmm.js")).getMyPositions;
+  const positionsResult = await readPositions();
+  if (!positionsResult || typeof positionsResult !== "object") {
+    throw new Error("positions unavailable");
+  }
+  if (positionsResult.error) {
+    throw new Error(`positions unavailable: ${positionsResult.error}`);
+  }
+  if (!Array.isArray(positionsResult.positions)) {
+    throw new Error("positions payload missing positions array");
+  }
+  const { positions } = positionsResult;
   const occupiedPools = new Set(positions.map((p) => p.pool));
   const occupiedMints = new Set(positions.map((p) => p.base_mint).filter(Boolean));
 

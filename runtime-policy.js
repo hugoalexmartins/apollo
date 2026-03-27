@@ -37,16 +37,39 @@ export function resolveTargetManagementInterval(positions = []) {
   return { interval, maxVolatility: roundMetric(maxVolatility) };
 }
 
+export function isPnlSignalStale(position = {}) {
+  const pnl = position?.pnl;
+  if (!pnl || typeof pnl !== "object") return false;
+  if (pnl.stale === true || pnl.lagging === true || pnl.status === "stale") return true;
+
+  const observedAtMs = Number.isFinite(Number(pnl.observed_at_ms ?? pnl.as_of_ms))
+    ? Number(pnl.observed_at_ms ?? pnl.as_of_ms)
+    : Number.isFinite(Date.parse(pnl.observed_at ?? pnl.as_of ?? ""))
+      ? Date.parse(pnl.observed_at ?? pnl.as_of)
+      : null;
+  const maxAgeMs = Number(pnl.max_age_ms ?? position.max_pnl_age_ms);
+
+  if (observedAtMs == null || !Number.isFinite(maxAgeMs) || maxAgeMs < 0) {
+    return false;
+  }
+
+  return Date.now() - observedAtMs > maxAgeMs;
+}
+
 export function planManagementRuntimeAction(position, config, expectedVolumeProfile = null) {
   if (position.instruction) return null;
 
-  const pnlPct = Number.isFinite(Number(position.pnl?.pnl_pct ?? position.pnl_pct))
+  const pnlSignalStale = isPnlSignalStale(position);
+
+  const pnlPct = !pnlSignalStale && Number.isFinite(Number(position.pnl?.pnl_pct ?? position.pnl_pct))
     ? Number(position.pnl?.pnl_pct ?? position.pnl_pct)
     : null;
-  const feePerTvl24h = Number.isFinite(Number(position.pnl?.fee_per_tvl_24h ?? position.fee_per_tvl_24h))
+  const feePerTvl24h = !pnlSignalStale && Number.isFinite(Number(position.pnl?.fee_per_tvl_24h ?? position.fee_per_tvl_24h))
     ? Number(position.pnl?.fee_per_tvl_24h ?? position.fee_per_tvl_24h)
     : null;
-  const feesUsd = asNumber(position.pnl?.unclaimed_fee_usd ?? position.unclaimed_fees_usd, 0);
+  const feesUsd = pnlSignalStale
+    ? 0
+    : asNumber(position.pnl?.unclaimed_fee_usd ?? position.unclaimed_fees_usd, 0);
   const oorMinutes = asNumber(position.minutes_out_of_range, 0);
   const derivedVolumeProfile = expectedVolumeProfile || deriveExpectedVolumeProfile({
     fee_tvl_ratio: position.fee_tvl_ratio,
@@ -54,7 +77,7 @@ export function planManagementRuntimeAction(position, config, expectedVolumeProf
     volume_window: position.volume_window,
   });
 
-  if (position.exitAlert) {
+  if (position.exitAlert && !pnlSignalStale) {
     return {
       toolName: "close_position",
       args: { position_address: position.position, reason: position.exitAlert },

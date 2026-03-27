@@ -28,7 +28,10 @@ async function main() {
 
   // Test 2: Deterministic top candidates
   console.log("\n\nFetching deterministic top candidates...");
-  const ranked = await getTopCandidates({ limit: 5 });
+  const ranked = await getTopCandidates({
+    limit: 5,
+    getMyPositionsFn: async () => ({ positions: [], total_positions: 0 }),
+  });
   console.log(`Ranked ${ranked.total_eligible} eligible pools from ${ranked.total_screened} screened`);
   if (ranked.candidates.length > 0) {
     const bestRanked = ranked.candidates[0];

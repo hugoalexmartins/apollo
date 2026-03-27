@@ -18,7 +18,7 @@ test("recordPerformance exposes fee and inventory attribution", async () => {
     process.env.ZENITH_LESSONS_FILE = lessonsPath;
     fs.writeFileSync(userConfigPath, JSON.stringify({ minFeeActiveTvlRatio: 0.05, minOrganic: 60 }, null, 2));
 
-    const { recordPerformance, getPerformanceSummary } = await import(`./lessons.js?test=${Date.now()}`);
+    const { recordPerformance, getPerformanceSummary, getStrategyProofSummary } = await import(`./lessons.js?test=${Date.now()}`);
 
     await recordPerformance({
       position: "pos-1",
@@ -46,6 +46,12 @@ test("recordPerformance exposes fee and inventory attribution", async () => {
     assert.equal(summary.total_inventory_pnl_usd, 10);
     assert.equal(summary.total_fee_component_usd, 12);
     assert.equal(summary.avg_operational_touch_count, 3);
+
+    const proof = getStrategyProofSummary({ hours: 24 });
+    assert.equal(proof.positions_analyzed, 1);
+    assert.equal(proof.total_inventory_pnl_usd, 10);
+    assert.equal(proof.total_fee_component_usd, 12);
+    assert.equal(proof.strategy_breakdown[0].strategy, "bid_ask");
   } finally {
     process.chdir(originalCwd);
     if (originalUserConfigPath) process.env.ZENITH_USER_CONFIG_PATH = originalUserConfigPath;

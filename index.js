@@ -7,25 +7,46 @@ import { getMyPositions, getPositionPnl } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
 import { getTopCandidates } from "./tools/screening.js";
 import { config, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
-import { evolveThresholds, getPerformanceHistory, getPerformanceSummary } from "./lessons.js";
+import { evolveThresholds, getPerformanceHistory, getPerformanceSummary, getStrategyProofSummary } from "./lessons.js";
 import { getScreeningThresholdSummary } from "./runtime-helpers.js";
-import { executeTool, registerCronRestarter } from "./tools/executor.js";
+import { executeTool, getAutonomousWriteSuppression, registerCronRestarter, setAutonomousWriteSuppression } from "./tools/executor.js";
 import { startPolling, stopPolling, sendMessage, sendHTML, notifyOutOfRange, isEnabled as telegramEnabled } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
-import { getEvaluationSummary, getLastBriefingDate, recordCycleEvaluation, setLastBriefingDate, updatePnlAndCheckExits } from "./state.js";
+import { getEvaluationSummary, getLastBriefingDate, getTrackedPositions, recordCycleEvaluation, setLastBriefingDate, updatePnlAndCheckExits } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
 import { recordPositionSnapshot, recallForPool } from "./pool-memory.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
 import { getTokenHolders, getTokenNarrative, getTokenInfo } from "./tools/token.js";
 import { getWalletScoreMemory, initMemory, recallForManagement, recallForScreening } from "./memory.js";
-import { deriveExpectedVolumeProfile, planManagementRuntimeAction, resolveTargetManagementInterval } from "./runtime-policy.js";
+import { deriveExpectedVolumeProfile, isPnlSignalStale, resolveTargetManagementInterval } from "./runtime-policy.js";
 import { getLpOverview } from "./tools/lp-overview.js";
+import { appendReplayEnvelope, createCycleId } from "./cycle-trace.js";
+import { classifyRuntimeFailure, isFailClosedResult, validateStartupSnapshot } from "./degraded-mode.js";
+import { getStartupSnapshot } from "./startup-snapshot.js";
+import { runManagementRuntimeActions } from "./management-runtime.js";
+import { listEvidenceBundles, writeEvidenceBundle } from "./evidence-bundles.js";
+import { formatRecoveryWorkflowReport, getRecoveryWorkflowReport, runBootRecovery, summarizeRecoveryBlock } from "./boot-recovery.js";
 
 log("startup", "DLMM LP Agent starting...");
 log("startup", `Mode: ${process.env.DRY_RUN === "true" ? "DRY RUN" : "LIVE"}`);
 log("startup", `Model: ${process.env.LLM_MODEL || "hermes-3-405b"}`);
 
 initMemory();
+
+const bootRecovery = await runBootRecovery({
+  observeOpenPositions: () => getMyPositions({ force: true }),
+  observeTrackedPositions: () => getTrackedPositions(true),
+});
+
+if (bootRecovery.suppress_autonomous_writes) {
+  const reason = bootRecovery.reason_code === "JOURNAL_INVALID"
+    ? `action journal invalid (${bootRecovery.journal_parse_errors.length} parse error(s))`
+    : `manual review required for ${bootRecovery.parked_manual_review_workflows.length} workflow(s)`;
+  setAutonomousWriteSuppression({ suppressed: true, reason });
+  log("recovery_block", `Autonomous write activity suppressed at boot: ${reason}`);
+} else {
+  setAutonomousWriteSuppression({ suppressed: false });
+}
 
 const DEPLOY  = config.management.deployAmountSol;
 
@@ -286,27 +307,6 @@ function enforceManagementIntervalFromPositions(positions) {
   return { changed: true, interval, maxVolatility };
 }
 
-async function runManagementRuntimeActions(positionData) {
-  const runtimeActions = [];
-
-  for (const position of positionData) {
-    const plannedAction = planManagementRuntimeAction(position, config);
-    if (!plannedAction) continue;
-
-    const result = await executeTool(plannedAction.toolName, plannedAction.args);
-    runtimeActions.push({
-      position: position.position,
-      pair: position.pair,
-      toolName: plannedAction.toolName,
-      reason: plannedAction.reason,
-      rule: plannedAction.rule,
-      result,
-    });
-  }
-
-  return runtimeActions;
-}
-
 function buildPrompt() {
   const mgmt  = formatCountdown(nextRunIn(timers.managementLastRun, config.schedule.managementIntervalMin));
   const scrn  = formatCountdown(nextRunIn(timers.screeningLastRun,  config.schedule.screeningIntervalMin));
@@ -320,23 +320,6 @@ let _cronTasks = [];
 let _managementBusy = false; // prevents overlapping management cycles
 let _screeningBusy = false;  // prevents overlapping screening cycles
 let _screeningLastTriggered = 0;
-let _startupSnapshotCache = null;
-let _startupSnapshotAt = 0;
-const STARTUP_SNAPSHOT_TTL_MS = 15 * 1000;
-
-async function getStartupSnapshot({ force = false } = {}) {
-  if (!force && _startupSnapshotCache && Date.now() - _startupSnapshotAt < STARTUP_SNAPSHOT_TTL_MS) {
-    return _startupSnapshotCache;
-  }
-
-  const wallet = await getWalletBalances();
-  const positions = await getMyPositions();
-  const candidates = await getTopCandidates({ limit: 5 });
-
-  _startupSnapshotCache = { wallet, positions, ...candidates };
-  _startupSnapshotAt = Date.now();
-  return _startupSnapshotCache;
-}
 
 async function runBriefing() {
   log("cron", "Starting morning briefing");
@@ -383,19 +366,53 @@ export function startCronJobs() {
     if (_managementBusy) return;
     _managementBusy = true;
     timers.managementLastRun = Date.now();
+    const cycleId = createCycleId("management");
     log("cron", `Starting management cycle [model: ${config.llm.managementModel}]`);
     let mgmtReport = null;
     let managementEvaluation = null;
     let positions = [];
     try {
       // Pre-load all positions + PnL in parallel — LLM gets everything, no fetch steps needed
-      const livePositions = await getMyPositions().catch(() => null);
+      const livePositions = await getMyPositions().catch((error) => ({ error: error.message }));
+      if (!livePositions || livePositions.error || !Array.isArray(livePositions.positions)) {
+        const failure = validateStartupSnapshot({
+          wallet: { sol: 0 },
+          positions: livePositions,
+          candidates: { candidates: [] },
+        }) || classifyRuntimeFailure(new Error(livePositions?.error || "positions unavailable"), { invalidState: !livePositions || !Array.isArray(livePositions?.positions) });
+        managementEvaluation = {
+          cycle_id: cycleId,
+          cycle_type: "management",
+          status: "failed_precheck",
+          summary: {
+            reason_code: failure.reason_code,
+            error: failure.message,
+          },
+          positions: [],
+        };
+        appendReplayEnvelope({
+          cycle_id: cycleId,
+          cycle_type: "management",
+          reason_code: failure.reason_code,
+          error: failure.message,
+        });
+        writeEvidenceBundle({
+          cycle_id: cycleId,
+          cycle_type: "management",
+          status: "failed_precheck",
+          reason_code: failure.reason_code,
+          error: failure.message,
+          written_at: new Date().toISOString(),
+        });
+        return;
+      }
       positions = livePositions?.positions || [];
       const intervalAdjustment = enforceManagementIntervalFromPositions(positions);
 
       if (positions.length === 0) {
         log("cron", "No open positions — triggering screening cycle");
         managementEvaluation = {
+          cycle_id: cycleId,
           cycle_type: "management",
           status: "empty_positions",
           summary: {
@@ -429,13 +446,18 @@ export function startCronJobs() {
         const memoryRecall = memoryHits.length
           ? memoryHits.map((hit) => `[${hit.source}] ${hit.key}: ${hit.answer}`).join(" | ")
           : null;
+        const pnlStale = isPnlSignalStale({ pnl });
         const exitAlert = pnl?.pnl_pct != null
-          ? updatePnlAndCheckExits(p.position, pnl.pnl_pct, config)
+          ? updatePnlAndCheckExits(p.position, pnl.pnl_pct, config, { stale: pnlStale })
           : null;
         return { ...enriched, pnl, recall, memoryRecall, exitAlert };
       }));
 
-      const runtimeActions = await runManagementRuntimeActions(positionData);
+      const runtimeActions = await runManagementRuntimeActions(positionData, {
+        cycleId,
+        config,
+        executeTool,
+      });
       const handledRuntimeActions = runtimeActions.filter((action) => didRuntimeHandleManagementAction(action.result));
       const attemptedRuntimeActions = runtimeActions.filter((action) => !didRuntimeHandleManagementAction(action.result));
       const handledRuntimeActionMap = new Map(handledRuntimeActions.map((action) => [action.position, action]));
@@ -481,6 +503,7 @@ export function startCronJobs() {
       if (pendingPositionData.length === 0) {
         mgmtReport = `RUNTIME ACTIONS ALREADY EXECUTED\n${handledRuntimeActionBlock}\n\nNo remaining positions required manager write decisions this cycle.`;
         managementEvaluation = {
+          cycle_id: cycleId,
           cycle_type: "management",
           status: "runtime_only",
           summary: {
@@ -512,6 +535,7 @@ ${attemptedRuntimeActionBlock}
 
 No remaining positions required model evaluation this cycle.`;
         managementEvaluation = {
+          cycle_id: cycleId,
           cycle_type: "management",
           status: "runtime_determined",
           summary: {
@@ -583,6 +607,7 @@ REPORT FORMAT (one per position):
         ? `RUNTIME ACTIONS ALREADY EXECUTED\n${handledRuntimeActionBlock}\n\nRUNTIME WRITE ATTEMPTS NOT COMPLETED\n${attemptedRuntimeActionBlock}\n\n${content}`
         : content;
       managementEvaluation = {
+        cycle_id: cycleId,
         cycle_type: "management",
         status: "completed",
         summary: {
@@ -605,18 +630,70 @@ REPORT FORMAT (one per position):
           memory_hits: p.memoryRecall ? 1 : 0,
         })),
       };
+      appendReplayEnvelope({
+        cycle_id: cycleId,
+        cycle_type: "management",
+        positions_total: positions.length,
+        position_inputs: positionData.map((position) => ({
+          position: position.position,
+          pair: position.pair,
+          in_range: position.in_range,
+          minutes_out_of_range: position.minutes_out_of_range,
+          age_minutes: position.age_minutes,
+          instruction: position.instruction || null,
+          exitAlert: position.exitAlert || null,
+          pnl: position.pnl || null,
+          pnl_pct: position.pnl_pct ?? null,
+          unclaimed_fees_usd: position.unclaimed_fees_usd ?? null,
+          fee_per_tvl_24h: position.pnl?.fee_per_tvl_24h ?? position.fee_per_tvl_24h ?? null,
+          fee_tvl_ratio: position.fee_tvl_ratio ?? null,
+          volume_window: position.volume_window ?? null,
+          volatility: position.volatility ?? null,
+        })),
+        runtime_actions: handledRuntimeActions.map((action) => ({
+          position: action.position,
+          tool: action.toolName,
+          rule: action.rule,
+          action_id: action.actionId,
+          outcome: summarizeRuntimeActionResult(action.result),
+        })),
+        model_positions: modelManagedPositions.map((position) => ({
+          position: position.position,
+          pair: position.pair,
+          instruction: position.instruction || null,
+          in_range: position.in_range,
+          out_of_range_direction: position.out_of_range_direction || null,
+        })),
+      });
     } catch (error) {
       log("cron_error", `Management cycle failed: ${error.message}`);
       mgmtReport = `Management cycle failed: ${error.message}`;
+      const failure = classifyRuntimeFailure(error);
       managementEvaluation = {
+        cycle_id: cycleId,
         cycle_type: "management",
         status: "failed",
         summary: {
           positions_total: positions.length,
-          error: error.message,
+          reason_code: failure.reason_code,
+          error: failure.message,
         },
         positions: [],
       };
+      appendReplayEnvelope({
+        cycle_id: cycleId,
+        cycle_type: "management",
+        reason_code: failure.reason_code,
+        error: failure.message,
+      });
+      writeEvidenceBundle({
+        cycle_id: cycleId,
+        cycle_type: "management",
+        status: "failed",
+        reason_code: failure.reason_code,
+        error: failure.message,
+        written_at: new Date().toISOString(),
+      });
     } finally {
       if (managementEvaluation) recordCycleEvaluation(managementEvaluation);
       _managementBusy = false;
@@ -635,14 +712,49 @@ REPORT FORMAT (one per position):
     if (_screeningBusy) return;
     _screeningBusy = true;
     _screeningLastTriggered = Date.now();
+    const cycleId = createCycleId("screening");
+    const failScreeningPrecheck = (failure) => {
+      log("cron_error", `Screening pre-check failed: ${failure.message}`);
+      recordCycleEvaluation({
+        cycle_id: cycleId,
+        cycle_type: "screening",
+        status: "failed_precheck",
+        summary: { reason_code: failure.reason_code, error: failure.message },
+        candidates: [],
+      });
+      appendReplayEnvelope({
+        cycle_id: cycleId,
+        cycle_type: "screening",
+        reason_code: failure.reason_code,
+        error: failure.message,
+      });
+      writeEvidenceBundle({
+        cycle_id: cycleId,
+        cycle_type: "screening",
+        status: "failed_precheck",
+        reason_code: failure.reason_code,
+        error: failure.message,
+        written_at: new Date().toISOString(),
+      });
+    };
 
     // Hard guards — don't even run the agent if preconditions aren't met
     let prePositions, preBalance;
     try {
       [prePositions, preBalance] = await Promise.all([getMyPositions(), getWalletBalances()]);
+      const precheckFailure = validateStartupSnapshot({
+        wallet: preBalance,
+        positions: prePositions,
+        candidates: { candidates: [] },
+      });
+      if (precheckFailure) {
+        failScreeningPrecheck(precheckFailure);
+        return;
+      }
       if (prePositions.total_positions >= config.risk.maxPositions) {
         log("cron", `Screening skipped — max positions reached (${prePositions.total_positions}/${config.risk.maxPositions})`);
         recordCycleEvaluation({
+          cycle_id: cycleId,
           cycle_type: "screening",
           status: "skipped_max_positions",
           summary: {
@@ -657,6 +769,7 @@ REPORT FORMAT (one per position):
       if (preBalance.sol < minRequired) {
         log("cron", `Screening skipped — insufficient SOL (${preBalance.sol.toFixed(3)} < ${minRequired} needed for deploy + gas)`);
         recordCycleEvaluation({
+          cycle_id: cycleId,
           cycle_type: "screening",
           status: "skipped_insufficient_balance",
           summary: {
@@ -668,13 +781,8 @@ REPORT FORMAT (one per position):
         return;
       }
     } catch (e) {
-      log("cron_error", `Screening pre-check failed: ${e.message}`);
-      recordCycleEvaluation({
-        cycle_type: "screening",
-        status: "failed_precheck",
-        summary: { error: e.message },
-        candidates: [],
-      });
+      const failure = classifyRuntimeFailure(e);
+      failScreeningPrecheck(failure);
       return;
     }
 
@@ -697,17 +805,52 @@ REPORT FORMAT (one per position):
         : `No active strategy — use default bid_ask, bins_above: 0, SOL only.`;
 
       // Pre-load top candidates + all recon data in parallel (saves 4-6 LLM steps)
-      screeningTopCandidates = await getTopCandidates({ limit: 8 }).catch(() => null);
+      screeningTopCandidates = await getTopCandidates({ limit: 8 }).catch((error) => ({ error: error.message }));
+      const screeningFailure = validateStartupSnapshot({
+        wallet: { sol: preBalance.sol },
+        positions: prePositions,
+        candidates: screeningTopCandidates,
+      });
+      if (screeningFailure) {
+        screeningEvaluation = {
+          cycle_id: cycleId,
+          cycle_type: "screening",
+          status: "failed_candidates",
+          summary: {
+            reason_code: screeningFailure.reason_code,
+            error: screeningFailure.message,
+          },
+          candidates: [],
+        };
+        appendReplayEnvelope({
+          cycle_id: cycleId,
+          cycle_type: "screening",
+          reason_code: screeningFailure.reason_code,
+          error: screeningFailure.message,
+        });
+        writeEvidenceBundle({
+          cycle_id: cycleId,
+          cycle_type: "screening",
+          status: "failed_candidates",
+          reason_code: screeningFailure.reason_code,
+          error: screeningFailure.message,
+          written_at: new Date().toISOString(),
+        });
+        screenReport = `Screening failed closed: [${screeningFailure.reason_code}] ${screeningFailure.message}`;
+        return;
+      }
       const candidates = screeningTopCandidates?.candidates || screeningTopCandidates?.pools || [];
       const totalEligible = screeningTopCandidates?.total_eligible ?? candidates.length;
       const blockedSummary = screeningTopCandidates?.blocked_summary || {};
       const shortlist = candidates.slice(0, Math.min(5, candidates.length));
       const finalists = shortlist.slice(0, Math.min(2, shortlist.length));
+      const scorePreloadLimit = finalists.length;
 
       if (shortlist.length === 0) {
         log("cron", "Screening skipped — no eligible candidates after deterministic filters");
         screenReport = "Screening skipped — no eligible candidates passed deterministic filters.";
         screeningEvaluation = {
+          cycle_id: cycleId,
           cycle_type: "screening",
           status: "skipped_no_candidates",
           summary: {
@@ -868,6 +1011,7 @@ STEPS:
       `, config.llm.maxSteps, [], "SCREENER", config.llm.screeningModel, 4096);
       screenReport = content;
       screeningEvaluation = {
+        cycle_id: cycleId,
         cycle_type: "screening",
         status: "completed",
         summary: {
@@ -881,18 +1025,60 @@ STEPS:
         },
         candidates: candidateEvaluations,
       };
+      appendReplayEnvelope({
+        cycle_id: cycleId,
+        cycle_type: "screening",
+        total_screened: screeningTopCandidates?.total_screened ?? candidates.length,
+        total_eligible: totalEligible,
+        occupied_pools: prePositions.positions?.map((position) => position.pool).filter(Boolean) || [],
+        occupied_mints: prePositions.positions?.map((position) => position.base_mint).filter(Boolean) || [],
+        candidate_inputs: candidates.map((pool) => ({
+          pool: pool.pool,
+          name: pool.name,
+          base: pool.base,
+          fee_active_tvl_ratio: pool.fee_active_tvl_ratio,
+          volume_window: pool.volume_window,
+          organic_score: pool.organic_score,
+          holders: pool.holders,
+          active_pct: pool.active_pct,
+          volatility: pool.volatility,
+        })),
+        shortlist: shortlist.map((pool) => ({
+          pool: pool.pool,
+          name: pool.name,
+          ranking_score: roundMetric(pool.deterministic_score),
+        })),
+        finalists: candidateEvaluations,
+      });
     } catch (error) {
       log("cron_error", `Screening cycle failed: ${error.message}`);
       screenReport = `Screening cycle failed: ${error.message}`;
+      const failure = classifyRuntimeFailure(error);
       screeningEvaluation = {
+        cycle_id: cycleId,
         cycle_type: "screening",
         status: "failed",
         summary: {
-          error: error.message,
+          reason_code: failure.reason_code,
+          error: failure.message,
           total_eligible: screeningTopCandidates?.total_eligible ?? 0,
         },
         candidates: [],
       };
+      appendReplayEnvelope({
+        cycle_id: cycleId,
+        cycle_type: "screening",
+        reason_code: failure.reason_code,
+        error: failure.message,
+      });
+      writeEvidenceBundle({
+        cycle_id: cycleId,
+        cycle_type: "screening",
+        status: "failed",
+        reason_code: failure.reason_code,
+        error: failure.message,
+        written_at: new Date().toISOString(),
+      });
     } finally {
       if (screeningEvaluation) recordCycleEvaluation(screeningEvaluation);
       _screeningBusy = false;
@@ -990,6 +1176,10 @@ function appendHistory(userMsg, assistantMsg) {
   }
 }
 
+function formatRecoveryReport(report, suppression) {
+  return formatRecoveryWorkflowReport(report, suppression);
+}
+
 // Register restarter — when update_config changes intervals, running cron jobs get replaced
 registerCronRestarter(() => { if (cronStarted) startCronJobs(); });
 
@@ -1009,6 +1199,13 @@ if (isTTY) {
   }, 10_000);
 
   function launchCron() {
+    if (bootRecovery.suppress_autonomous_writes) {
+      const recoveryBlock = summarizeRecoveryBlock(bootRecovery);
+      console.log(`Autonomous cycles are paused: boot recovery blocked startup because ${recoveryBlock.headline}.`);
+      console.log(`Recovery detail: ${recoveryBlock.detail}`);
+      rl.prompt(true);
+      return;
+    }
     if (!cronStarted) {
       cronStarted = true;
       // Seed timers so countdown starts from now
@@ -1037,12 +1234,26 @@ if (isTTY) {
 `);
 
   console.log("Fetching wallet and top pool candidates...\n");
+  if (bootRecovery.suppress_autonomous_writes) {
+    const recoveryBlock = summarizeRecoveryBlock(bootRecovery);
+    console.log(`RECOVERY BLOCK ACTIVE: ${recoveryBlock.headline}.`);
+    console.log(`Autonomous write-capable cycles are suppressed until operator review. ${recoveryBlock.detail}\n`);
+  }
 
   busy = true;
   let startupCandidates = [];
 
   try {
-    const { wallet, positions, candidates, total_eligible, total_screened } = await getStartupSnapshot({ force: true });
+    const startupSnapshot = await getStartupSnapshot({
+      force: true,
+      getWalletBalances,
+      getMyPositions,
+      getTopCandidates,
+    });
+    if (isFailClosedResult(startupSnapshot)) {
+      throw new Error(`[${startupSnapshot.reason_code}] ${startupSnapshot.message}`);
+    }
+    const { wallet, positions, candidates, total_eligible, total_screened } = startupSnapshot;
 
     startupCandidates = candidates;
 
@@ -1088,6 +1299,17 @@ if (isTTY) {
       return;
     }
 
+    if (text === "/recovery") {
+      try {
+        const report = getRecoveryWorkflowReport({ limit: 5 });
+        const suppression = getAutonomousWriteSuppression();
+        await sendMessage(formatRecoveryReport(report, suppression));
+      } catch (e) {
+        await sendMessage(`Error: ${e.message}`).catch(() => {});
+      }
+      return;
+    }
+
     busy = true;
     try {
       log("telegram", `Incoming: ${text}`);
@@ -1114,7 +1336,10 @@ Commands:
   /candidates    Refresh top pool list
   /candidate <n> Inspect one ranked candidate with richer signals
   /evaluation    Show recent cycle/tool evaluation summary
+  /failures      Show recent persisted bad-cycle evidence bundles
+  /recovery      Show unresolved/manual-review recovery workflows
   /performance   Show recent closed-position performance history
+  /proof         Show bounded strategy proof summary from realized closes
   /briefing      Show morning briefing (last 24h)
   /learn         Study top LPers from the best current pool and save lessons
   /learn <addr>  Study top LPers from a specific pool address
@@ -1175,7 +1400,16 @@ Commands:
 
     if (input === "/status") {
       await runBusy(async () => {
-        const { wallet, positions } = await getStartupSnapshot();
+        const snapshot = await getStartupSnapshot({
+          getWalletBalances,
+          getMyPositions,
+          getTopCandidates,
+        });
+        if (isFailClosedResult(snapshot)) {
+          console.log(`\nStatus unavailable: [${snapshot.reason_code}] ${snapshot.message}\n`);
+          return;
+        }
+        const { wallet, positions } = snapshot;
         console.log(`\nWallet: ${wallet.sol} SOL  ($${wallet.sol_usd})`);
         console.log(`Positions: ${positions.total_positions}`);
         for (const p of positions.positions) {
@@ -1197,7 +1431,17 @@ Commands:
 
     if (input === "/candidates") {
       await runBusy(async () => {
-        const { candidates, total_eligible, total_screened } = await getStartupSnapshot({ force: true });
+        const snapshot = await getStartupSnapshot({
+          force: true,
+          getWalletBalances,
+          getMyPositions,
+          getTopCandidates,
+        });
+        if (isFailClosedResult(snapshot)) {
+          console.log(`\nCandidates unavailable: [${snapshot.reason_code}] ${snapshot.message}\n`);
+          return;
+        }
+        const { candidates, total_eligible, total_screened } = snapshot;
         startupCandidates = candidates;
         console.log(`\nTop pools (${total_eligible} eligible from ${total_screened} screened):\n`);
         console.log(formatCandidates(candidates));
@@ -1253,6 +1497,32 @@ Commands:
       return;
     }
 
+    if (input === "/failures") {
+      await runBusy(async () => {
+        const bundles = listEvidenceBundles(5);
+        if (bundles.length === 0) {
+          console.log("\nNo bad-cycle evidence bundles recorded yet.\n");
+          return;
+        }
+
+        console.log("\nRecent bad-cycle evidence bundles:\n");
+        for (const bundle of bundles) {
+          console.log(`  - ${bundle.file}: ${bundle.cycle_type} / ${bundle.status}${bundle.reason_code ? ` / ${bundle.reason_code}` : ""}${bundle.error ? ` / ${bundle.error}` : ""}`);
+        }
+        console.log();
+      });
+      return;
+    }
+
+    if (input === "/recovery") {
+      await runBusy(async () => {
+        const report = getRecoveryWorkflowReport({ limit: 10 });
+        const suppression = getAutonomousWriteSuppression();
+        console.log(formatRecoveryReport(report, suppression));
+      });
+      return;
+    }
+
     if (input === "/performance") {
       await runBusy(async () => {
         const summary = getPerformanceSummary();
@@ -1293,6 +1563,37 @@ Commands:
           console.log("\n  Recent closes:");
           for (const row of history.positions) {
             console.log(`    - ${row.pool_name}: pnl=${row.pnl_usd} usd | inventory=${row.inventory_pnl_usd} | fees=${row.fee_component_usd} | touches=${row.operational_touch_count} | reason=${row.close_reason}`);
+          }
+        }
+        console.log();
+      });
+      return;
+    }
+
+    if (input === "/proof") {
+      await runBusy(async () => {
+        const proof = getStrategyProofSummary({ hours: 168 });
+        if (!proof) {
+          console.log("\nNo closed-position proof data recorded yet.\n");
+          return;
+        }
+
+        console.log("\nStrategy proof summary:\n");
+        console.log(`  positions_analyzed:         ${proof.positions_analyzed}`);
+        console.log(`  total_inventory_pnl_usd:    ${proof.total_inventory_pnl_usd}`);
+        console.log(`  total_fee_component_usd:    ${proof.total_fee_component_usd}`);
+        console.log(`  fee_share_of_total_pnl_pct: ${proof.fee_share_of_total_pnl_pct}%`);
+        console.log(`  avg_operational_touches:    ${proof.avg_operational_touch_count}`);
+
+        console.log("\n  Strategy breakdown:");
+        for (const row of proof.strategy_breakdown) {
+          console.log(`    - ${row.strategy}: count=${row.count} | win=${row.win_rate_pct}% | avg_pnl=${row.avg_pnl_pct}% | inv=${row.avg_inventory_pnl_usd} | fees=${row.avg_fee_component_usd} | touches=${row.avg_operational_touch_count}`);
+        }
+
+        if (proof.top_close_reasons.length > 0) {
+          console.log("\n  Top close reasons:");
+          for (const row of proof.top_close_reasons) {
+            console.log(`    - ${row.reason}: ${row.count}`);
           }
         }
         console.log();
@@ -1410,17 +1711,22 @@ Focus on: hold duration, entry/exit timing, what win rates look like, whether sc
 
 } else {
   // Non-TTY: start immediately
-  log("startup", "Non-TTY mode — starting cron cycles immediately.");
-  startCronJobs();
-  maybeRunMissedBriefing().catch(() => {});
-  (async () => {
-    try {
-      await agentLoop(`
+  if (bootRecovery.suppress_autonomous_writes) {
+    const recoveryBlock = summarizeRecoveryBlock(bootRecovery);
+    log("recovery_block", `Non-TTY boot recovery blocked autonomous write-capable startup because ${recoveryBlock.headline}. ${recoveryBlock.detail}`);
+  } else {
+    log("startup", "Non-TTY mode — starting cron cycles immediately.");
+    startCronJobs();
+    maybeRunMissedBriefing().catch(() => {});
+    (async () => {
+      try {
+        await agentLoop(`
 STARTUP CHECK
 1. get_wallet_balance. 2. get_my_positions. 3. If SOL >= ${config.management.minSolToOpen}: get_top_candidates then deploy ${DEPLOY} SOL. 4. Report.
-      `, config.llm.maxSteps, [], "SCREENER");
-    } catch (e) {
-      log("startup_error", e.message);
-    }
-  })();
+        `, config.llm.maxSteps, [], "SCREENER");
+      } catch (e) {
+        log("startup_error", e.message);
+      }
+    })();
+  }
 }

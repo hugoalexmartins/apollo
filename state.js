@@ -10,6 +10,7 @@
 
 import fs from "fs";
 import { log } from "./logger.js";
+import { foldActionJournal, readActionJournal } from "./action-journal.js";
 
 const STATE_FILE = "./state.json";
 
@@ -74,7 +75,7 @@ function load() {
     return state;
   } catch (err) {
     log("state_error", `Failed to read state.json: ${err.message}`);
-    return emptyState();
+    throw new Error(`Invalid state.json: ${err.message}`);
   }
 }
 
@@ -226,6 +227,7 @@ function pushEvent(state, event) {
 }
 
 export function recordCycleEvaluation({
+  cycle_id = null,
   cycle_type,
   status = "completed",
   summary = {},
@@ -238,6 +240,7 @@ export function recordCycleEvaluation({
   const evaluation = ensureEvaluation(state);
   const record = {
     ts: new Date().toISOString(),
+    cycle_id,
     cycle_type,
     status,
     summary,
@@ -271,6 +274,8 @@ export function recordToolOutcome({ tool, outcome, reason = null, metadata = nul
     tool,
     outcome,
     reason,
+    cycle_id: metadata?.cycle_id || null,
+    action_id: metadata?.action_id || null,
     metadata,
   };
 
@@ -349,10 +354,15 @@ export function setPositionInstruction(position_address, instruction) {
  * Update peak PnL and check trailing take profit / stop loss.
  * Returns an action string if a threshold is hit, or null.
  */
-export function updatePnlAndCheckExits(position_address, currentPnlPct, config) {
+export function updatePnlAndCheckExits(position_address, currentPnlPct, config, { stale = false } = {}) {
+  const normalizedPnlPct = Number(currentPnlPct);
+  if (stale || !Number.isFinite(normalizedPnlPct)) return null;
+
   const state = load();
   const pos = state.positions[position_address];
   if (!pos || pos.closed) return null;
+
+  currentPnlPct = normalizedPnlPct;
 
   const mgmt = config.management;
   let action = null;
@@ -470,6 +480,17 @@ export function syncOpenPositions(active_addresses) {
   const activeSet = new Set(active_addresses);
   let changed = false;
 
+  const journal = readActionJournal();
+  const unresolvedWriteWorkflows = foldActionJournal(journal.entries).filter((workflow) => {
+    if (!workflow || !workflow.tool) return false;
+    if (workflow.lifecycle === "completed" || workflow.lifecycle === "manual_review") return false;
+    return workflow.lifecycle === "intent" || workflow.lifecycle === "close_observed_pending_redeploy";
+  });
+
+  if (journal.parse_errors.length > 0) {
+    log("state_warn", `State sync skipped auto-close because action journal has ${journal.parse_errors.length} parse error(s)`);
+  }
+
   for (const posId in state.positions) {
     const pos = state.positions[posId];
     if (pos.closed || activeSet.has(posId)) continue;
@@ -478,6 +499,26 @@ export function syncOpenPositions(active_addresses) {
     const deployedAt = pos.deployed_at ? new Date(pos.deployed_at).getTime() : 0;
     if (Date.now() - deployedAt < SYNC_GRACE_MS) {
       log("state", `Position ${posId} not on-chain yet — within grace period, skipping auto-close`);
+      continue;
+    }
+
+    if (journal.parse_errors.length > 0) {
+      log("state_warn", `Position ${posId} missing on-chain but action journal is invalid; skipping auto-close`);
+      continue;
+    }
+
+    const relatedWorkflows = unresolvedWriteWorkflows.filter((workflow) => {
+      if (workflow.position_address && workflow.position_address === posId) return true;
+      if (workflow.pool_address && pos.pool && workflow.pool_address === pos.pool) return true;
+      return false;
+    });
+
+    if (relatedWorkflows.length > 0) {
+      const workflowHints = relatedWorkflows
+        .slice(0, 3)
+        .map((workflow) => `${workflow.workflow_id}:${workflow.tool}:${workflow.lifecycle}`)
+        .join(", ");
+      log("state_warn", `Position ${posId} missing on-chain but unresolved workflow(s) exist (${workflowHints}); skipping auto-close`);
       continue;
     }
 

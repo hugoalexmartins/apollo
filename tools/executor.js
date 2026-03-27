@@ -25,6 +25,7 @@ import { addSmartWallet, removeSmartWallet, listSmartWallets, checkSmartWalletsO
 import { getTokenInfo, getTokenHolders, getTokenNarrative } from "./token.js";
 import { config } from "../config.js";
 import { estimateInitialValueUsd } from "../runtime-helpers.js";
+import { appendActionLifecycle } from "../action-journal.js";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -35,9 +36,71 @@ const USER_CONFIG_PATH = path.join(__dirname, "../user-config.json");
 import { log, logAction } from "../logger.js";
 import { notifyDeploy, notifyClose, notifySwap } from "../telegram.js";
 
+const executorTestOverrides = {
+  getMyPositions: null,
+  getWalletBalances: null,
+  recordToolOutcome: null,
+  tools: {},
+};
+
+export function setExecutorTestOverrides(overrides = {}) {
+  if (Object.prototype.hasOwnProperty.call(overrides, "getMyPositions")) executorTestOverrides.getMyPositions = overrides.getMyPositions;
+  if (Object.prototype.hasOwnProperty.call(overrides, "getWalletBalances")) executorTestOverrides.getWalletBalances = overrides.getWalletBalances;
+  if (Object.prototype.hasOwnProperty.call(overrides, "recordToolOutcome")) executorTestOverrides.recordToolOutcome = overrides.recordToolOutcome;
+  if (overrides.tools) executorTestOverrides.tools = { ...executorTestOverrides.tools, ...overrides.tools };
+}
+
+export function resetExecutorTestOverrides() {
+  executorTestOverrides.getMyPositions = null;
+  executorTestOverrides.getWalletBalances = null;
+  executorTestOverrides.recordToolOutcome = null;
+  executorTestOverrides.tools = {};
+}
+
+function getMyPositionsRuntime(args = {}) {
+  return executorTestOverrides.getMyPositions
+    ? executorTestOverrides.getMyPositions(args)
+    : getMyPositions(args);
+}
+
+function getWalletBalancesRuntime(args = {}) {
+  return executorTestOverrides.getWalletBalances
+    ? executorTestOverrides.getWalletBalances(args)
+    : getWalletBalances(args);
+}
+
+function recordToolOutcomeRuntime(payload) {
+  if (executorTestOverrides.recordToolOutcome) {
+    executorTestOverrides.recordToolOutcome(payload);
+    return;
+  }
+  recordToolOutcome(payload);
+}
+
+function getToolImplementation(name) {
+  return executorTestOverrides.tools[name] || toolMap[name];
+}
+
 // Registered by index.js so update_config can restart cron jobs when intervals change
 let _cronRestarter = null;
 export function registerCronRestarter(fn) { _cronRestarter = fn; }
+
+let _autonomousWriteSuppressed = false;
+let _writeSuppressionReason = null;
+
+export function setAutonomousWriteSuppression({ suppressed, reason = null } = {}) {
+  _autonomousWriteSuppressed = Boolean(suppressed);
+  _writeSuppressionReason = _autonomousWriteSuppressed
+    ? (reason || "manual review required")
+    : null;
+}
+
+export function getAutonomousWriteSuppression() {
+  return {
+    suppressed: _autonomousWriteSuppressed,
+    reason: _writeSuppressionReason,
+  };
+}
 
 // Map tool names to implementations
 const toolMap = {
@@ -262,12 +325,27 @@ const WRITE_TOOLS = new Set([
 /**
  * Execute a tool call with safety checks and logging.
  */
-export async function executeTool(name, args) {
+export async function executeTool(name, args, meta = {}) {
   const startTime = Date.now();
   let normalizedArgs = args;
+  let workflowId = null;
+
+  function appendManualReviewTerminal(reason) {
+    if (!workflowId) return;
+    appendActionLifecycle({
+      workflow_id: workflowId,
+      lifecycle: "manual_review",
+      tool: name,
+      cycle_id: meta.cycle_id || null,
+      action_id: meta.action_id || null,
+      position_address: normalizedArgs?.position_address || null,
+      pool_address: normalizedArgs?.pool_address || null,
+      reason,
+    });
+  }
 
   // ─── Validate tool exists ─────────────────
-  const fn = toolMap[name];
+  const fn = getToolImplementation(name);
   if (!fn) {
     const error = `Unknown tool: ${name}`;
     log("error", error);
@@ -275,7 +353,7 @@ export async function executeTool(name, args) {
   }
 
   if (name === "deploy_position" && normalizedArgs && normalizedArgs.initial_value_usd == null) {
-    const wallet = await getWalletBalances({}).catch(() => null);
+    const wallet = await getWalletBalancesRuntime({}).catch(() => null);
     const solPrice = Number(wallet?.sol_price) || 0;
     const solLeg = Number(normalizedArgs.amount_y ?? normalizedArgs.amount_sol ?? 0);
     if (solPrice > 0 && solLeg > 0) {
@@ -288,22 +366,63 @@ export async function executeTool(name, args) {
   }
 
   // ─── Pre-execution safety checks ──────────
-    if (WRITE_TOOLS.has(name)) {
-      const safetyCheck = await runSafetyChecks(name, normalizedArgs);
-      if (!safetyCheck.pass) {
-        log("safety_block", `${name} blocked: ${safetyCheck.reason}`);
-        recordToolOutcome({
-          tool: name,
-          outcome: "blocked",
-          reason: safetyCheck.reason,
-          metadata: {
-            pool_address: normalizedArgs?.pool_address || null,
-            position_address: normalizedArgs?.position_address || null,
-          },
-        });
-        return {
-          blocked: true,
-          reason: safetyCheck.reason,
+  if (WRITE_TOOLS.has(name)) {
+    if (_autonomousWriteSuppressed) {
+      const reason = _writeSuppressionReason || "manual review required before autonomous writes can resume";
+      recordToolOutcomeRuntime({
+        tool: name,
+        outcome: "blocked",
+        reason,
+        metadata: {
+          pool_address: normalizedArgs?.pool_address || null,
+          position_address: normalizedArgs?.position_address || null,
+          cycle_id: meta.cycle_id || null,
+          action_id: meta.action_id || null,
+          blocked_by_recovery: true,
+        },
+      });
+      return {
+        blocked: true,
+        reason,
+      };
+    }
+
+    workflowId = meta.action_id || `${name}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    appendActionLifecycle({
+      workflow_id: workflowId,
+      lifecycle: "intent",
+      tool: name,
+      cycle_id: meta.cycle_id || null,
+      action_id: meta.action_id || null,
+      position_address: normalizedArgs?.position_address || null,
+      pool_address: normalizedArgs?.pool_address || null,
+    });
+
+    if (name === "rebalance_on_exit") {
+      normalizedArgs = {
+        ...normalizedArgs,
+        journal_workflow_id: workflowId,
+      };
+    }
+
+    const safetyCheck = await runSafetyChecks(name, normalizedArgs);
+    if (!safetyCheck.pass) {
+      log("safety_block", `${name} blocked: ${safetyCheck.reason}`);
+      appendManualReviewTerminal("write_intent_blocked_by_safety_checks");
+      recordToolOutcomeRuntime({
+        tool: name,
+        outcome: "blocked",
+        reason: safetyCheck.reason,
+        metadata: {
+          pool_address: normalizedArgs?.pool_address || null,
+          position_address: normalizedArgs?.position_address || null,
+          cycle_id: meta.cycle_id || null,
+          action_id: meta.action_id || null,
+        },
+      });
+      return {
+        blocked: true,
+        reason: safetyCheck.reason,
       };
     }
   }
@@ -320,16 +439,31 @@ export async function executeTool(name, args) {
       result: summarizeResult(result),
       duration_ms: duration,
       success,
+      cycle_id: meta.cycle_id || null,
+      action_id: meta.action_id || null,
     });
 
     if (success) {
       if (WRITE_TOOLS.has(name)) {
-        recordToolOutcome({
+        if (workflowId) {
+          appendActionLifecycle({
+            workflow_id: workflowId,
+            lifecycle: "completed",
+            tool: name,
+            cycle_id: meta.cycle_id || null,
+            action_id: meta.action_id || null,
+            position_address: normalizedArgs?.position_address || result?.position || null,
+            pool_address: normalizedArgs?.pool_address || result?.pool || result?.pool_address || null,
+          });
+        }
+        recordToolOutcomeRuntime({
           tool: name,
           outcome: "success",
           metadata: {
-            pool_address: args?.pool_address || result?.pool_address || null,
+            pool_address: normalizedArgs?.pool_address || result?.pool_address || null,
             position_address: normalizedArgs?.position_address || result?.position || null,
+            cycle_id: meta.cycle_id || null,
+            action_id: meta.action_id || null,
           },
         });
       }
@@ -342,7 +476,7 @@ export async function executeTool(name, args) {
         // Auto-swap base token back to SOL unless user said to hold
         if (!normalizedArgs.skip_swap && result.base_mint) {
           try {
-            const balances = await getWalletBalances({});
+            const balances = await getWalletBalancesRuntime({});
             const token = balances.tokens?.find(t => t.mint === result.base_mint);
             if (token && token.usd >= 0.10) {
               log("executor", `Auto-swapping ${token.symbol || result.base_mint.slice(0, 8)} ($${token.usd.toFixed(2)}) back to SOL`);
@@ -354,7 +488,7 @@ export async function executeTool(name, args) {
         }
       } else if (name === "claim_fees" && config.management.autoSwapAfterClaim && result.base_mint) {
         try {
-          const balances = await getWalletBalances({});
+          const balances = await getWalletBalancesRuntime({});
           const token = balances.tokens?.find(t => t.mint === result.base_mint);
           if (token && token.usd >= 0.10) {
             log("executor", `Auto-swapping claimed ${token.symbol || result.base_mint.slice(0, 8)} ($${token.usd.toFixed(2)}) back to SOL`);
@@ -366,18 +500,37 @@ export async function executeTool(name, args) {
       }
     }
 
+    if (!success && WRITE_TOOLS.has(name)) {
+      const reason = result?.error || "write_tool_reported_unsuccessful_result";
+      appendManualReviewTerminal(reason);
+      recordToolOutcomeRuntime({
+        tool: name,
+        outcome: "error",
+        reason,
+        metadata: {
+          pool_address: normalizedArgs?.pool_address || null,
+          position_address: normalizedArgs?.position_address || null,
+          cycle_id: meta.cycle_id || null,
+          action_id: meta.action_id || null,
+        },
+      });
+    }
+
     return result;
   } catch (error) {
     const duration = Date.now() - startTime;
 
     if (WRITE_TOOLS.has(name)) {
-      recordToolOutcome({
+      appendManualReviewTerminal(error.message || "write_tool_execution_error");
+      recordToolOutcomeRuntime({
         tool: name,
         outcome: "error",
         reason: error.message,
-          metadata: {
+        metadata: {
           pool_address: normalizedArgs?.pool_address || null,
           position_address: normalizedArgs?.position_address || null,
+          cycle_id: meta.cycle_id || null,
+          action_id: meta.action_id || null,
         },
       });
     }
@@ -388,6 +541,8 @@ export async function executeTool(name, args) {
       error: error.message,
       duration_ms: duration,
       success: false,
+      cycle_id: meta.cycle_id || null,
+      action_id: meta.action_id || null,
     });
 
     // Return error to LLM so it can decide what to do
@@ -401,7 +556,7 @@ export async function executeTool(name, args) {
 /**
  * Run safety checks before executing write operations.
  */
-async function runSafetyChecks(name, args) {
+export async function runSafetyChecks(name, args) {
   switch (name) {
     case "deploy_position": {
       // Reject pools with bin_step out of configured range
@@ -415,7 +570,7 @@ async function runSafetyChecks(name, args) {
       }
 
       // Check position count limit + duplicate pool guard
-      const positions = await getMyPositions({ force: true });
+      const positions = await getMyPositionsRuntime({ force: true });
       if (positions.total_positions >= config.risk.maxPositions) {
         return {
           pass: false,
@@ -470,7 +625,7 @@ async function runSafetyChecks(name, args) {
       }
 
       // Check SOL balance — must have enough to deploy + gas reserve
-      const balance = await getWalletBalances();
+      const balance = await getWalletBalancesRuntime();
       const gasReserve = config.management.gasReserve;
       const minRequired = amountY + gasReserve;
       if (balance.sol < minRequired) {
@@ -509,7 +664,7 @@ async function runSafetyChecks(name, args) {
         };
       }
 
-      const positions = await getMyPositions({ force: true });
+      const positions = await getMyPositionsRuntime({ force: true });
       const openPosition = positions.positions?.find((position) => position.position === args.position_address);
       if (!openPosition) {
         return {

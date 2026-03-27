@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { deriveExpectedVolumeProfile, MANAGEMENT_SUBREASONS, planManagementRuntimeAction, resolveTargetManagementInterval } from "./runtime-policy.js";
+import { deriveExpectedVolumeProfile, isPnlSignalStale, MANAGEMENT_SUBREASONS, planManagementRuntimeAction, resolveTargetManagementInterval } from "./runtime-policy.js";
 
 const config = {
   management: {
@@ -65,4 +65,51 @@ test("deriveExpectedVolumeProfile remains bounded and deterministic", () => {
   assert.equal(deriveExpectedVolumeProfile({ fee_tvl_ratio: 0.02, volume_window: 500, volatility: 1 }), "low");
   assert.equal(deriveExpectedVolumeProfile({ fee_tvl_ratio: 0.7, volume_window: 100000, volatility: 11 }), "high");
   assert.equal(deriveExpectedVolumeProfile({ fee_tvl_ratio: 2.1, volume_window: 300000, volatility: 19 }), "bursty");
+});
+
+test("stale pnl signals suppress pnl-driven management actions", () => {
+  const result = planManagementRuntimeAction({
+    position: "pos-stale",
+    in_range: true,
+    age_minutes: 120,
+    pnl: {
+      stale: true,
+      pnl_pct: 9,
+      fee_per_tvl_24h: 2,
+      unclaimed_fee_usd: 12,
+    },
+    unclaimed_fees_usd: 12,
+  }, config);
+
+  assert.equal(result, null);
+});
+
+test("stale pnl suppresses exit-alert closes", () => {
+  const result = planManagementRuntimeAction({
+    position: "pos-stale-exit",
+    exitAlert: "STOP_LOSS: stale feed should not trigger close",
+    in_range: true,
+    age_minutes: 120,
+    pnl: { stale: true, pnl_pct: -20 },
+  }, config);
+
+  assert.equal(result, null);
+});
+
+test("stale pnl still allows deterministic out-of-range rebalance", () => {
+  const result = planManagementRuntimeAction({
+    position: "pos-stale-oor",
+    in_range: false,
+    minutes_out_of_range: 8,
+    pnl: { stale: true, volatility: 6 },
+  }, config);
+
+  assert.equal(result.toolName, "rebalance_on_exit");
+  assert.equal(result.rule, MANAGEMENT_SUBREASONS.OUT_OF_RANGE);
+});
+
+test("isPnlSignalStale detects explicit stale markers", () => {
+  assert.equal(isPnlSignalStale({ pnl: { stale: true } }), true);
+  assert.equal(isPnlSignalStale({ pnl: { lagging: true } }), true);
+  assert.equal(isPnlSignalStale({ pnl: { pnl_pct: 1.2 } }), false);
 });

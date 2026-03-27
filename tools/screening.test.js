@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { discoverPools, evaluateCandidateSnapshot, rankCandidateSnapshots, resetDiscoveryCache } from "./screening.js";
+import { discoverPools, evaluateCandidateSnapshot, getTopCandidates, rankCandidateSnapshots, resetDiscoveryCache } from "./screening.js";
 
 function buildPool(overrides = {}) {
   return {
@@ -102,4 +102,26 @@ test("discoverPools reuses short-lived cache for identical requests", async () =
     resetDiscoveryCache();
     global.fetch = originalFetch;
   }
+});
+
+test("getTopCandidates throws deterministic error for error-shaped positions payload", async () => {
+  await assert.rejects(
+    getTopCandidates({
+      limit: 2,
+      discoverPoolsFn: async () => ({ pools: [buildPool()] }),
+      getMyPositionsFn: async () => ({ error: "RPC timeout" }),
+    }),
+    /positions unavailable: RPC timeout/
+  );
+});
+
+test("getTopCandidates rejects malformed positions payload before dereference", async () => {
+  await assert.rejects(
+    getTopCandidates({
+      limit: 2,
+      discoverPoolsFn: async () => ({ pools: [buildPool()] }),
+      getMyPositionsFn: async () => ({ total_positions: 0 }),
+    }),
+    /positions payload missing positions array/
+  );
 });

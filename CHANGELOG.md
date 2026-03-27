@@ -4,8 +4,26 @@ This file documents the major additions and behavior changes present in this for
 
 ## Recent updates
 
+### 2026-03-27
+
+- Added a committed runtime-hardening closure plan in `runtime-hardening-plan.md`, mapping the action journal, restart recovery, fault-injection seams, and reconciliation surfaces onto the current Zenith files.
+- Added a committed runtime-hardening review note in `runtime-hardening-review.md`, capturing the anti-bloat boundary, recovery posture, and remaining sharp edges for this phase.
+- Added `test/test-dry-run-startup.js` as a provider-free dry-run startup verification script covering clean boot recovery and startup snapshot readiness.
+- Added `test:hardening:*` npm scripts plus `npm run test:hardening` as the deterministic runtime-hardening verification gate.
+- Kept `test/test-screening.js` wallet-free by injecting an explicit empty-position view into deterministic candidate ranking smoke.
+- Updated the README to document the action journal, boot recovery, `/recovery`, the committed hardening plan/review artifacts, and the new verification command.
+
 ### 2026-03-26
 
+- Added startup snapshot extraction with fail-closed validation and bounded caching (`startup-snapshot.js`, `startup-snapshot.test.js`).
+- Added a separately testable deterministic management runtime runner (`management-runtime.js`, `management-runtime.test.js`).
+- Added persisted bad-cycle evidence bundles and REPL inspection via `/failures` (`evidence-bundles.js`, `evidence-bundles.test.js`).
+- Added bounded strategy-proof reporting via `/proof`, including realized inventory-vs-fee contribution, operational touch counts, strategy breakdowns, and dominant close reasons.
+- Added Phase 0 serious-capital proof infrastructure: executor-boundary checks, cycle/action correlation IDs, replay envelopes, fail-closed degraded-mode helpers, and minimal deterministic reconciliation helpers.
+- Added direct executor-boundary regression coverage in `test/test-executor-boundary.js`.
+- Added provider-free replay and fail-closed contract coverage in `cycle-trace.test.js`, `cycle-replay.test.js`, `degraded-mode.test.js`, and `reconciliation.test.js`.
+- Threaded explicit `cycle_id` / `action_id` correlation through runtime evaluation and tool outcomes for clearer auditability.
+- Added fail-closed startup/screening handling for unavailable or invalid wallet/positions/candidate payloads.
 - Removed redundant deploy choreography by stopping the requirement to pre-call `get_active_bin` before `deploy_position` when no standalone bin inspection is needed.
 - Hardened deploy-time basis data so `initial_value_usd` is treated as required evaluation input, with a bounded SOL-leg fallback for legacy callers.
 - Replaced the blunt fixed post-close wait with a bounded settlement check/polling path to reduce stale-balance races more safely.

@@ -671,6 +671,69 @@ export function getPerformanceSummary() {
   };
 }
 
+export function getStrategyProofSummary({ hours = 168 } = {}) {
+  const data = load();
+  const since = Date.now() - (hours * 60 * 60 * 1000);
+  const positions = (data.performance || []).filter((row) => new Date(row.recorded_at).getTime() >= since);
+  if (positions.length === 0) return null;
+
+  const byStrategy = new Map();
+  const closeReasons = new Map();
+  let totalInventory = 0;
+  let totalFees = 0;
+  let totalTouches = 0;
+
+  for (const row of positions) {
+    const strategy = row.strategy || "unknown";
+    const current = byStrategy.get(strategy) || {
+      strategy,
+      count: 0,
+      wins: 0,
+      totalPnlPct: 0,
+      totalInventoryUsd: 0,
+      totalFeesUsd: 0,
+      totalTouches: 0,
+    };
+    current.count += 1;
+    current.wins += row.pnl_usd > 0 ? 1 : 0;
+    current.totalPnlPct += row.pnl_pct || 0;
+    current.totalInventoryUsd += row.inventory_pnl_usd || 0;
+    current.totalFeesUsd += row.fee_component_usd || 0;
+    current.totalTouches += row.operational_touch_count || 0;
+    byStrategy.set(strategy, current);
+
+    const closeReason = row.close_reason || "unknown";
+    closeReasons.set(closeReason, (closeReasons.get(closeReason) || 0) + 1);
+    totalInventory += row.inventory_pnl_usd || 0;
+    totalFees += row.fee_component_usd || 0;
+    totalTouches += row.operational_touch_count || 0;
+  }
+
+  return {
+    window_hours: hours,
+    positions_analyzed: positions.length,
+    total_inventory_pnl_usd: Math.round(totalInventory * 100) / 100,
+    total_fee_component_usd: Math.round(totalFees * 100) / 100,
+    fee_share_of_total_pnl_pct: positions.length && (totalInventory + totalFees) !== 0
+      ? Math.round((totalFees / (totalInventory + totalFees)) * 1000) / 10
+      : 0,
+    avg_operational_touch_count: Math.round((totalTouches / positions.length) * 10) / 10,
+    strategy_breakdown: [...byStrategy.values()].map((row) => ({
+      strategy: row.strategy,
+      count: row.count,
+      win_rate_pct: Math.round((row.wins / row.count) * 100),
+      avg_pnl_pct: Math.round((row.totalPnlPct / row.count) * 100) / 100,
+      avg_inventory_pnl_usd: Math.round((row.totalInventoryUsd / row.count) * 100) / 100,
+      avg_fee_component_usd: Math.round((row.totalFeesUsd / row.count) * 100) / 100,
+      avg_operational_touch_count: Math.round((row.totalTouches / row.count) * 10) / 10,
+    })).sort((a, b) => b.count - a.count),
+    top_close_reasons: [...closeReasons.entries()]
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5)
+      .map(([reason, count]) => ({ reason, count })),
+  };
+}
+
 function inferTokenTypeDistribution(perf) {
   const strategy = String(perf.strategy || "").toLowerCase();
 

@@ -2,7 +2,7 @@
 
 **Autonomous Meteora DLMM liquidity management agent for Solana, powered by LLM-guided runtime orchestration.**
 
-Implementation status updated: `2026-03-26`
+Implementation status updated: `2026-03-27`
 
 ---
 
@@ -48,6 +48,14 @@ A third health check runs hourly to summarize portfolio state.
 - Post-close handling now uses a bounded settlement check instead of a blind fixed sleep, reducing stale-balance races after close transactions
 - `deploy_position` no longer depends on redundant `get_active_bin` choreography and now backfills deploy-time USD basis data when only the SOL leg is known
 - Setup input now masks wallet private key entry instead of echoing secrets in plain text
+- Phase 0 serious-capital work is now in place: executor-boundary contract checks, cycle/action correlation IDs, replay envelopes for screening and management, fail-closed startup/screening behavior, and deterministic reconciliation helpers
+- Startup snapshot caching/validation and deterministic management-runtime execution are now extracted into dedicated helpers so the orchestration path is easier to prove and test
+- Bad-cycle evidence bundles are now persisted for fail-closed and failed screening/management cycles, and `/failures` exposes the latest bundle summaries directly in the REPL
+- `/proof` now surfaces a bounded strategy-proof summary from realized closes: inventory contribution, fee contribution, operational touch count, per-strategy breakdown, and dominant close reasons
+- Runtime writes now flow through a durable action journal in `data/workflow-actions.jsonl`, with executor-boundary `intent -> terminal` lifecycle tracking and rebalance-specific mid-state handoff for restart safety
+- Boot recovery now resolves prior write workflows observation-first, blocks autonomous writes on journal corruption or unresolved outcomes, and exposes `/recovery` so the operator can inspect suppression state without opening JSONL directly
+- Provider-free operator and chaos drills now cover fail-closed screening startup paths, stale-PnL management behavior, bounded LP Agent fallback, and screening replay reconciliation
+- `npm run test:hardening` now acts as the committed runtime-hardening verification gate; `npm run test:screen` remains the live external screening smoke and `npm run test:agent` remains the optional dry-run full-agent smoke
 
 **Data sources used by the agent:**
 - `@meteora-ag/dlmm` SDK — on-chain position data, active bin, deploy/close flows
@@ -112,6 +120,7 @@ Or copy `user-config.example.json` to `user-config.json` and edit it manually.
 ```bash
 npm run dev    # dry run; no live on-chain transactions
 npm start      # live mode
+npm run test:hardening  # deterministic runtime-hardening verification gate
 ```
 
 On startup Zenith loads wallet state, open positions, and current candidates, then starts the autonomous screening and management cycles.
@@ -177,7 +186,10 @@ After startup, an interactive prompt is available. The prompt shows a live count
 | `/candidates` | Re-screen and display the current top candidates |
 | `/candidate <n>` | Inspect one ranked candidate with richer signals on demand |
 | `/evaluation` | Show recent cycle/tool evaluation summaries |
+| `/failures` | Show recent persisted bad-cycle evidence bundles |
+| `/recovery` | Show recovery suppression state and unresolved/manual-review workflows |
 | `/performance` | Show recent closed-position attribution and history |
+| `/proof` | Show bounded strategy proof summary from realized closes |
 | `/briefing` | Show a daily briefing that now prefers cached LP-overview metrics when available |
 | `/learn` | Study top LPers across current candidate pools and save lessons |
 | `/learn <pool_address>` | Study top LPers for one specific pool |
@@ -236,6 +248,37 @@ Zenith now also keeps bounded evaluation summaries in local state: recent manage
 
 Management runtime actions also expose explicit subreason codes (for example stop loss, take profit, low fee yield, fee threshold, or out-of-range rebalance) so operator-facing reports and tests can describe *why* runtime acted without widening prompt-owned policy.
 
+### Phase 0 proof surfaces
+
+Zenith now has a minimal proof layer for serious-capital safety work:
+
+- executor-boundary contract checks for the write blast wall (`test/test-executor-boundary.js`)
+- cycle/action correlation IDs threaded through runtime actions and evaluation state
+- replay envelopes for screening and management cycles (`cycle-trace.js`)
+- provider-free deterministic replay helpers (`cycle-replay.js`)
+- fail-closed degraded-mode contracts with explicit reason codes (`degraded-mode.js`)
+- minimal reconciliation helpers for replay-vs-recorded deterministic behavior (`reconciliation.js`)
+
+This is intentionally narrow. It is not a full analytics platform or event system — just enough structure to prove and inspect deterministic behavior at the control-plane boundary.
+
+### Phase 1-3 bounded proof surfaces
+
+Zenith now also includes a small set of proof-oriented but still lean operator/runtime modules:
+
+- `startup-snapshot.js` — short-lived cached startup/operator snapshot with fail-closed validation
+- `management-runtime.js` — separately testable deterministic runtime action runner for obvious management actions
+- `evidence-bundles.js` — persisted bad-cycle evidence summaries for postmortem review
+- `getStrategyProofSummary()` in `lessons.js` — bounded realized proof summary instead of a new strategy engine
+
+### Phase 4 runtime-hardening surfaces
+
+Zenith now closes the next serious-capital layer with explicit restart and recovery surfaces:
+
+- `action-journal.js` — append-only workflow ledger for autonomous write intents and terminal states
+- `boot-recovery.js` — observation-first startup recovery, journal corruption blocking, and `/recovery` operator reporting
+- `runtime-hardening-plan.md` — committed file map for the action ledger, recovery, fault-injection seams, and reconciliation layer
+- `runtime-hardening-review.md` — committed anti-bloat and hidden-failure review note for this runtime-hardening phase
+
 Closed-position performance summaries now expose a slightly more honest decomposition of outcomes: inventory contribution, fee contribution, and operational touch counts are stored alongside headline PnL so the operator can distinguish cleaner wins from high-touch wins.
 
 ### LP overview reporting
@@ -275,6 +318,7 @@ Treat the compounding output as a claim plus a suggested next action, not as a c
 ## Verification surfaces
 
 Zenith now has focused provider-free checks for important deterministic control paths:
+- `npm run test:hardening` — committed runtime-hardening gate covering journal/recovery tests, screening/management/startup fail-closed tests, executor boundary checks, operator drills, chaos drills, and the provider-free dry-run startup check
 - `state.test.js` — bounded state/evaluation summaries
 - `tools/screening.test.js` — deterministic ranking and hard gates
 - `memory.test.js` — broader strategy-memory buckets
@@ -282,8 +326,19 @@ Zenith now has focused provider-free checks for important deterministic control 
 - `lessons.test.js` — threshold-evolution key alignment and attribution summaries
 - `runtime-policy.test.js` — runtime management policy decisions
 - `test/test-runtime-fixes.js` — pure helper checks for required SOL floors and canonical screening-threshold summaries
+- `test/test-executor-boundary.js` — direct executor boundary checks for duplicate exposure, balance reserve enforcement, closed-position rejection, and blocked write recording
+- `cycle-trace.test.js` — cycle/action correlation and replay-envelope writing
+- `cycle-replay.test.js` — provider-free replay of deterministic screening and management decisions
+- `degraded-mode.test.js` — fail-closed degraded-mode contracts
+- `reconciliation.test.js` — deterministic replay-vs-recorded comparison helpers
+- `startup-snapshot.test.js` — provider-free startup snapshot cache/fail-closed validation checks
+- `management-runtime.test.js` — provider-free management runtime runner checks
+- `evidence-bundles.test.js` — persisted bad-cycle evidence bundle checks
+- `test/test-dry-run-startup.js` — provider-free dry-run startup verification for boot recovery + startup snapshot readiness
+- `test/test-operator-drill.js` — provider-free screening reconciliation and fail-closed evidence drill
+- `test/test-chaos-drill.js` — provider-free chaos drill for startup/provider failure, stale-PnL management, and bounded LP Agent fallback
 
-Smoke scripts still exist for screening and startup, but the focused tests are the stronger signal for the deterministic control plane.
+Manual external smoke still exists for screening and the full agent path (`npm run test:screen`, `npm run test:agent`), but `npm run test:hardening` is the stronger reproducible signal for the deterministic control plane. The screening smoke now injects an empty-position view so it remains wallet-free while still exercising live discovery/detail reads.
 
 ---
 
