@@ -24,6 +24,8 @@ test("screening threshold summary uses canonical live keys", () => {
     minOrganic: 60,
     minHolders: 500,
     minVolume: 500,
+    minTokenAgeHours: null,
+    maxTokenAgeHours: null,
     timeframe: "5m",
   }).map(([label]) => label);
 
@@ -35,6 +37,8 @@ test("screening threshold summary uses canonical live keys", () => {
     "minOrganic",
     "minHolders",
     "minVolume",
+    "minTokenAgeHours",
+    "maxTokenAgeHours",
     "timeframe",
   ]);
 });

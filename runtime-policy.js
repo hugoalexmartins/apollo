@@ -8,6 +8,7 @@ function roundMetric(value) {
 }
 
 export const MANAGEMENT_SUBREASONS = Object.freeze({
+  INSTRUCTION: "instruction_condition_met",
   EXIT_ALERT: "exit_alert",
   STOP_LOSS: "stop_loss_pct_breached",
   TAKE_PROFIT: "take_profit_pct_reached",
@@ -15,6 +16,100 @@ export const MANAGEMENT_SUBREASONS = Object.freeze({
   LOW_FEE_YIELD: "fee_yield_below_floor",
   FEE_THRESHOLD: "fee_threshold_reached",
 });
+
+function normalizeInstructionText(instruction) {
+  return String(instruction || "")
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, " ");
+}
+
+function parseInstructionThreshold(instruction) {
+  const normalized = normalizeInstructionText(instruction);
+  if (!normalized) return null;
+
+  const comparatorMatch = normalized.match(/(?:pnl|profit|gain|loss)\s*(>=|<=|>|<)\s*(-?\d+(?:\.\d+)?)%/i);
+  if (comparatorMatch) {
+    return {
+      comparator: comparatorMatch[1],
+      thresholdPct: Number(comparatorMatch[2]),
+      source: "explicit_comparator",
+    };
+  }
+
+  const closeAtProfit = normalized.match(/(?:close|sell|take profit|hold)\s+(?:at|until|when)\s*(-?\d+(?:\.\d+)?)%\s+profit/i);
+  if (closeAtProfit) {
+    return {
+      comparator: ">=",
+      thresholdPct: Number(closeAtProfit[1]),
+      source: "profit_phrase",
+    };
+  }
+
+  const stopLoss = normalized.match(/(?:stop loss|close|sell|hold)\s+(?:at|until|when)\s*(-?\d+(?:\.\d+)?)%\s+loss/i);
+  if (stopLoss) {
+    const raw = Number(stopLoss[1]);
+    return {
+      comparator: "<=",
+      thresholdPct: raw > 0 ? -raw : raw,
+      source: "loss_phrase",
+    };
+  }
+
+  return null;
+}
+
+function compareThreshold(currentPct, comparator, thresholdPct) {
+  switch (comparator) {
+    case ">=": return currentPct >= thresholdPct;
+    case ">": return currentPct > thresholdPct;
+    case "<=": return currentPct <= thresholdPct;
+    case "<": return currentPct < thresholdPct;
+    default: return false;
+  }
+}
+
+export function classifyInstructionRuntimeGate(position = {}) {
+  if (!position.instruction) {
+    return {
+      route: "runtime",
+      reason: "no_instruction",
+      action: "runtime_policy",
+    };
+  }
+
+  const parsed = parseInstructionThreshold(position.instruction);
+  if (!parsed) {
+    return {
+      route: "model",
+      reason: "instruction_requires_model",
+      action: "model_evaluation",
+    };
+  }
+
+  const pnlSignalStale = isPnlSignalStale(position);
+  const pnlPct = !pnlSignalStale && Number.isFinite(Number(position.pnl?.pnl_pct ?? position.pnl_pct))
+    ? Number(position.pnl?.pnl_pct ?? position.pnl_pct)
+    : null;
+
+  if (pnlPct == null) {
+    return {
+      route: "runtime",
+      reason: "instruction_waiting_for_fresh_pnl",
+      action: "hold",
+      parsed,
+    };
+  }
+
+  const met = compareThreshold(pnlPct, parsed.comparator, parsed.thresholdPct);
+  return {
+    route: "runtime",
+    reason: met ? "instruction_condition_met" : "instruction_condition_not_met",
+    action: met ? "close" : "hold",
+    parsed,
+    pnlPct,
+  };
+}
 
 export function deriveExpectedVolumeProfile(snapshot = {}) {
   const feeTvlRatio = asNumber(snapshot.fee_active_tvl_ratio ?? snapshot.fee_tvl_ratio, 0);
@@ -57,6 +152,15 @@ export function isPnlSignalStale(position = {}) {
 }
 
 export function planManagementRuntimeAction(position, config, expectedVolumeProfile = null) {
+  const instructionGate = classifyInstructionRuntimeGate(position);
+  if (instructionGate.action === "close") {
+    return {
+      toolName: "close_position",
+      args: { position_address: position.position, reason: position.instruction },
+      reason: `instruction met (${instructionGate.parsed.comparator} ${instructionGate.parsed.thresholdPct}%, current ${instructionGate.pnlPct.toFixed(2)}%)`,
+      rule: MANAGEMENT_SUBREASONS.INSTRUCTION,
+    };
+  }
   if (position.instruction) return null;
 
   const pnlSignalStale = isPnlSignalStale(position);
@@ -140,4 +244,19 @@ export function planManagementRuntimeAction(position, config, expectedVolumeProf
   }
 
   return null;
+}
+
+export function classifyManagementModelGate(position = {}) {
+  const instructionGate = classifyInstructionRuntimeGate(position);
+  if (instructionGate.route === "model") {
+    return {
+      route: "model",
+      reason: instructionGate.reason,
+    };
+  }
+
+  return {
+    route: "runtime",
+    reason: instructionGate.reason,
+  };
 }

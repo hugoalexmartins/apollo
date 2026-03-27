@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { appendReplayEnvelope, createCycleId } from "../cycle-trace.js";
+import { config } from "../config.js";
 import { validateStartupSnapshot } from "../degraded-mode.js";
 import { writeEvidenceBundle, listEvidenceBundles } from "../evidence-bundles.js";
 import { reconcileScreeningEnvelope } from "../reconciliation.js";
@@ -21,6 +22,7 @@ function buildPool(overrides = {}) {
     holders: overrides.holders ?? 2500,
     active_pct: overrides.active_pct ?? 88,
     volatility: overrides.volatility ?? 4,
+    token_age_hours: overrides.token_age_hours ?? 72,
   };
 }
 
@@ -88,6 +90,25 @@ async function main() {
     const screeningReconciliation = reconcileScreeningEnvelope(screeningEnvelope);
     assert.equal(screeningReconciliation.status, "match");
     console.log(`screening replay status: ${screeningReconciliation.status}`);
+
+    console.log("\n=== Operator drill: deterministic token-age hard blocks ===");
+    const originalMinAge = config.screening.minTokenAgeHours;
+    const originalMaxAge = config.screening.maxTokenAgeHours;
+    config.screening.minTokenAgeHours = 12;
+    config.screening.maxTokenAgeHours = 120;
+    try {
+      const tokenAgeRanked = rankCandidateSnapshots([
+        buildPool({ pool: "pool-young", token_age_hours: 2 }),
+        buildPool({ pool: "pool-old", token_age_hours: 240 }),
+        buildPool({ pool: "pool-eligible", token_age_hours: 48 }),
+      ]);
+      assert.equal(tokenAgeRanked.blocked_summary.token_too_new, 1);
+      assert.equal(tokenAgeRanked.blocked_summary.token_too_old, 1);
+      assert.equal(tokenAgeRanked.total_eligible, 1);
+    } finally {
+      config.screening.minTokenAgeHours = originalMinAge;
+      config.screening.maxTokenAgeHours = originalMaxAge;
+    }
 
     console.log("\n=== Operator drill: wallet error-shape precheck fails closed ===");
     const walletPrecheckFailure = validateStartupSnapshot({

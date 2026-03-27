@@ -108,3 +108,8 @@ export function foldActionJournal(entries) {
 
   return Array.from(workflows.values());
 }
+
+export function listActionJournalEntries(limit = 20) {
+  const journal = readActionJournal();
+  return journal.entries.slice(-limit).reverse();
+}

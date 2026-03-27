@@ -20,7 +20,9 @@ import {
   syncOpenPositions,
 } from "../state.js";
 import { recordPerformance } from "../lessons.js";
+import { evaluatePortfolioGuard } from "../portfolio-guards.js";
 import { estimateInitialValueUsd } from "../runtime-helpers.js";
+import { getPoolDeployCooldown } from "../pool-memory.js";
 import { appendActionLifecycle } from "../action-journal.js";
 import { getWalletBalances, normalizeMint } from "./wallet.js";
 
@@ -512,6 +514,31 @@ export async function deployPosition({
   initial_value_usd,
 }) {
   pool_address = normalizeMint(pool_address);
+  const portfolioGuard = evaluatePortfolioGuard();
+  if (portfolioGuard.blocked) {
+    return {
+      success: false,
+      blocked: true,
+      reason: "portfolio_guard_pause_active",
+      pool: pool_address,
+      pause_until: portfolioGuard.pause_until,
+      guard_reason: portfolioGuard.reason,
+      guard_reason_code: portfolioGuard.reason_code,
+    };
+  }
+  const cooldown = getPoolDeployCooldown({ pool_address });
+  if (cooldown.active) {
+    return {
+      success: false,
+      blocked: true,
+      reason: "pool_low_yield_cooldown_active",
+      pool: pool_address,
+      cooldown_until: cooldown.cooldown_until,
+      cooldown_reason: cooldown.reason,
+      remaining_minutes: Math.ceil((cooldown.remaining_ms || 0) / 60000),
+    };
+  }
+
   const activeStrategy = strategy || config.strategy.strategy;
 
   const activeBinsBelow = bins_below ?? config.strategy.binsBelow;
@@ -1289,6 +1316,19 @@ export async function rebalanceOnExit({
   execute = true,
   journal_workflow_id = null,
 } = {}) {
+  const portfolioGuard = evaluatePortfolioGuard();
+  if (portfolioGuard.blocked) {
+    return {
+      success: false,
+      blocked: true,
+      reason: "portfolio_guard_pause_active",
+      position: position_address,
+      pause_until: portfolioGuard.pause_until,
+      guard_reason: portfolioGuard.reason,
+      guard_reason_code: portfolioGuard.reason_code,
+    };
+  }
+
   position_address = normalizeMint(position_address);
   if (!position_address) {
     return { success: false, error: "position_address is required" };

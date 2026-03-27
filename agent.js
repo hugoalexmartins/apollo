@@ -5,11 +5,41 @@ import { tools } from "./tools/definitions.js";
 
 const MANAGER_TOOLS  = new Set(["close_position", "claim_fees", "rebalance_on_exit", "auto_compound_fees", "swap_token", "update_config", "get_position_pnl", "get_my_positions", "set_position_note", "add_pool_note", "get_wallet_balance", "get_pool_info", "score_top_lpers", "choose_distribution_strategy", "calculate_dynamic_bin_tiers", "remember_fact", "recall_memory"]);
 const SCREENER_TOOLS = new Set(["deploy_position", "get_active_bin", "get_top_candidates", "check_smart_wallets_on_pool", "get_token_holders", "get_token_narrative", "get_token_info", "search_pools", "get_pool_memory", "add_pool_note", "add_to_blacklist", "update_config", "get_wallet_balance", "get_my_positions", "get_pool_info", "score_top_lpers", "choose_distribution_strategy", "calculate_dynamic_bin_tiers", "remember_fact", "recall_memory"]);
+const GENERAL_SAFE_TOOLS = new Set([
+  "discover_pools",
+  "get_top_candidates",
+  "get_pool_detail",
+  "get_position_pnl",
+  "get_active_bin",
+  "choose_distribution_strategy",
+  "calculate_dynamic_bin_tiers",
+  "get_my_positions",
+  "get_wallet_positions",
+  "search_pools",
+  "get_token_info",
+  "get_token_holders",
+  "get_token_narrative",
+  "list_smart_wallets",
+  "check_smart_wallets_on_pool",
+  "get_wallet_balance",
+  "get_top_lpers",
+  "study_top_lpers",
+  "score_top_lpers",
+  "get_pool_info",
+  "get_performance_history",
+  "list_strategies",
+  "get_strategy",
+  "get_pool_memory",
+  "list_lessons",
+  "recall_memory",
+  "list_blacklist",
+]);
 
-function getToolsForRole(agentType) {
+export function getToolsForRole(agentType, { allowDangerousTools = false } = {}) {
   if (agentType === "MANAGER")  return tools.filter(t => MANAGER_TOOLS.has(t.function.name));
   if (agentType === "SCREENER") return tools.filter(t => SCREENER_TOOLS.has(t.function.name));
-  return tools;
+  if (allowDangerousTools) return tools;
+  return tools.filter((t) => GENERAL_SAFE_TOOLS.has(t.function.name));
 }
 import { getWalletBalances } from "./tools/wallet.js";
 import { getMyPositions } from "./tools/dlmm.js";
@@ -36,7 +66,7 @@ const DEFAULT_MODEL = process.env.LLM_MODEL || "openrouter/healer-alpha";
  * @param {number} maxSteps - Safety limit on iterations (default 20)
  * @returns {string} - The agent's final text response
  */
-export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHistory = [], agentType = "GENERAL", model = null, maxOutputTokens = null) {
+export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHistory = [], agentType = "GENERAL", model = null, maxOutputTokens = null, options = {}) {
   // Build dynamic system prompt with current portfolio state
   const [portfolio, positions] = await Promise.all([getWalletBalances(), getMyPositions()]);
   const stateSummary = getStateSummary();
@@ -65,7 +95,7 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
         response = await client.chat.completions.create({
           model: usedModel,
           messages,
-          tools: getToolsForRole(agentType),
+          tools: getToolsForRole(agentType, options),
           tool_choice: "auto",
           temperature: config.llm.temperature,
           max_tokens: maxOutputTokens ?? config.llm.maxTokens,

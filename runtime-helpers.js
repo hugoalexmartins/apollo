@@ -20,8 +20,17 @@ export function getScreeningThresholdSummary(screening) {
     ["minOrganic", screening.minOrganic],
     ["minHolders", screening.minHolders],
     ["minVolume", screening.minVolume],
+    ["minTokenAgeHours", screening.minTokenAgeHours],
+    ["maxTokenAgeHours", screening.maxTokenAgeHours],
     ["timeframe", screening.timeframe],
   ];
+}
+
+export function normalizeOptionalNonNegativeNumber(value, fallback = null) {
+  if (value == null || value === "") return null;
+  const num = Number(value);
+  if (!Number.isFinite(num) || num < 0) return fallback;
+  return num;
 }
 
 export function estimateInitialValueUsd({ amountSol = 0, solPrice = 0, amountToken = 0, activePrice = 0 }) {

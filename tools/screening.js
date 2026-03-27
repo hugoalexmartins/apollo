@@ -166,21 +166,32 @@ export function evaluateCandidateSnapshot(pool, {
   occupiedMints = new Set(),
 } = {}) {
   const hard_blocks = [];
+  const token_age_hours = asTokenAgeHours(pool.token_age_hours);
+  const minTokenAgeHours = asOptionalTokenAgeThreshold(config.screening.minTokenAgeHours);
+  const maxTokenAgeHours = asOptionalTokenAgeThreshold(config.screening.maxTokenAgeHours);
+  const tokenTooNew = token_age_hours != null && minTokenAgeHours != null && token_age_hours < minTokenAgeHours;
+  const tokenTooOld = token_age_hours != null && maxTokenAgeHours != null && token_age_hours > maxTokenAgeHours;
   const gate_results = {
     pool_unoccupied: !occupiedPools.has(pool.pool),
     token_unoccupied: !pool.base?.mint || !occupiedMints.has(pool.base.mint),
     not_blacklisted: !isBlacklisted(pool.base?.mint),
+    token_age_available: token_age_hours != null,
+    token_age_min_ok: minTokenAgeHours == null || token_age_hours == null || token_age_hours >= minTokenAgeHours,
+    token_age_max_ok: maxTokenAgeHours == null || token_age_hours == null || token_age_hours <= maxTokenAgeHours,
   };
 
   if (!gate_results.pool_unoccupied) hard_blocks.push("pool_already_open");
   if (!gate_results.token_unoccupied) hard_blocks.push("base_token_already_held");
   if (!gate_results.not_blacklisted) hard_blocks.push("base_token_blacklisted");
+  if (tokenTooNew) hard_blocks.push("token_too_new");
+  if (tokenTooOld) hard_blocks.push("token_too_old");
 
   const score_breakdown = buildCandidateScore(pool);
   const deterministic_score = score_breakdown.total_score;
 
   return {
     ...pool,
+    token_age_hours,
     eligible: hard_blocks.length === 0,
     eligibility_reason: hard_blocks[0] || "eligible",
     hard_blocks,
@@ -260,6 +271,9 @@ function condensePool(p) {
     active_pct: fix(p.active_positions_pct, 1),
     open_positions: p.open_positions,
 
+    // Token age visibility from discovery payload (ms epoch)
+    token_age_hours: toTokenAgeHours(p.token_x?.created_at),
+
     // Price action
     price: p.pool_price,
     price_change_pct: fix(p.pool_price_change_pct, 1),
@@ -306,6 +320,27 @@ function buildCandidateScore(pool) {
       volatility: pool.volatility,
     },
   };
+}
+
+function toTokenAgeHours(createdAtMs) {
+  const created = Number(createdAtMs);
+  if (!Number.isFinite(created) || created <= 0) return null;
+  const ageMs = Date.now() - created;
+  if (!Number.isFinite(ageMs) || ageMs < 0) return null;
+  return fix(ageMs / 3_600_000, 2);
+}
+
+function asTokenAgeHours(value) {
+  const age = Number(value);
+  if (!Number.isFinite(age) || age < 0) return null;
+  return age;
+}
+
+function asOptionalTokenAgeThreshold(value) {
+  if (value == null || value === "") return null;
+  const threshold = Number(value);
+  if (!Number.isFinite(threshold) || threshold < 0) return null;
+  return threshold;
 }
 
 function summarizeBlockedCandidates(pools) {

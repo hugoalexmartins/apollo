@@ -18,6 +18,7 @@ Close the serious-capital control-plane gaps without turning Zenith into a broad
 | Recovery-aware local state | `state.js`, `state.test.js` | Prevents stale provider or invalid journal state from silently auto-closing tracked positions |
 | Fail-closed startup and provider classification | `startup-snapshot.js`, `startup-snapshot.test.js`, `degraded-mode.js`, `degraded-mode.test.js` | Rejects stale/error-shaped startup inputs with explicit reason codes |
 | Deterministic screening and management seams | `tools/screening.js`, `tools/screening.test.js`, `runtime-policy.js`, `runtime-policy.test.js`, `management-runtime.js`, `management-runtime.test.js` | Provider-free seams for screening, stale-PnL handling, and runtime action execution |
+| Elite ops guards and heartbeat | `portfolio-guards.js`, `runtime-health.js`, `replay-review.js`, `operator-controls.js` | Portfolio pauses, machine-readable health, replay-backed review, and operator runbook control surfaces |
 | Replay and reconciliation | `cycle-trace.js`, `cycle-trace.test.js`, `cycle-replay.js`, `cycle-replay.test.js`, `reconciliation.js`, `reconciliation.test.js` | Writes replay envelopes and checks deterministic parity after the fact |
 | Drill harnesses | `test/test-executor-boundary.js`, `test/test-operator-drill.js`, `test/test-chaos-drill.js`, `test/test-dry-run-startup.js` | Operator-grade/provider-free proof around restart, fail-closed startup, and deterministic runtime handling |
 

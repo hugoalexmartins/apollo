@@ -78,3 +78,36 @@ test("runManagementRuntimeActions suppresses stale-pnl exits but keeps out-of-ra
   assert.equal(results.length, 1);
   assert.equal(results[0].position, "pos-stale-oor");
 });
+
+test("runManagementRuntimeActions closes parsed instruction thresholds without escalating to the model", async () => {
+  const calls = [];
+  const results = await runManagementRuntimeActions([
+    {
+      position: "pos-inst-close",
+      pair: "Gamma-SOL",
+      in_range: true,
+      instruction: "hold until pnl >= 5%",
+      pnl: { pnl_pct: 5.8 },
+    },
+    {
+      position: "pos-inst-hold",
+      pair: "Delta-SOL",
+      in_range: true,
+      instruction: "hold until pnl >= 5%",
+      pnl: { pnl_pct: 2.1 },
+    },
+  ], {
+    cycleId: "management-instruction",
+    config,
+    executeTool: async (name, args, meta) => {
+      calls.push({ name, args, meta });
+      return { success: true, tool: name };
+    },
+  });
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].name, "close_position");
+  assert.equal(calls[0].args.position_address, "pos-inst-close");
+  assert.equal(results.length, 1);
+  assert.equal(results[0].position, "pos-inst-close");
+});

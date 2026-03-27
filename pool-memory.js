@@ -9,6 +9,8 @@ import fs from "fs";
 import { log } from "./logger.js";
 
 const POOL_MEMORY_FILE = "./pool-memory.json";
+const LOW_YIELD_COOLDOWN_MS = 4 * 60 * 60 * 1000;
+export const CANONICAL_LOW_YIELD_REASON = "fee yield too low";
 
 function createPoolEntry(name, baseMint = null) {
   return {
@@ -23,6 +25,8 @@ function createPoolEntry(name, baseMint = null) {
     notes: [],
     snapshots: [],
     token_type_distribution_stats: {},
+    low_yield_cooldown_until: null,
+    low_yield_cooldown_reason: null,
   };
 }
 
@@ -35,9 +39,69 @@ function ensurePoolEntry(db, poolAddress, seed = {}) {
   if (!db[poolAddress].deploys) db[poolAddress].deploys = [];
   if (!db[poolAddress].snapshots) db[poolAddress].snapshots = [];
   if (!db[poolAddress].token_type_distribution_stats) db[poolAddress].token_type_distribution_stats = {};
+  if (!Object.hasOwn(db[poolAddress], "low_yield_cooldown_until")) db[poolAddress].low_yield_cooldown_until = null;
+  if (!Object.hasOwn(db[poolAddress], "low_yield_cooldown_reason")) db[poolAddress].low_yield_cooldown_reason = null;
   if (!db[poolAddress].name) db[poolAddress].name = seed.name || poolAddress.slice(0, 8);
   if (!db[poolAddress].base_mint && seed.base_mint) db[poolAddress].base_mint = seed.base_mint;
   return db[poolAddress];
+}
+
+function normalizeReason(reason) {
+  return String(reason || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[_-]+/g, " ")
+    .replace(/\s+/g, " ");
+}
+
+export function isLowYieldCloseReason(reason) {
+  const normalized = normalizeReason(reason);
+  if (!normalized) return false;
+  return normalized === CANONICAL_LOW_YIELD_REASON || normalized === "low yield";
+}
+
+export function getPoolDeployCooldown({ pool_address, nowMs = Date.now() } = {}) {
+  if (!pool_address) {
+    return {
+      pool_address: null,
+      active: false,
+      cooldown_until: null,
+      remaining_ms: 0,
+      reason: null,
+    };
+  }
+
+  const db = load();
+  const entry = db[pool_address];
+  if (!entry?.low_yield_cooldown_until) {
+    return {
+      pool_address,
+      active: false,
+      cooldown_until: null,
+      remaining_ms: 0,
+      reason: null,
+    };
+  }
+
+  const cooldownUntilMs = Date.parse(entry.low_yield_cooldown_until);
+  if (!Number.isFinite(cooldownUntilMs)) {
+    return {
+      pool_address,
+      active: false,
+      cooldown_until: null,
+      remaining_ms: 0,
+      reason: null,
+    };
+  }
+
+  const remainingMs = Math.max(0, cooldownUntilMs - nowMs);
+  return {
+    pool_address,
+    active: remainingMs > 0,
+    cooldown_until: entry.low_yield_cooldown_until,
+    remaining_ms: remainingMs,
+    reason: entry.low_yield_cooldown_reason || CANONICAL_LOW_YIELD_REASON,
+  };
 }
 
 function round(value, decimals = 2) {
@@ -159,6 +223,11 @@ export function recordPoolDeploy(poolAddress, deployData) {
   }
 
   updateTokenTypeDistributionStats(entry, deploy);
+
+  if (isLowYieldCloseReason(deploy.close_reason)) {
+    entry.low_yield_cooldown_until = new Date(Date.now() + LOW_YIELD_COOLDOWN_MS).toISOString();
+    entry.low_yield_cooldown_reason = CANONICAL_LOW_YIELD_REASON;
+  }
 
   save(db);
   log("pool-memory", `Recorded deploy for ${entry.name} (${poolAddress.slice(0, 8)}): PnL ${deploy.pnl_pct}%`);

@@ -73,3 +73,35 @@ test("replayManagementEnvelope reproduces deterministic runtime actions", () => 
     { position: "pos-2", tool: "auto_compound_fees", rule: "fee_threshold_reached", reason: "fees $8.00 >= $5" },
   ]);
 });
+
+test("replayManagementEnvelope reproduces parsed instruction threshold closes", () => {
+  const config = {
+    management: {
+      emergencyPriceDropPct: -50,
+      takeProfitFeePct: 5,
+      minFeePerTvl24h: 7,
+      minClaimAmount: 5,
+    },
+  };
+
+  const replay = replayManagementEnvelope({
+    cycle_id: "management-instruction",
+    position_inputs: [
+      {
+        position: "pos-inst-close",
+        instruction: "hold until pnl >= 5%",
+        in_range: true,
+        pnl: { pnl_pct: 5.8 },
+      },
+    ],
+  }, config);
+
+  assert.deepEqual(replay.actions, [
+    {
+      position: "pos-inst-close",
+      tool: "close_position",
+      rule: "instruction_condition_met",
+      reason: "instruction met (>= 5%, current 5.80%)",
+    },
+  ]);
+});

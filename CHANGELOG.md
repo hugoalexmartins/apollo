@@ -6,6 +6,16 @@ This file documents the major additions and behavior changes present in this for
 
 ### 2026-03-27
 
+- Added a lean elite-ops layer with `portfolio-guards.js`, `runtime-health.js`, `replay-review.js`, and `operator-controls.js` to extend Zenith beyond basic runtime hardening without adding a dashboard or second control plane.
+- Added portfolio-level autonomous trading pauses based on recent realized loss, stop-loss streaks, broader equity drawdown, and open-position unrealized loss, with deploy/rebalance enforcement at executor and DLMM boundaries.
+- Added runbook-grade operator commands for `/health`, `/journal`, `/failure <id>`, `/replay <cycle_id>`, `/reconcile <cycle_id>`, `/review`, `/resume <why>`, `/arm`, and `/disarm`.
+- Hardened the GENERAL agent tool surface so free-form chat is read-only by default unless explicitly armed for a bounded window.
+- Removed the hardcoded Jupiter API key and switched setup/runtime so wallet secrets are env-only instead of being read from `user-config.json`.
+- Added a machine-readable runtime heartbeat in `data/runtime-health.json` with startup, cycle, recovery, provider-health, and write-arm status.
+- Made operator arming and recovery-resume overrides durable across restart windows instead of keeping them process-local only.
+- Split the remaining inline management/screening cycle bodies out of `index.js` into `management-cycle-runner.js` and `screening-cycle-runner.js` so boot/wiring is cleaner and easier to reason about.
+- Split the remaining boot, REPL, and Telegram operator surfaces out of `index.js` into `interactive-interface.js` and `startup-interface.js`, leaving the top-level file closer to pure orchestration.
+- Added new provider-free coverage in `portfolio-guards.test.js`, `runtime-health.test.js`, `replay-review.test.js`, `operator-controls.test.js`, and `agent-tools.test.js`, and rolled them into `npm run test:hardening`.
 - Added a committed runtime-hardening closure plan in `runtime-hardening-plan.md`, mapping the action journal, restart recovery, fault-injection seams, and reconciliation surfaces onto the current Zenith files.
 - Added a committed runtime-hardening review note in `runtime-hardening-review.md`, capturing the anti-bloat boundary, recovery posture, and remaining sharp edges for this phase.
 - Added `test/test-dry-run-startup.js` as a provider-free dry-run startup verification script covering clean boot recovery and startup snapshot readiness.

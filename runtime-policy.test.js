@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-import { deriveExpectedVolumeProfile, isPnlSignalStale, MANAGEMENT_SUBREASONS, planManagementRuntimeAction, resolveTargetManagementInterval } from "./runtime-policy.js";
+import { classifyInstructionRuntimeGate, classifyManagementModelGate, deriveExpectedVolumeProfile, isPnlSignalStale, MANAGEMENT_SUBREASONS, planManagementRuntimeAction, resolveTargetManagementInterval } from "./runtime-policy.js";
 
 const config = {
   management: {
@@ -112,4 +112,54 @@ test("isPnlSignalStale detects explicit stale markers", () => {
   assert.equal(isPnlSignalStale({ pnl: { stale: true } }), true);
   assert.equal(isPnlSignalStale({ pnl: { lagging: true } }), true);
   assert.equal(isPnlSignalStale({ pnl: { pnl_pct: 1.2 } }), false);
+});
+
+test("classifyManagementModelGate keeps model usage instruction-only", () => {
+  assert.deepEqual(classifyManagementModelGate({ instruction: "close if moon soon" }), {
+    route: "model",
+    reason: "instruction_requires_model",
+  });
+  assert.deepEqual(classifyManagementModelGate({}), {
+    route: "runtime",
+    reason: "no_instruction",
+  });
+});
+
+test("classifyInstructionRuntimeGate holds or closes on simple parsed pnl instructions", () => {
+  assert.deepEqual(classifyInstructionRuntimeGate({
+    instruction: "hold until pnl >= 5%",
+    pnl: { pnl_pct: 2.1 },
+  }), {
+    route: "runtime",
+    reason: "instruction_condition_not_met",
+    action: "hold",
+    parsed: {
+      comparator: ">=",
+      thresholdPct: 5,
+      source: "explicit_comparator",
+    },
+    pnlPct: 2.1,
+  });
+
+  const closeGate = classifyInstructionRuntimeGate({
+    position: "pos-i",
+    instruction: "close at 5% profit",
+    pnl: { pnl_pct: 5.5 },
+  });
+  assert.equal(closeGate.route, "runtime");
+  assert.equal(closeGate.reason, "instruction_condition_met");
+  assert.equal(closeGate.action, "close");
+});
+
+test("planManagementRuntimeAction deterministically closes when a parsed instruction threshold is met", () => {
+  const result = planManagementRuntimeAction({
+    position: "pos-inst-close",
+    instruction: "hold until pnl >= 5%",
+    pnl: { pnl_pct: 6.2 },
+    in_range: true,
+  }, config);
+
+  assert.equal(result.toolName, "close_position");
+  assert.equal(result.rule, MANAGEMENT_SUBREASONS.INSTRUCTION);
+  assert.equal(result.args.position_address, "pos-inst-close");
 });

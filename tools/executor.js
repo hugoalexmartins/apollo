@@ -26,6 +26,7 @@ import { getTokenInfo, getTokenHolders, getTokenNarrative } from "./token.js";
 import { config } from "../config.js";
 import { estimateInitialValueUsd } from "../runtime-helpers.js";
 import { appendActionLifecycle } from "../action-journal.js";
+import { evaluatePortfolioGuard } from "../portfolio-guards.js";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
@@ -216,6 +217,16 @@ const toolMap = {
       minTokenFeesSol: ["screening", "minTokenFeesSol"],
       maxBundlersPct: ["screening", "maxBundlersPct"],
       maxTop10Pct: ["screening", "maxTop10Pct"],
+      // protections
+      protectionsEnabled: ["protections", "enabled"],
+      maxRecentRealizedLossUsd: ["protections", "maxRecentRealizedLossUsd"],
+      maxDrawdownPct: ["protections", "maxDrawdownPct"],
+      maxOpenUnrealizedLossUsd: ["protections", "maxOpenUnrealizedLossUsd"],
+      recentLossWindowHours: ["protections", "recentLossWindowHours"],
+      stopLossStreakLimit: ["protections", "stopLossStreakLimit"],
+      portfolioPauseMinutes: ["protections", "pauseMinutes"],
+      maxReviewedCloses: ["protections", "maxReviewedCloses"],
+      recoveryResumeOverrideMinutes: ["protections", "recoveryResumeOverrideMinutes"],
       // management
       minClaimAmount: ["management", "minClaimAmount"],
       autoSwapAfterClaim: ["management", "autoSwapAfterClaim"],
@@ -559,6 +570,14 @@ export async function executeTool(name, args, meta = {}) {
 export async function runSafetyChecks(name, args) {
   switch (name) {
     case "deploy_position": {
+      const portfolioGuard = evaluatePortfolioGuard();
+      if (portfolioGuard.blocked) {
+        return {
+          pass: false,
+          reason: `Portfolio guard active: ${portfolioGuard.reason}`,
+        };
+      }
+
       // Reject pools with bin_step out of configured range
       const minStep = config.screening.minBinStep;
       const maxStep = config.screening.maxBinStep;
@@ -646,6 +665,14 @@ export async function runSafetyChecks(name, args) {
 
     case "rebalance_on_exit":
     case "auto_compound_fees": {
+      const portfolioGuard = evaluatePortfolioGuard();
+      if (portfolioGuard.blocked) {
+        return {
+          pass: false,
+          reason: `Portfolio guard active: ${portfolioGuard.reason}`,
+        };
+      }
+
       if (!args?.position_address) {
         return {
           pass: false,

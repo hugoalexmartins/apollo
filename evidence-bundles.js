@@ -34,3 +34,17 @@ export function listEvidenceBundles(limit = 5) {
       };
     });
 }
+
+export function getEvidenceBundle(identifier) {
+  if (!identifier || !fs.existsSync(EVIDENCE_DIR)) return null;
+  const fileName = String(identifier).endsWith(".json") ? String(identifier) : `${String(identifier)}.json`;
+  const directPath = path.join(EVIDENCE_DIR, fileName);
+  if (fs.existsSync(directPath)) {
+    return JSON.parse(fs.readFileSync(directPath, "utf8"));
+  }
+
+  const matches = fs.readdirSync(EVIDENCE_DIR)
+    .filter((file) => file.endsWith(".json") && file.includes(String(identifier)));
+  if (matches.length === 0) return null;
+  return JSON.parse(fs.readFileSync(path.join(EVIDENCE_DIR, matches[0]), "utf8"));
+}

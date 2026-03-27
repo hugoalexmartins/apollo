@@ -13,6 +13,7 @@ import { getEffectiveMinSolToOpen } from "./runtime-helpers.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = path.join(__dirname, "user-config.json");
+const ENV_PATH = path.join(__dirname, ".env");
 
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
 
@@ -77,6 +78,21 @@ function askChoice(question, choices) {
       console.log("  ⚠ Invalid choice.");
     }
   })();
+}
+
+function upsertEnvValue(key, value) {
+  const safeValue = String(value || "").trim();
+  const existing = fs.existsSync(ENV_PATH) ? fs.readFileSync(ENV_PATH, "utf8") : "";
+  const lines = existing ? existing.split(/\r?\n/) : [];
+  const nextLine = `${key}=${safeValue}`;
+  const index = lines.findIndex((line) => line.startsWith(`${key}=`));
+  if (index >= 0) {
+    lines[index] = nextLine;
+  } else {
+    if (lines.length > 0 && lines[lines.length - 1] !== "") lines.push("");
+    lines.push(nextLine);
+  }
+  fs.writeFileSync(ENV_PATH, `${lines.join("\n").replace(/\n*$/, "")}\n`);
 }
 
 // ─── Presets ──────────────────────────────────────────────────────────────────
@@ -163,8 +179,9 @@ const rpcUrl = await ask(
   e("rpcUrl", process.env.RPC_URL || "https://api.mainnet-beta.solana.com")
 );
 
-const existingWalletKey = existing.walletKey || process.env.WALLET_PRIVATE_KEY || "";
-const walletKey = await askSecret("Wallet private key (base58)", { hasExisting: Boolean(existingWalletKey) });
+const existingWalletPrivateKey = process.env.WALLET_PRIVATE_KEY || "";
+const walletPrivateKeyInput = await askSecret("Wallet private key (base58)", { hasExisting: Boolean(existingWalletPrivateKey) });
+const finalWalletPrivateKey = walletPrivateKeyInput || existingWalletPrivateKey;
 
 // ─── Deployment ───────────────────────────────────────────────────────────────
 console.log("\n── Deployment ────────────────────────────────");
@@ -280,7 +297,6 @@ rl.close();
 const userConfig = {
   preset: presetChoice.key,
   rpcUrl,
-  ...(walletKey ? { walletKey } : existing.walletKey ? { walletKey: existing.walletKey } : {}),
   deployAmountSol,
   maxPositions,
   minSolToOpen,
@@ -300,6 +316,9 @@ const userConfig = {
 };
 
 fs.writeFileSync(CONFIG_PATH, JSON.stringify(userConfig, null, 2));
+if (finalWalletPrivateKey) {
+  upsertEnvValue("WALLET_PRIVATE_KEY", finalWalletPrivateKey);
+}
 
 const presetName = preset ? preset.label : "Custom";
 
@@ -317,6 +336,8 @@ Timeframe:    ${timeframe}
   Volatility:  max ${maxVolatility}
   Organic:     min ${minOrganic}
   Holders:     min ${minHolders}
+
+Wallet private key saved to .env (not user-config.json)
   Max mcap:    $${maxMcap.toLocaleString()}
   OOR close:   after ${outOfRangeWaitMinutes} min
   Mgmt:        every ${managementIntervalMin} min

@@ -56,6 +56,11 @@ A third health check runs hourly to summarize portfolio state.
 - Boot recovery now resolves prior write workflows observation-first, blocks autonomous writes on journal corruption or unresolved outcomes, and exposes `/recovery` so the operator can inspect suppression state without opening JSONL directly
 - Provider-free operator and chaos drills now cover fail-closed screening startup paths, stale-PnL management behavior, bounded LP Agent fallback, and screening replay reconciliation
 - `npm run test:hardening` now acts as the committed runtime-hardening verification gate; `npm run test:screen` remains the live external screening smoke and `npm run test:agent` remains the optional dry-run full-agent smoke
+- Autonomous screening now respects portfolio-level kill-switches based on recent realized loss and stop-loss streaks, pausing new capital deployment without disabling protective management flows
+- The operator surface now includes runbook-grade commands for `/health`, `/journal`, `/failure <id>`, `/replay <cycle_id>`, `/reconcile <cycle_id>`, `/review`, `/resume <why>`, `/arm`, and `/disarm`
+- General free-form chat is now read-only by default; write-capable GENERAL tool access must be explicitly armed for a bounded window, while deterministic screening/management flows keep their existing runtime-owned privileges
+- Zenith now writes a machine-readable heartbeat to `data/runtime-health.json`, tracking startup status, cycle status, suppression state, provider health, and write-arming state for external checks
+- Setup writes `WALLET_PRIVATE_KEY` to `.env` and Zenith reads wallet secrets from environment only
 
 **Data sources used by the agent:**
 - `@meteora-ag/dlmm` SDK — on-chain position data, active bin, deploy/close flows
@@ -74,6 +79,7 @@ Agents are powered via OpenRouter-compatible models and can be swapped by changi
 - Solana wallet (base58 private key)
 - Telegram bot token (optional, for notifications)
 - `LPAGENT_API_KEY` (optional, enables `score_top_lpers` / top-LPer scoring features when available)
+- `JUPITER_API_KEY` (optional, used for authenticated Jupiter swap/quote requests when available)
 
 ---
 
@@ -100,6 +106,7 @@ WALLET_PRIVATE_KEY=your_base58_private_key
 HELIUS_API_KEY=your_helius_key         # optional for some wallet/balance lookups
 TELEGRAM_BOT_TOKEN=123456:ABC...       # optional
 LPAGENT_API_KEY=lpagent_...            # optional, enables score_top_lpers when available
+JUPITER_API_KEY=jup_...                # optional, adds authenticated Jupiter API access when available
 DRY_RUN=true                           # safest way to start
 ```
 
@@ -114,6 +121,8 @@ npm run setup
 ```
 
 Or copy `user-config.example.json` to `user-config.json` and edit it manually.
+
+`user-config.json` is for runtime settings only. Keep wallet secrets in `.env`; setup now writes `WALLET_PRIVATE_KEY` there instead of persisting it in `user-config.json`.
 
 **5. Run**
 
@@ -133,7 +142,6 @@ Edit `user-config.json`. The example file is a starting point; the runtime defau
 
 | Field | Default | Description |
 |---|---|---|
-| `walletKey` | — | Base58-encoded private key of the trading wallet |
 | `rpcUrl` | — | Solana RPC endpoint URL |
 | `dryRun` | `true` | Simulate transactions without submitting them |
 | `deployAmountSol` | `0.5` | Minimum deploy floor used by the sizing logic |
@@ -162,6 +170,14 @@ Edit `user-config.json`. The example file is a starting point; the runtime defau
 | `category` | `trending` | Pool category filter |
 | `takeProfitFeePct` | `5` | Close when fees reach this percent of deployed capital |
 | `minClaimAmount` | `5` | Fee threshold for claim / safe-mode compounding |
+| `protectionsEnabled` | `true` | Enable portfolio-level autonomous trading pauses |
+| `maxRecentRealizedLossUsd` | `100` | Pause new autonomous capital deployment if recent realized losses exceed this USD amount |
+| `maxDrawdownPct` | `25` | Pause new autonomous capital deployment if portfolio equity drawdown exceeds this percentage |
+| `maxOpenUnrealizedLossUsd` | `150` | Pause new autonomous capital deployment if aggregate open-position unrealized loss exceeds this USD amount |
+| `recentLossWindowHours` | `24` | Lookback window for realized-loss protection |
+| `stopLossStreakLimit` | `3` | Pause new autonomous capital deployment after this many consecutive stop-loss closes |
+| `portfolioPauseMinutes` | `180` | Duration of a portfolio-guard pause once triggered |
+| `recoveryResumeOverrideMinutes` | `180` | Duration of a persisted operator recovery-resume override window |
 | `outOfRangeWaitMinutes` | `30` | Recorded out-of-range timing window and alert context; runtime management cadence is now enforced from live open-position volatility |
 | `minVolumeToRebalance` | `1000` | Minimum pool volume needed for rebalance logic |
 | `maxBundlersPct` | `30` | Maximum allowed bundler concentration across top-100 holders |
@@ -185,9 +201,18 @@ After startup, an interactive prompt is available. The prompt shows a live count
 | `/status` | Refresh and display wallet balance and open positions |
 | `/candidates` | Re-screen and display the current top candidates |
 | `/candidate <n>` | Inspect one ranked candidate with richer signals on demand |
+| `/health` | Show machine-readable heartbeat, provider health, suppression state, and guard status |
 | `/evaluation` | Show recent cycle/tool evaluation summaries |
 | `/failures` | Show recent persisted bad-cycle evidence bundles |
+| `/failure <id>` | Show one persisted evidence bundle in detail |
 | `/recovery` | Show recovery suppression state and unresolved/manual-review workflows |
+| `/journal` | Show recent write-workflow journal entries |
+| `/replay <cycle_id>` | Show one replay envelope |
+| `/reconcile <cycle_id>` | Re-run deterministic replay reconciliation for one cycle |
+| `/review` | Show replay-backed review stats across recent cycles |
+| `/resume <why>` | Clear current-process autonomous write suppression after manual review |
+| `/arm [minutes] [why]` | Temporarily arm GENERAL free-form write tools |
+| `/disarm` | Remove GENERAL free-form write access |
 | `/performance` | Show recent closed-position attribution and history |
 | `/proof` | Show bounded strategy proof summary from realized closes |
 | `/briefing` | Show a daily briefing that now prefers cached LP-overview metrics when available |
@@ -279,6 +304,17 @@ Zenith now closes the next serious-capital layer with explicit restart and recov
 - `runtime-hardening-plan.md` — committed file map for the action ledger, recovery, fault-injection seams, and reconciliation layer
 - `runtime-hardening-review.md` — committed anti-bloat and hidden-failure review note for this runtime-hardening phase
 
+### Phase 5 elite ops surfaces
+
+Zenith now adds a thin elite-ops layer on top of runtime hardening:
+
+- `portfolio-guards.js` — portfolio-level autonomous trading pauses for stop-loss streaks and realized-loss windows
+- `runtime-health.js` — machine-readable heartbeat and provider-health state in `data/runtime-health.json`
+- `replay-review.js` — operator-friendly replay lookup and reconciliation review over persisted envelopes
+- `operator-controls.js` — bounded GENERAL write arming plus durable, restart-aware operator resume actions
+- `management-cycle-runner.js` / `screening-cycle-runner.js` — extracted autonomous cycle runners so `index.js` stays focused on boot and wiring
+- `interactive-interface.js` / `startup-interface.js` — extracted REPL, Telegram, and startup surfaces so operator flow is no longer embedded directly in `index.js`
+
 Closed-position performance summaries now expose a slightly more honest decomposition of outcomes: inventory contribution, fee contribution, and operational touch counts are stored alongside headline PnL so the operator can distinguish cleaner wins from high-touch wins.
 
 ### LP overview reporting
@@ -337,6 +373,11 @@ Zenith now has focused provider-free checks for important deterministic control 
 - `test/test-dry-run-startup.js` — provider-free dry-run startup verification for boot recovery + startup snapshot readiness
 - `test/test-operator-drill.js` — provider-free screening reconciliation and fail-closed evidence drill
 - `test/test-chaos-drill.js` — provider-free chaos drill for startup/provider failure, stale-PnL management, and bounded LP Agent fallback
+- `portfolio-guards.test.js` — portfolio pause triggers and clearing behavior
+- `runtime-health.test.js` — machine-readable heartbeat persistence
+- `replay-review.test.js` — replay lookup and reconciliation review helpers
+- `operator-controls.test.js` — GENERAL write arming and operator audit logging
+- `agent-tools.test.js` — read-only GENERAL tool surface by default
 
 Manual external smoke still exists for screening and the full agent path (`npm run test:screen`, `npm run test:agent`), but `npm run test:hardening` is the stronger reproducible signal for the deterministic control plane. The screening smoke now injects an empty-position view so it remains wallet-free while still exercising live discovery/detail reads.
 

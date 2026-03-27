@@ -20,3 +20,29 @@ export function appendReplayEnvelope(envelope) {
   const file = path.join(TRACE_DIR, `replay-${dateStr}.jsonl`);
   fs.appendFileSync(file, `${JSON.stringify({ timestamp, ...envelope })}\n`);
 }
+
+export function readReplayEnvelopes() {
+  if (!fs.existsSync(TRACE_DIR)) return [];
+  const files = fs.readdirSync(TRACE_DIR)
+    .filter((file) => /^replay-.*\.jsonl$/.test(file))
+    .sort();
+  const envelopes = [];
+
+  for (const file of files) {
+    const fullPath = path.join(TRACE_DIR, file);
+    const lines = fs.readFileSync(fullPath, "utf8").split(/\r?\n/).filter(Boolean);
+    for (const line of lines) {
+      try {
+        envelopes.push(JSON.parse(line));
+      } catch {
+        // ignore malformed replay lines in read path
+      }
+    }
+  }
+
+  return envelopes;
+}
+
+export function getReplayEnvelope(cycleId) {
+  return readReplayEnvelopes().find((envelope) => envelope.cycle_id === cycleId) || null;
+}
