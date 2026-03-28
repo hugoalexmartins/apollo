@@ -2,6 +2,10 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { config } from "./config.js";
+import {
+	readJsonSnapshotWithBackupSync,
+	writeJsonSnapshotAtomicSync,
+} from "./durable-store.js";
 import { getPerformanceHistory } from "./lessons.js";
 import { log } from "./logger.js";
 
@@ -31,23 +35,30 @@ function emptyGuardState() {
 }
 
 function loadGuardState() {
-  if (!fs.existsSync(GUARD_FILE)) return emptyGuardState();
-  try {
-    return {
-      ...emptyGuardState(),
-      ...JSON.parse(fs.readFileSync(GUARD_FILE, "utf8")),
-    };
-  } catch (error) {
-    log("guard_warn", `Failed to read portfolio guards: ${error.message}`);
-    return emptyGuardState();
-  }
+	const snapshot = readJsonSnapshotWithBackupSync(GUARD_FILE);
+	if (!snapshot.value) {
+		if (snapshot.error) {
+			log("guard_warn", `Failed to read portfolio guards: ${snapshot.error}`);
+			return {
+				...emptyGuardState(),
+				_snapshot_invalid: true,
+				_snapshot_error: snapshot.error,
+			};
+		}
+		return emptyGuardState();
+	}
+	const state = {
+		...emptyGuardState(),
+		...snapshot.value,
+	};
+	if (snapshot.source === "backup") {
+		log("guard_warn", "Recovered portfolio guards from backup snapshot");
+	}
+	return state;
 }
 
 function saveGuardState(state) {
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-  }
-  fs.writeFileSync(GUARD_FILE, JSON.stringify(state, null, 2));
+	writeJsonSnapshotAtomicSync(GUARD_FILE, state);
 }
 
 function appendHistory(state, entry) {
@@ -181,9 +192,21 @@ function buildTrigger(metrics) {
 }
 
 export function getPortfolioGuardStatus({ nowMs = Date.now() } = {}) {
-  const state = loadGuardState();
-  const pauseUntilMs = Date.parse(state.pause_until || "");
-  const remainingMs = Number.isFinite(pauseUntilMs) ? Math.max(0, pauseUntilMs - nowMs) : 0;
+	const state = loadGuardState();
+	if (state._snapshot_invalid) {
+		return {
+			active: true,
+			pause_until: null,
+			remaining_ms: 0,
+			reason_code: "GUARD_STATE_INVALID",
+			reason: `portfolio guard state unreadable: ${state._snapshot_error}`,
+			triggered_at: null,
+			metrics: state.metrics,
+			history: state.history,
+		};
+	}
+	const pauseUntilMs = Date.parse(state.pause_until || "");
+	const remainingMs = Number.isFinite(pauseUntilMs) ? Math.max(0, pauseUntilMs - nowMs) : 0;
   return {
     active: remainingMs > 0,
     pause_until: remainingMs > 0 ? state.pause_until : null,
@@ -197,9 +220,21 @@ export function getPortfolioGuardStatus({ nowMs = Date.now() } = {}) {
 }
 
 export function evaluatePortfolioGuard({ nowMs = Date.now(), portfolioSnapshot = null, openPositionPnls = [] } = {}) {
-  const protections = config.protections;
-  const state = loadGuardState();
-  const current = getPortfolioGuardStatus({ nowMs });
+	const protections = config.protections;
+	const state = loadGuardState();
+	if (state._snapshot_invalid) {
+		return {
+			blocked: true,
+			active: true,
+			pause_until: null,
+			remaining_ms: 0,
+			reason_code: "GUARD_STATE_INVALID",
+			reason: `portfolio guard state unreadable: ${state._snapshot_error}`,
+			metrics: state.metrics,
+			history: state.history,
+		};
+	}
+	const current = getPortfolioGuardStatus({ nowMs });
   const nowIso = new Date(nowMs).toISOString();
 
   const history = getPerformanceHistory({
@@ -291,9 +326,10 @@ export function formatPortfolioGuardReport(status = getPortfolioGuardStatus()) {
   const lines = ["", "Portfolio guard:", ""];
   lines.push(`  active: ${status.active ? "yes" : "no"}`);
   if (status.reason_code) lines.push(`  reason_code: ${status.reason_code}`);
-  if (status.reason) lines.push(`  reason: ${status.reason}`);
-  if (status.pause_until) lines.push(`  pause_until: ${status.pause_until}`);
-  if (status.metrics) {
+	if (status.reason) lines.push(`  reason: ${status.reason}`);
+	if (status.pause_until) lines.push(`  pause_until: ${status.pause_until}`);
+	if (status.loaded_from_backup) lines.push("  loaded_from_backup: true");
+	if (status.metrics) {
     lines.push(`  recent_loss_usd: ${status.metrics.recent_loss_usd}`);
     lines.push(`  stop_loss_streak: ${status.metrics.stop_loss_streak}`);
     lines.push(`  positions_considered: ${status.metrics.positions_considered}`);

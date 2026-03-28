@@ -160,5 +160,51 @@ test("portfolio guard pauses on open unrealized risk", () => {
     clearPortfolioGuardPause({ reason: "test cleanup" });
     process.chdir(originalCwd);
     fs.rmSync(tempDir, { recursive: true, force: true });
-  }
+	}
+});
+
+test("portfolio guard fails closed when the guard snapshot is unreadable", () => {
+	const originalCwd = process.cwd();
+	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "zenith-portfolio-guard-invalid-test-"));
+
+	try {
+		process.chdir(tempDir);
+		fs.mkdirSync(path.join(tempDir, "logs"), { recursive: true });
+		fs.mkdirSync(path.join(tempDir, "data"), { recursive: true });
+		fs.writeFileSync(path.join(tempDir, "data", "portfolio-guards.json"), "{bad json");
+
+		const status = getPortfolioGuardStatus();
+		assert.equal(status.active, true);
+		assert.equal(status.reason_code, "GUARD_STATE_INVALID");
+
+		const result = evaluatePortfolioGuard();
+		assert.equal(result.blocked, true);
+		assert.equal(result.reason_code, "GUARD_STATE_INVALID");
+	} finally {
+		process.chdir(originalCwd);
+		fs.rmSync(tempDir, { recursive: true, force: true });
+	}
+});
+
+test("portfolio guard recovers from backup snapshot when primary is missing", () => {
+	const originalCwd = process.cwd();
+	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "zenith-portfolio-guard-backup-test-"));
+
+	try {
+		process.chdir(tempDir);
+		fs.mkdirSync(path.join(tempDir, "logs"), { recursive: true });
+		fs.mkdirSync(path.join(tempDir, "data"), { recursive: true });
+		fs.writeFileSync(path.join(tempDir, "data", "portfolio-guards.json.bak"), JSON.stringify({
+			pause_until: "2030-01-01T00:00:00.000Z",
+			reason_code: "STOP_LOSS_STREAK",
+			reason: "backup pause",
+		}, null, 2));
+
+		const status = getPortfolioGuardStatus({ nowMs: Date.parse("2029-12-31T23:00:00.000Z") });
+		assert.equal(status.active, true);
+		assert.equal(status.reason_code, "STOP_LOSS_STREAK");
+	} finally {
+		process.chdir(originalCwd);
+		fs.rmSync(tempDir, { recursive: true, force: true });
+	}
 });

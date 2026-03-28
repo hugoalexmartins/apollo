@@ -78,13 +78,10 @@ export async function renderInteractiveStartup({
 export async function runNonInteractiveStartup({
   bootRecoveryBlockActive,
   bootRecovery,
-  summarizeRecoveryBlock,
-  log,
-  startCronJobs,
-  maybeRunMissedBriefing,
-  agentLoop,
-  config,
-  deployAmountSol,
+	summarizeRecoveryBlock,
+	log,
+	startCronJobs,
+	maybeRunMissedBriefing,
 } = {}) {
   if (bootRecoveryBlockActive) {
     const recoveryBlock = summarizeRecoveryBlock(bootRecovery);
@@ -95,16 +92,7 @@ export async function runNonInteractiveStartup({
   log("startup", "Non-TTY mode — starting cron cycles immediately.");
   startCronJobs();
   maybeRunMissedBriefing().catch(() => {});
-  (async () => {
-    try {
-      await agentLoop(`
-STARTUP CHECK
-1. get_wallet_balance. 2. get_my_positions. 3. If SOL >= ${config.management.minSolToOpen}: get_top_candidates then deploy ${deployAmountSol} SOL. 4. Report.
-      `, config.llm.maxSteps, [], "SCREENER");
-    } catch (e) {
-      log("startup_error", e.message);
-    }
-  })();
+  log("startup", "Non-TTY autonomous startup deploy path disabled; cron-only startup in effect.");
 }
 
 export function formatInteractiveHelp(deployAmountSol) {

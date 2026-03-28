@@ -480,11 +480,18 @@ export function planManagementRuntimeAction(position, config, expectedVolumeProf
   const feePerTvl24h = !pnlSignalStale && Number.isFinite(Number(position.pnl?.fee_per_tvl_24h ?? position.fee_per_tvl_24h))
     ? Number(position.pnl?.fee_per_tvl_24h ?? position.fee_per_tvl_24h)
     : null;
-  const feesUsd = pnlSignalStale
-    ? 0
-    : asNumber(position.pnl?.unclaimed_fee_usd ?? position.unclaimed_fees_usd, 0);
-  const oorMinutes = asNumber(position.minutes_out_of_range, 0);
-  const derivedVolumeProfile = expectedVolumeProfile || deriveExpectedVolumeProfile({
+	const feesUsd = pnlSignalStale
+		? 0
+		: asNumber(position.pnl?.unclaimed_fee_usd ?? position.unclaimed_fees_usd, 0);
+	const totalFeesEarnedUsd = pnlSignalStale
+		? 0
+		: feesUsd + asNumber(position.collected_fees_usd, 0);
+	const initialValueUsd = asNumber(position.initial_value_usd, 0);
+	const feeTakeProfitPct = initialValueUsd > 0
+		? (totalFeesEarnedUsd / initialValueUsd) * 100
+		: null;
+	const oorMinutes = asNumber(position.minutes_out_of_range, 0);
+	const derivedVolumeProfile = expectedVolumeProfile || deriveExpectedVolumeProfile({
     fee_tvl_ratio: position.fee_tvl_ratio,
     volatility: position.pnl?.volatility ?? position.volatility,
     volume_window: position.volume_window,
@@ -508,14 +515,14 @@ export function planManagementRuntimeAction(position, config, expectedVolumeProf
     };
   }
 
-  if (pnlPct != null && pnlPct >= config.management.takeProfitFeePct) {
-    return {
-      toolName: "close_position",
-      args: { position_address: position.position, reason: "fixed take profit" },
-      reason: `pnl ${pnlPct.toFixed(2)}% >= ${config.management.takeProfitFeePct}%`,
-      rule: MANAGEMENT_SUBREASONS.TAKE_PROFIT,
-    };
-  }
+	if (feeTakeProfitPct != null && feeTakeProfitPct >= config.management.takeProfitFeePct) {
+		return {
+			toolName: "close_position",
+			args: { position_address: position.position, reason: "fixed take profit" },
+			reason: `fees ${feeTakeProfitPct.toFixed(2)}% >= ${config.management.takeProfitFeePct}% of deployed capital`,
+			rule: MANAGEMENT_SUBREASONS.TAKE_PROFIT,
+		};
+	}
 
   if (position.in_range === false) {
     return {

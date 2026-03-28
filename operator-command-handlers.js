@@ -1,12 +1,11 @@
 export async function handleOperatorCommandText({
   text,
   source,
-  config,
-  getRecoveryWorkflowReport,
-  getAutonomousWriteSuppression,
-  clearPortfolioGuardPause,
-  setAutonomousWriteSuppression,
-  acknowledgeRecoveryResume,
+	config,
+	getRecoveryWorkflowReport,
+	getAutonomousWriteSuppression,
+	setAutonomousWriteSuppression,
+	acknowledgeRecoveryResume,
   armGeneralWriteTools,
   disarmGeneralWriteTools,
   getOperatorControlSnapshot,
@@ -47,12 +46,21 @@ export async function handleOperatorCommandText({
       };
     }
     const suppression = getAutonomousWriteSuppression();
-    const clearedGuard = clearPortfolioGuardPause({ reason });
+    const resumableWorkflowBlock = suppression.suppressed
+      && suppression.code === "UNRESOLVED_WORKFLOW"
+      && Boolean(suppression.incident_key);
+    if (!resumableWorkflowBlock) {
+      return {
+        handled: true,
+        message: "Cannot persist resume override unless autonomous writes are currently suppressed for an unresolved-workflow manual-review block.",
+      };
+    }
     setAutonomousWriteSuppression({ suppressed: false });
     const override = acknowledgeRecoveryResume({
       reason,
       report_status: report.status,
-      cleared_guard_pause: clearedGuard.cleared,
+      cleared_guard_pause: false,
+      incident_key: suppression.incident_key,
       source,
       override_minutes: config.protections.recoveryResumeOverrideMinutes,
     });
@@ -60,7 +68,7 @@ export async function handleOperatorCommandText({
     refreshRuntimeHealth();
     return {
       handled: true,
-      message: `Autonomous write suppression cleared. Previous suppression: ${suppression.reason || "none"}. Guard pause cleared: ${clearedGuard.cleared ? "yes" : "no"}. Persisted resume override until ${snapshot.recovery_resume_override?.override_until || "n/a"}.`,
+      message: `Autonomous write suppression cleared. Previous suppression: ${suppression.reason || "none"}. Portfolio guard pause unchanged. Persisted resume override until ${snapshot.recovery_resume_override?.override_until || "n/a"}.`,
     };
   }
 

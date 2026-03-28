@@ -388,6 +388,20 @@ async function getPool(poolAddress) {
   return poolCache.get(key);
 }
 
+export async function getPoolGovernanceMetadata({ pool_address }) {
+	pool_address = normalizeMint(pool_address);
+	try {
+		const pool = await getPool(pool_address);
+		return {
+			pool_address,
+			base_mint: pool?.lbPair?.tokenXMint?.toString() || null,
+			bin_step: pool?.lbPair?.binStep ?? null,
+		};
+	} catch (error) {
+		return { error: error.message };
+	}
+}
+
 setInterval(() => poolCache.clear(), 5 * 60 * 1000);
 
 // ─── Get Active Bin ────────────────────────────────────────────
@@ -602,18 +616,14 @@ export async function deployPosition({
   // If amount_y is not provided but amount_sol is, use amount_sol (for backward compatibility)
   const finalAmountY = amount_y ?? amount_sol ?? 0;
   const finalAmountX = amount_x ?? 0;
-  let deployValueUsd = initial_value_usd ?? null;
-
-  if (deployValueUsd == null) {
-    const walletBalances = await getWalletBalances({}).catch(() => null);
-    const solPrice = Number(walletBalances?.sol_price) || 0;
-    deployValueUsd = estimateInitialValueUsd({
-      amountSol: finalAmountY,
-      solPrice,
-      amountToken: finalAmountX,
-      activePrice: Number(activeBin.price),
-    });
-  }
+	const walletBalances = await getWalletBalances({}).catch(() => null);
+	const solPrice = Number(walletBalances?.sol_price) || 0;
+	const deployValueUsd = estimateInitialValueUsd({
+		amountSol: finalAmountY,
+		solPrice,
+		amountToken: finalAmountX,
+		activePrice: Number(activeBin.price),
+	});
 
   const totalYLamports = new BN(Math.floor(finalAmountY * 1e9));
   // For X, we assume it's also 9 decimals for now, or we'd need to fetch mint decimals.
@@ -901,6 +911,8 @@ export async function getMyPositions({ force = false } = {}) {
         volatility: r.volatility,
         organic_score: r.organic_score,
         instruction: r.instruction,
+        amount_sol: tracked?.amount_sol ?? null,
+        initial_value_usd: tracked?.initial_value_usd ?? null,
         base_mint: tracked?.base_mint || poolMints?.token_x_mint || r.base_mint,
         lower_bin: lowerBin,
         upper_bin: upperBin,
@@ -1847,6 +1859,11 @@ export async function claimFees({ position_address }) {
     // Clear cached pool so SDK loads fresh position fee state
     poolCache.delete(poolAddress.toString());
     const pool = await getPool(poolAddress);
+    const baseMint = pool.lbPair.tokenXMint.toString();
+    const baseBalanceBeforeClaim = await getWalletTokenBalance({
+      walletPubkey: wallet.publicKey,
+      mint: baseMint,
+    }).catch(() => null);
 
     const positionData = await pool.getPosition(new PublicKey(position_address));
     const txs = await pool.claimSwapFee({
@@ -1866,8 +1883,22 @@ export async function claimFees({ position_address }) {
     log("claim", `SUCCESS txs: ${txHashes.join(", ")}`);
     _positionsCacheAt = 0; // invalidate cache after claim
     recordClaim(position_address);
+    const baseBalanceAfterClaim = await getWalletTokenBalance({
+      walletPubkey: wallet.publicKey,
+      mint: baseMint,
+    }).catch(() => null);
+    const baseAmountReceived = computeObservedTokenDelta({
+      previousBalance: baseBalanceBeforeClaim,
+      observedBalance: baseBalanceAfterClaim,
+    });
 
-    return { success: true, position: position_address, txs: txHashes, base_mint: pool.lbPair.tokenXMint.toString() };
+    return {
+      success: true,
+      position: position_address,
+      txs: txHashes,
+      base_mint: baseMint,
+      base_amount_received: baseAmountReceived,
+    };
   } catch (error) {
     log("claim_error", error.message);
     return { success: false, error: error.message };
@@ -1892,6 +1923,11 @@ export async function closePosition({ position_address, reason = "agent decision
     // Clear cached pool so SDK loads fresh position fee state
     poolCache.delete(poolAddress.toString());
     const pool = await getPool(poolAddress);
+    const baseMint = pool.lbPair.tokenXMint.toString();
+    const baseBalanceBeforeClose = await getWalletTokenBalance({
+      walletPubkey: wallet.publicKey,
+      mint: baseMint,
+    }).catch(() => null);
 
     const positionPubKey = new PublicKey(position_address);
 
@@ -1934,8 +1970,9 @@ export async function closePosition({ position_address, reason = "agent decision
     log("close", `SUCCESS txs: ${txHashes.join(", ")}`);
     const settlement = await waitForPostCloseSettlement({
       walletPubkey: wallet.publicKey,
-      baseMint: pool.lbPair.tokenXMint.toString(),
+      baseMint,
       positionAddress: position_address,
+      previousBaseBalance: baseBalanceBeforeClose,
     });
     if (!settlement.settled) {
       log("close_warn", `Post-close settlement not observed before timeout (${settlement.reason})`);
@@ -1976,12 +2013,22 @@ export async function closePosition({ position_address, reason = "agent decision
         txs: txHashes,
         pnl_usd: closePerformance.result.pnl_usd,
         pnl_pct: closePerformance.result.pnl_pct,
-        base_mint: pool.lbPair.tokenXMint.toString(),
+        base_mint: baseMint,
+        base_amount_received: settlement.observed_balance_delta ?? 0,
         close_reason: reason,
       };
     }
 
-    return { success: true, position: position_address, pool: poolAddress, pool_name: null, txs: txHashes, base_mint: pool.lbPair.tokenXMint.toString(), close_reason: reason };
+    return {
+      success: true,
+      position: position_address,
+      pool: poolAddress,
+      pool_name: null,
+      txs: txHashes,
+      base_mint: baseMint,
+      base_amount_received: settlement.observed_balance_delta ?? 0,
+      close_reason: reason,
+    };
   } catch (error) {
     log("close_error", error.message);
     return { success: false, error: error.message };
@@ -2068,12 +2115,22 @@ async function lookupPoolForPosition(position_address, walletAddress) {
   throw new Error(`Position ${position_address} not found in open positions`);
 }
 
-export function evaluatePostCloseSettlementObservation({ observedBaseBalance, positionStillOpen }) {
-  if (Number.isFinite(observedBaseBalance) && observedBaseBalance > 0) {
+export function evaluatePostCloseSettlementObservation({
+	previousBaseBalance,
+	observedBaseBalance,
+	positionStillOpen,
+}) {
+	const observedBalanceDelta = computeObservedTokenDelta({
+		previousBalance: previousBaseBalance,
+		observedBalance: observedBaseBalance,
+	});
+
+  if (Number.isFinite(observedBalanceDelta) && observedBalanceDelta > 0) {
     return {
       settled: true,
-      signal: "base_balance_observed",
+      signal: "base_balance_delta_observed",
       observed_balance: observedBaseBalance,
+      observed_balance_delta: observedBalanceDelta,
     };
   }
 
@@ -2081,6 +2138,8 @@ export function evaluatePostCloseSettlementObservation({ observedBaseBalance, po
     return {
       settled: true,
       signal: "position_absent_from_open_positions",
+      observed_balance: observedBaseBalance,
+      observed_balance_delta: observedBalanceDelta,
     };
   }
 
@@ -2090,7 +2149,7 @@ export function evaluatePostCloseSettlementObservation({ observedBaseBalance, po
   };
 }
 
-async function waitForPostCloseSettlement({ walletPubkey, baseMint, positionAddress, maxAttempts = 6, delayMs = 1000 }) {
+async function waitForPostCloseSettlement({ walletPubkey, baseMint, positionAddress, previousBaseBalance = null, maxAttempts = 6, delayMs = 1000 }) {
   if (!baseMint && !positionAddress) {
     return { settled: false, reason: "missing_settlement_observation_targets" };
   }
@@ -2114,7 +2173,7 @@ async function waitForPostCloseSettlement({ walletPubkey, baseMint, positionAddr
     try {
       if (positionAddress) {
         const openPositions = await getMyPositions({ force: true });
-        if (Array.isArray(openPositions?.positions)) {
+        if (!openPositions?.error && Array.isArray(openPositions?.positions)) {
           positionStillOpen = openPositions.positions.some((position) => position.position === positionAddress);
         }
       }
@@ -2123,17 +2182,19 @@ async function waitForPostCloseSettlement({ walletPubkey, baseMint, positionAddr
     }
 
     const observed = evaluatePostCloseSettlementObservation({
+      previousBaseBalance,
       observedBaseBalance,
       positionStillOpen,
     });
     if (observed.settled) {
-      return {
-        settled: true,
-        signal: observed.signal,
-        observed_balance: observed.observed_balance ?? null,
-        position_still_open: positionStillOpen,
-        attempts: attempt,
-      };
+		return {
+			settled: true,
+			signal: observed.signal,
+			observed_balance: observed.observed_balance ?? null,
+			observed_balance_delta: observed.observed_balance_delta ?? null,
+			position_still_open: positionStillOpen,
+			attempts: attempt,
+		};
     }
 
     if (attempt < maxAttempts) {
@@ -2142,4 +2203,23 @@ async function waitForPostCloseSettlement({ walletPubkey, baseMint, positionAddr
   }
 
   return { settled: false, reason: "settlement_signal_not_observed" };
+}
+
+function computeObservedTokenDelta({ previousBalance = null, observedBalance = null } = {}) {
+  const previous = Number(previousBalance);
+  const observed = Number(observedBalance);
+  if (!Number.isFinite(previous) || !Number.isFinite(observed)) {
+    return null;
+  }
+  const delta = observed - previous;
+  return delta > 0 ? delta : 0;
+}
+
+async function getWalletTokenBalance({ walletPubkey, mint } = {}) {
+  if (!walletPubkey || !mint) return null;
+  const response = await getConnection().getParsedTokenAccountsByOwner(walletPubkey, { mint: new PublicKey(mint) });
+  return (response.value || []).reduce((sum, account) => {
+    const amount = Number(account.account.data.parsed.info.tokenAmount.uiAmount || 0);
+    return sum + (Number.isFinite(amount) ? amount : 0);
+  }, 0);
 }

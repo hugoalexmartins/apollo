@@ -78,7 +78,39 @@ test("state tracks explicit out-of-range direction", () => {
   } finally {
     process.chdir(originalCwd);
     fs.rmSync(tempDir, { recursive: true, force: true });
-  }
+	}
+});
+
+test("state falls back to backup snapshot when primary is missing", () => {
+	const originalCwd = process.cwd();
+	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "zenith-state-backup-test-"));
+
+	try {
+		process.chdir(tempDir);
+		fs.mkdirSync(path.join(tempDir, "logs"), { recursive: true });
+		fs.writeFileSync(
+			path.join(tempDir, "state.json.bak"),
+			JSON.stringify({
+				positions: {
+					"pos-backup-1": {
+						position: "pos-backup-1",
+						pool: "pool-backup-1",
+						pool_name: "Backup Pool",
+						amount_sol: 0.5,
+						strategy: "spot",
+						deployed_at: new Date().toISOString(),
+					},
+				},
+			}, null, 2),
+		);
+
+		const summary = getStateSummary();
+		assert.equal(summary.positions.length, 1);
+		assert.equal(summary.positions[0].position, "pos-backup-1");
+	} finally {
+		process.chdir(originalCwd);
+		fs.rmSync(tempDir, { recursive: true, force: true });
+	}
 });
 
 test("syncOpenPositions skips auto-close when unresolved workflow references position or pool", () => {

@@ -8,22 +8,31 @@ function buildReport(runId, mismatches) {
   };
 }
 
+function pushMismatchIfDifferent(mismatches, field, expected, actual) {
+	if (JSON.stringify(expected) !== JSON.stringify(actual)) {
+		mismatches.push({ field, expected, actual });
+	}
+}
+
 export function reconcileScreeningEnvelope(envelope) {
   const replayed = replayScreeningEnvelope(envelope);
-  const expectedOrder = (envelope.shortlist || []).map((item) => item.pool);
-  const actualOrder = replayed.shortlist.map((item) => item.pool);
   const mismatches = [];
 
-  if (JSON.stringify(expectedOrder) !== JSON.stringify(actualOrder)) {
-    mismatches.push({ field: "candidateOrder", expected: expectedOrder, actual: actualOrder });
-  }
+	if (envelope.status) {
+		pushMismatchIfDifferent(mismatches, "status", envelope.status, replayed.status || null);
+		pushMismatchIfDifferent(mismatches, "summary", envelope.summary || null, replayed.summary || null);
+		return buildReport(envelope.cycle_id || null, mismatches);
+	}
 
-  if ((envelope.total_eligible ?? null) !== replayed.total_eligible) {
-    mismatches.push({ field: "terminalDecision", expected: envelope.total_eligible ?? null, actual: replayed.total_eligible });
-  }
+  const expectedOrder = (envelope.shortlist || []).map((item) => item.pool);
+  const actualOrder = (replayed.shortlist || []).map((item) => item.pool);
+
+  pushMismatchIfDifferent(mismatches, "candidateOrder", expectedOrder, actualOrder);
+
+  pushMismatchIfDifferent(mismatches, "terminalDecision", envelope.total_eligible ?? null, replayed.total_eligible);
 
   if ((envelope.reason_code || null) !== null) {
-    mismatches.push({ field: "degradedReason", expected: envelope.reason_code, actual: null });
+		mismatches.push({ field: "degradedReason", expected: envelope.reason_code, actual: null });
   }
 
   return buildReport(envelope.cycle_id || null, mismatches);
@@ -43,9 +52,13 @@ export function reconcileManagementEnvelope(envelope, config) {
   }));
   const mismatches = [];
 
-  if (JSON.stringify(expectedActions) !== JSON.stringify(actualActions)) {
-    mismatches.push({ field: "terminalDecision", expected: expectedActions, actual: actualActions });
-  }
+	if (envelope.status) {
+		pushMismatchIfDifferent(mismatches, "status", envelope.status, replayed.status || null);
+		pushMismatchIfDifferent(mismatches, "summary", envelope.summary || null, replayed.summary || null);
+		return buildReport(envelope.cycle_id || null, mismatches);
+	}
+
+  pushMismatchIfDifferent(mismatches, "terminalDecision", expectedActions, actualActions);
 
   if ((envelope.reason_code || null) !== null) {
     mismatches.push({ field: "degradedReason", expected: envelope.reason_code, actual: null });

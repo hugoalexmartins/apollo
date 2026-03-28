@@ -17,8 +17,9 @@ export function createManagementCycleRunner(deps) {
       isPnlSignalStale,
       updatePnlAndCheckExits,
       evaluatePortfolioGuard,
-      runManagementRuntimeActions,
-      executeTool,
+		runManagementRuntimeActions,
+		listActionJournalWorkflowsByCycle,
+		executeTool,
       didRuntimeHandleManagementAction,
       classifyManagementModelGate,
       summarizeRuntimeActionResult,
@@ -51,20 +52,21 @@ export function createManagementCycleRunner(deps) {
     let positionData = [];
     let runtimeActions = [];
 
-    const appendManagementReplayEnvelope = (inputs, actions) => {
-      appendReplayEnvelope({
-        cycle_id: cycleId,
-        cycle_type: "management",
+		const appendManagementReplayEnvelope = (inputs, actions) => {
+			appendReplayEnvelope({
+				cycle_id: cycleId,
+				cycle_type: "management",
         position_inputs: inputs,
-        runtime_actions: actions.map((action) => ({
-          position: action.position,
-          tool: action.toolName,
-          rule: action.rule,
-          reason: action.reason,
-          action_id: action.actionId,
-        })),
-      });
-    };
+				runtime_actions: actions.map((action) => ({
+					position: action.position,
+					tool: action.toolName,
+					rule: action.rule,
+					reason: action.reason,
+					action_id: action.actionId,
+				})),
+				write_workflows: listActionJournalWorkflowsByCycle(cycleId),
+			});
+		};
 
     try {
       const [livePositionsResult, walletSnapshotResult] = await Promise.all([

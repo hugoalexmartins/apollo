@@ -3,6 +3,10 @@ import readline from "node:readline";
 import { formatCandidateInspection, formatCandidates, formatRangeStatus, inspectCandidate } from "./screening-intel.js";
 import { formatInteractiveHelp, renderInteractiveStartup } from "./startup-interface.js";
 
+export function getTelegramFreeformAgentRole() {
+	return "GENERAL";
+}
+
 export async function runInteractiveInterface({
   buildPrompt,
   bootRecovery,
@@ -224,9 +228,7 @@ export async function runInteractiveInterface({
     state.busy = true;
     try {
       log("telegram", `Incoming: ${text}`);
-      const hasCloseIntent = /\bclose\b|\bsell\b|\bexit\b|\bwithdraw\b/i.test(text);
-      const isDeployRequest = !hasCloseIntent && /\bdeploy\b|\bopen position\b|\blp into\b|\badd liquidity\b/i.test(text);
-      const agentRole = isDeployRequest ? "SCREENER" : "GENERAL";
+			const agentRole = getTelegramFreeformAgentRole();
       const { content } = await agentLoop(text, config.llm.maxSteps, state.sessionHistory, agentRole, config.llm.generalModel, null, {
         allowDangerousTools: agentRole !== "GENERAL" || getOperatorControlSnapshot().general_write_arm.armed,
       });
@@ -646,13 +648,13 @@ For each pool, call study_top_lpers then move to the next. After studying all po
 4. Summarize what you learned.
 
 Focus on: hold duration, entry/exit timing, what win rates look like, whether scalpers or holders dominate.`,
-          config.llm.maxSteps,
-          [],
-          "GENERAL",
-          config.llm.generalModel,
-          null,
-          { allowDangerousTools: true }
-        );
+			config.llm.maxSteps,
+			[],
+			"GENERAL",
+			config.llm.generalModel,
+			null,
+			{ allowDangerousTools: false }
+		);
         console.log(`\n${reply}\n`);
       });
       return;

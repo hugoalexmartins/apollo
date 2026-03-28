@@ -31,7 +31,11 @@ import {
 	listSmartWallets,
 	removeSmartWallet,
 } from "../smart-wallets.js";
-import { recordToolOutcome, setPositionInstruction } from "../state.js";
+import {
+	getTrackedPositions,
+	recordToolOutcome,
+	setPositionInstruction,
+} from "../state.js";
 import {
 	addStrategy,
 	getStrategy,
@@ -52,6 +56,7 @@ import {
 	claimFees,
 	closePosition,
 	deployPosition,
+	getPoolGovernanceMetadata,
 	getActiveBin,
 	getMyPositions,
 	getPositionPnl,
@@ -70,6 +75,7 @@ const USER_CONFIG_PATH = path.join(__dirname, "../user-config.json");
 const executorTestOverrides = {
 	getMyPositions: null,
 	getWalletBalances: null,
+	getPoolGovernanceMetadata: null,
 	recordToolOutcome: null,
 	tools: {},
 };
@@ -79,6 +85,9 @@ export function setExecutorTestOverrides(overrides = {}) {
 		executorTestOverrides.getMyPositions = overrides.getMyPositions;
 	if (Object.hasOwn(overrides, "getWalletBalances"))
 		executorTestOverrides.getWalletBalances = overrides.getWalletBalances;
+	if (Object.hasOwn(overrides, "getPoolGovernanceMetadata"))
+		executorTestOverrides.getPoolGovernanceMetadata =
+			overrides.getPoolGovernanceMetadata;
 	if (Object.hasOwn(overrides, "recordToolOutcome"))
 		executorTestOverrides.recordToolOutcome = overrides.recordToolOutcome;
 	if (overrides.tools)
@@ -91,6 +100,7 @@ export function setExecutorTestOverrides(overrides = {}) {
 export function resetExecutorTestOverrides() {
 	executorTestOverrides.getMyPositions = null;
 	executorTestOverrides.getWalletBalances = null;
+	executorTestOverrides.getPoolGovernanceMetadata = null;
 	executorTestOverrides.recordToolOutcome = null;
 	executorTestOverrides.tools = {};
 }
@@ -105,6 +115,21 @@ function getWalletBalancesRuntime(args = {}) {
 	return executorTestOverrides.getWalletBalances
 		? executorTestOverrides.getWalletBalances(args)
 		: getWalletBalances(args);
+}
+
+function getPoolGovernanceMetadataRuntime(args = {}) {
+	return executorTestOverrides.getPoolGovernanceMetadata
+		? executorTestOverrides.getPoolGovernanceMetadata(args)
+		: getPoolGovernanceMetadata(args);
+}
+
+function mergeOpenPositions(livePositions = [], trackedPositions = []) {
+	const merged = new Map();
+	for (const position of [...livePositions, ...trackedPositions]) {
+		if (!position?.position) continue;
+		merged.set(position.position, position);
+	}
+	return Array.from(merged.values());
 }
 
 function recordToolOutcomeRuntime(payload) {
@@ -127,21 +152,29 @@ export function registerCronRestarter(fn) {
 
 let _autonomousWriteSuppressed = false;
 let _writeSuppressionReason = null;
+let _writeSuppressionCode = null;
+let _writeSuppressionIncidentKey = null;
 
 export function setAutonomousWriteSuppression({
 	suppressed,
 	reason = null,
+	code = null,
+	incidentKey = null,
 } = {}) {
 	_autonomousWriteSuppressed = Boolean(suppressed);
 	_writeSuppressionReason = _autonomousWriteSuppressed
 		? reason || "manual review required"
 		: null;
+	_writeSuppressionCode = _autonomousWriteSuppressed ? code || null : null;
+	_writeSuppressionIncidentKey = _autonomousWriteSuppressed ? incidentKey || null : null;
 }
 
 export function getAutonomousWriteSuppression() {
 	return {
 		suppressed: _autonomousWriteSuppressed,
 		reason: _writeSuppressionReason,
+		code: _writeSuppressionCode,
+		incident_key: _writeSuppressionIncidentKey,
 	};
 }
 
@@ -488,7 +521,13 @@ function recordWriteToolOutcome({
 	});
 }
 
-async function handleSuccessfulToolSideEffects(name, normalizedArgs, result) {
+async function handleSuccessfulToolSideEffects(
+	name,
+	normalizedArgs,
+	result,
+	meta = {},
+	workflowId = null,
+) {
 	if (name === "swap_token" && result.tx) {
 		await notifySwap({
 			inputSymbol: normalizedArgs.input_mint?.slice(0, 8),
@@ -527,25 +566,31 @@ async function handleSuccessfulToolSideEffects(name, normalizedArgs, result) {
 			pnlUsd: result.pnl_usd ?? 0,
 			pnlPct: result.pnl_pct ?? 0,
 		}).catch(() => {});
-		if (!normalizedArgs.skip_swap && result.base_mint) {
-			try {
-				const balances = await getWalletBalancesRuntime({});
-				const token = balances.tokens?.find(
-					(entry) => entry.mint === result.base_mint,
+		const swapAmount = Number(result.base_amount_received ?? 0);
+		if (!normalizedArgs.skip_swap && result.base_mint && Number.isFinite(swapAmount) && swapAmount > 0) {
+			log(
+				"executor",
+				`Auto-swapping observed close proceeds ${swapAmount} of ${result.base_mint.slice(0, 8)} back to SOL`,
+			);
+			const autoSwapResult = await executeTool(
+				"swap_token",
+				{
+					input_mint: result.base_mint,
+					output_mint: "SOL",
+					amount: swapAmount,
+				},
+				{
+					cycle_id: meta.cycle_id || null,
+					cycle_type: meta.cycle_type || null,
+					regime_label: meta.regime_label || null,
+					action_id: workflowId ? `${workflowId}:auto_swap_close` : undefined,
+				},
+			);
+			if (autoSwapResult?.error || autoSwapResult?.blocked) {
+				log(
+					"executor_warn",
+					`Auto-swap after close did not complete: ${autoSwapResult.error || autoSwapResult.reason || "unknown error"}`,
 				);
-				if (token && token.usd >= 0.1) {
-					log(
-						"executor",
-						`Auto-swapping ${token.symbol || result.base_mint.slice(0, 8)} ($${token.usd.toFixed(2)}) back to SOL`,
-					);
-					await swapToken({
-						input_mint: result.base_mint,
-						output_mint: "SOL",
-						amount: token.balance,
-					});
-				}
-			} catch (error) {
-				log("executor_warn", `Auto-swap after close failed: ${error.message}`);
 			}
 		}
 		return;
@@ -556,24 +601,32 @@ async function handleSuccessfulToolSideEffects(name, normalizedArgs, result) {
 		config.management.autoSwapAfterClaim &&
 		result.base_mint
 	) {
-		try {
-			const balances = await getWalletBalancesRuntime({});
-			const token = balances.tokens?.find(
-				(entry) => entry.mint === result.base_mint,
+		const swapAmount = Number(result.base_amount_received ?? 0);
+		if (Number.isFinite(swapAmount) && swapAmount > 0) {
+			log(
+				"executor",
+				`Auto-swapping observed claimed proceeds ${swapAmount} of ${result.base_mint.slice(0, 8)} back to SOL`,
 			);
-			if (token && token.usd >= 0.1) {
-				log(
-					"executor",
-					`Auto-swapping claimed ${token.symbol || result.base_mint.slice(0, 8)} ($${token.usd.toFixed(2)}) back to SOL`,
-				);
-				await swapToken({
+			const autoSwapResult = await executeTool(
+				"swap_token",
+				{
 					input_mint: result.base_mint,
 					output_mint: "SOL",
-					amount: token.balance,
-				});
+					amount: swapAmount,
+				},
+				{
+					cycle_id: meta.cycle_id || null,
+					cycle_type: meta.cycle_type || null,
+					regime_label: meta.regime_label || null,
+					action_id: workflowId ? `${workflowId}:auto_swap_claim` : undefined,
+				},
+			);
+			if (autoSwapResult?.error || autoSwapResult?.blocked) {
+				log(
+					"executor_warn",
+					`Auto-swap after claim did not complete: ${autoSwapResult.error || autoSwapResult.reason || "unknown error"}`,
+				);
 			}
-		} catch (error) {
-			log("executor_warn", `Auto-swap after claim failed: ${error.message}`);
 		}
 	}
 }
@@ -605,27 +658,21 @@ export async function executeTool(name, args, meta = {}) {
 		return { error };
 	}
 
-	if (
-		name === "deploy_position" &&
-		normalizedArgs &&
-		normalizedArgs.initial_value_usd == null
-	) {
+	if (name === "deploy_position" && normalizedArgs) {
 		const wallet = await getWalletBalancesRuntime({}).catch(() => null);
 		const solPrice = Number(wallet?.sol_price) || 0;
-		const solLeg = Number(
-			normalizedArgs.amount_y ?? normalizedArgs.amount_sol ?? 0,
-		);
-		if (solPrice > 0 && solLeg > 0) {
-			normalizedArgs = {
-				...normalizedArgs,
-				initial_value_usd: estimateInitialValueUsd({
-					amountSol: solLeg,
-					solPrice,
-				}),
-			};
+		const solLeg = Number(normalizedArgs.amount_y ?? normalizedArgs.amount_sol ?? 0);
+		const derivedInitialValueUsd = solPrice > 0 && solLeg > 0
+			? estimateInitialValueUsd({ amountSol: solLeg, solPrice })
+			: null;
+		normalizedArgs = {
+			...normalizedArgs,
+			initial_value_usd: derivedInitialValueUsd,
+		};
+		if (derivedInitialValueUsd != null) {
 			log(
 				"executor",
-				`Derived initial_value_usd=$${normalizedArgs.initial_value_usd} from SOL leg for deploy_position`,
+				`Derived initial_value_usd=$${normalizedArgs.initial_value_usd} from runtime data for deploy_position`,
 			);
 		}
 	}
@@ -737,8 +784,14 @@ export async function executeTool(name, args, meta = {}) {
 					result,
 				});
 			}
-			await handleSuccessfulToolSideEffects(name, normalizedArgs, result);
-		}
+		await handleSuccessfulToolSideEffects(
+			name,
+			normalizedArgs,
+			result,
+			meta,
+			workflowId,
+		);
+	}
 
 		if (!success && WRITE_TOOLS.has(name)) {
 			const reason = result?.error || "write_tool_reported_unsuccessful_result";
@@ -790,23 +843,41 @@ export async function executeTool(name, args, meta = {}) {
  * Run safety checks before executing write operations.
  */
 export async function runSafetyChecks(name, args) {
-	switch (name) {
+		switch (name) {
 		case "deploy_position": {
 			const portfolioGuard = evaluatePortfolioGuard();
+			if (args?.pool_address) {
+				const governanceMetadata = await getPoolGovernanceMetadataRuntime({
+					pool_address: args.pool_address,
+				});
+				if (governanceMetadata?.error) {
+					return {
+						pass: false,
+						reason: `Deploy governance metadata unavailable: ${governanceMetadata.error}`,
+					};
+				}
+				args.base_mint = governanceMetadata.base_mint;
+				args.bin_step = governanceMetadata.bin_step;
+			}
 			const positions = await getMyPositionsRuntime({ force: true });
-			const balance = await getWalletBalancesRuntime();
-			const deployAdmission = evaluateDeployAdmission({
-				config,
-				poolAddress: args.pool_address,
-				baseMint: args.base_mint,
-				amountY: args.amount_y ?? args.amount_sol ?? 0,
-				amountX: args.amount_x ?? 0,
-				binStep: args.bin_step,
-				positions: positions.positions,
-				positionsCount: positions.total_positions,
-				walletSol: balance.sol,
-				portfolioGuard,
-				poolCooldown: getPoolDeployCooldown({
+			const trackedPositions = getTrackedPositions(true);
+				const combinedPositions = mergeOpenPositions(
+					positions.positions,
+					trackedPositions,
+				);
+				const balance = await getWalletBalancesRuntime();
+				const deployAdmission = evaluateDeployAdmission({
+					config,
+					poolAddress: args.pool_address,
+					baseMint: args.base_mint,
+					amountY: args.amount_y ?? args.amount_sol ?? 0,
+					amountX: args.amount_x ?? 0,
+					binStep: args.bin_step,
+					positions: combinedPositions,
+					positionsCount: combinedPositions.length,
+					walletSol: balance.sol,
+					portfolioGuard,
+					poolCooldown: getPoolDeployCooldown({
 					pool_address: args.pool_address,
 				}),
 			});

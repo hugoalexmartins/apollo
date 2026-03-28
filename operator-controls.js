@@ -12,6 +12,7 @@ function emptyState() {
     recovery_resume_override_until_ms: 0,
     recovery_resume_override_reason: null,
     recovery_resume_override_source: null,
+    recovery_resume_override_incident_key: null,
   };
 }
 
@@ -82,6 +83,7 @@ export function getRecoveryResumeOverrideStatus({ nowMs = Date.now() } = {}) {
     remaining_ms: remainingMs,
     reason: remainingMs > 0 ? state.recovery_resume_override_reason : null,
     source: remainingMs > 0 ? state.recovery_resume_override_source : null,
+    incident_key: remainingMs > 0 ? state.recovery_resume_override_incident_key : null,
   };
 }
 
@@ -99,6 +101,7 @@ export function clearRecoveryResumeOverride({ reason = "operator clear", nowMs =
   state.recovery_resume_override_until_ms = 0;
   state.recovery_resume_override_reason = null;
   state.recovery_resume_override_source = null;
+  state.recovery_resume_override_incident_key = null;
   saveState(state);
   appendOperatorAction({ type: "clear_recovery_resume_override", reason, was_active: wasActive });
   return getRecoveryResumeOverrideStatus({ nowMs });
@@ -109,6 +112,7 @@ export function acknowledgeRecoveryResume({
   source = "operator",
   report_status = null,
   cleared_guard_pause = false,
+  incident_key = null,
   override_minutes = 180,
   nowMs = Date.now(),
 } = {}) {
@@ -116,6 +120,7 @@ export function acknowledgeRecoveryResume({
   state.recovery_resume_override_until_ms = nowMs + Math.max(1, Number(override_minutes) || 180) * 60_000;
   state.recovery_resume_override_reason = reason || "manual resume";
   state.recovery_resume_override_source = source;
+  state.recovery_resume_override_incident_key = incident_key;
   saveState(state);
 
   appendOperatorAction({
@@ -124,6 +129,7 @@ export function acknowledgeRecoveryResume({
     source,
     report_status,
     cleared_guard_pause,
+    incident_key,
     override_minutes,
     override_until: new Date(state.recovery_resume_override_until_ms).toISOString(),
   });

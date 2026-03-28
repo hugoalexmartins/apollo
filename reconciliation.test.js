@@ -46,6 +46,53 @@ test("reconcileManagementEnvelope reports mismatch for divergent runtime actions
     },
   });
 
-  assert.equal(report.status, "mismatch");
-  assert.equal(report.mismatches[0].field, "terminalDecision");
+	assert.equal(report.status, "mismatch");
+	assert.equal(report.mismatches[0].field, "terminalDecision");
+});
+
+test("reconcileScreeningEnvelope replays deterministic skip decisions", () => {
+	const report = reconcileScreeningEnvelope({
+		cycle_id: "screen-skip-1",
+		status: "skipped_max_positions",
+		summary: {
+			total_positions: 3,
+			max_positions: 3,
+		},
+		admission_inputs: {
+			positionsCount: 3,
+			walletSol: 10,
+			config: {
+				risk: { maxPositions: 3 },
+				management: { deployAmountSol: 0.5, gasReserve: 0.1 },
+			},
+		},
+	});
+
+	assert.equal(report.status, "match");
+	assert.deepEqual(report.mismatches, []);
+});
+
+test("reconcileManagementEnvelope replays overlap skip decisions", () => {
+	const report = reconcileManagementEnvelope({
+		cycle_id: "manage-skip-1",
+		status: "skipped_overlap",
+		summary: {
+			overlap_with: "screening",
+		},
+		overlap_inputs: {
+			cycleType: "management",
+			managementBusy: false,
+			screeningBusy: true,
+		},
+	}, {
+		management: {
+			emergencyPriceDropPct: -50,
+			takeProfitFeePct: 5,
+			minFeePerTvl24h: 7,
+			minClaimAmount: 5,
+		},
+	});
+
+	assert.equal(report.status, "match");
+	assert.deepEqual(report.mismatches, []);
 });

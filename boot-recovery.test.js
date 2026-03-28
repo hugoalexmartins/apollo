@@ -5,10 +5,16 @@ import path from "node:path";
 import test from "node:test";
 
 import { appendActionLifecycle, foldActionJournal, readActionJournal, setActionJournalPathForTests } from "./action-journal.js";
-import { formatRecoveryWorkflowReport, getRecoveryWorkflowReport, runBootRecovery, summarizeRecoveryBlock } from "./boot-recovery.js";
+import {
+	formatRecoveryWorkflowReport,
+	getRecoveryWorkflowReport,
+	isBootRecoveryOverrideAllowed,
+	runBootRecovery,
+	summarizeRecoveryBlock,
+} from "./boot-recovery.js";
 import { getTrackedPositions } from "./state.js";
 
-test("boot recovery completes rebalance when replacement is observable", async () => {
+test("boot recovery parks rebalance for manual review even when replacement is observable", async () => {
   const originalCwd = process.cwd();
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "zenith-boot-recovery-rebalance-complete-test-"));
   const journalPath = path.join(tempDir, "data", "workflow-actions.jsonl");
@@ -35,21 +41,20 @@ test("boot recovery completes rebalance when replacement is observable", async (
       observeTrackedPositions: async () => [],
     });
 
-    assert.equal(decision.suppress_autonomous_writes, false);
-    assert.equal(decision.completed_on_boot_workflows.length, 1);
-    assert.equal(decision.completed_on_boot_workflows[0], "cycle-1:rebalance_on_exit:1");
+		assert.equal(decision.suppress_autonomous_writes, true);
+		assert.equal(decision.parked_manual_review_workflows.includes("cycle-1:rebalance_on_exit:1"), true);
 
-    const folded = foldActionJournal(readActionJournal().entries);
-    const resolved = folded.find((workflow) => workflow.workflow_id === "cycle-1:rebalance_on_exit:1");
-    assert.equal(resolved.lifecycle, "completed");
-  } finally {
+		const folded = foldActionJournal(readActionJournal().entries);
+		const resolved = folded.find((workflow) => workflow.workflow_id === "cycle-1:rebalance_on_exit:1");
+		assert.equal(resolved.lifecycle, "manual_review");
+	} finally {
     setActionJournalPathForTests(null);
     process.chdir(originalCwd);
     fs.rmSync(tempDir, { recursive: true, force: true });
   }
 });
 
-test("boot recovery resolves deploy intent by observed target-pool position", async () => {
+test("boot recovery parks deploy intent for manual review even when the target pool is observable", async () => {
   const originalCwd = process.cwd();
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "zenith-boot-recovery-deploy-resolution-test-"));
   const journalPath = path.join(tempDir, "data", "workflow-actions.jsonl");
@@ -75,8 +80,8 @@ test("boot recovery resolves deploy intent by observed target-pool position", as
       observeTrackedPositions: async () => [],
     });
 
-    assert.equal(decision.suppress_autonomous_writes, false);
-    assert.equal(decision.completed_on_boot_workflows[0], "cycle-3:deploy_position:1");
+		assert.equal(decision.suppress_autonomous_writes, true);
+		assert.equal(decision.parked_manual_review_workflows.includes("cycle-3:deploy_position:1"), true);
 
     appendActionLifecycle({
       workflow_id: "cycle-4:deploy_position:1",
@@ -97,11 +102,11 @@ test("boot recovery resolves deploy intent by observed target-pool position", as
     assert.equal(decision.parked_manual_review_workflows.includes("cycle-4:deploy_position:1"), true);
 
     const folded = foldActionJournal(readActionJournal().entries);
-    const deployComplete = folded.find((workflow) => workflow.workflow_id === "cycle-3:deploy_position:1");
-    const deployManual = folded.find((workflow) => workflow.workflow_id === "cycle-4:deploy_position:1");
-    assert.equal(deployComplete.lifecycle, "completed");
-    assert.equal(deployManual.lifecycle, "manual_review");
-  } finally {
+		const deployComplete = folded.find((workflow) => workflow.workflow_id === "cycle-3:deploy_position:1");
+		const deployManual = folded.find((workflow) => workflow.workflow_id === "cycle-4:deploy_position:1");
+		assert.equal(deployComplete.lifecycle, "manual_review");
+		assert.equal(deployManual.lifecycle, "manual_review");
+	} finally {
     setActionJournalPathForTests(null);
     process.chdir(originalCwd);
     fs.rmSync(tempDir, { recursive: true, force: true });
@@ -144,7 +149,42 @@ test("boot recovery resolves close intent when target position is no longer open
     setActionJournalPathForTests(null);
     process.chdir(originalCwd);
     fs.rmSync(tempDir, { recursive: true, force: true });
-  }
+	}
+});
+
+test("boot recovery blocks autonomous writes when open-position observation is invalid", async () => {
+	const originalCwd = process.cwd();
+	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "zenith-boot-recovery-open-positions-invalid-test-"));
+	const journalPath = path.join(tempDir, "data", "workflow-actions.jsonl");
+
+	try {
+		process.chdir(tempDir);
+		fs.mkdirSync(path.join(tempDir, "logs"), { recursive: true });
+		setActionJournalPathForTests(journalPath);
+
+		appendActionLifecycle({
+			workflow_id: "cycle-invalid:close_position:1",
+			lifecycle: "intent",
+			tool: "close_position",
+			cycle_id: "cycle-invalid",
+			action_id: "cycle-invalid:close_position:1",
+			position_address: "pos-invalid-1",
+		});
+
+		const decision = await runBootRecovery({
+			observeOpenPositions: async () => ({ positions: [], error: "rpc unavailable" }),
+			observeTrackedPositions: async () => [],
+		});
+
+		assert.equal(decision.suppress_autonomous_writes, true);
+		assert.equal(decision.reason_code, "OPEN_POSITIONS_INVALID");
+		assert.equal(decision.parked_manual_review_workflows.includes("cycle-invalid:close_position:1"), true);
+		assert.equal(decision.observed.open_positions_invalid, true);
+	} finally {
+		setActionJournalPathForTests(null);
+		process.chdir(originalCwd);
+		fs.rmSync(tempDir, { recursive: true, force: true });
+	}
 });
 
 test("invalid state.json does not erase journal-based recovery gating", async () => {
@@ -316,4 +356,49 @@ test("summarizeRecoveryBlock distinguishes journal corruption from manual-review
   });
   assert.match(manualReview.headline, /manual_review/i);
   assert.match(manualReview.detail, /cycle-1:rebalance_on_exit:1/i);
+
+	const invalidObservation = summarizeRecoveryBlock({
+		reason_code: "OPEN_POSITIONS_INVALID",
+		observed: { open_positions_error: "rpc unavailable" },
+	});
+	assert.match(invalidObservation.headline, /open-position observation is invalid/i);
+	assert.match(invalidObservation.detail, /rpc unavailable/i);
+});
+
+test("boot recovery override is only allowed for unresolved workflow blocks", () => {
+	assert.equal(
+		isBootRecoveryOverrideAllowed(
+			{ suppress_autonomous_writes: true, reason_code: "UNRESOLVED_WORKFLOW", incident_key: "wf-1|wf-2" },
+			{ active: true, incident_key: "wf-1|wf-2" },
+		),
+		true,
+	);
+	assert.equal(
+		isBootRecoveryOverrideAllowed(
+			{ suppress_autonomous_writes: true, reason_code: "OPEN_POSITIONS_INVALID", incident_key: null },
+			{ active: true, incident_key: "wf-1|wf-2" },
+		),
+		false,
+	);
+	assert.equal(
+		isBootRecoveryOverrideAllowed(
+			{ suppress_autonomous_writes: true, reason_code: "JOURNAL_INVALID", incident_key: null },
+			{ active: true, incident_key: "wf-1|wf-2" },
+		),
+		false,
+	);
+	assert.equal(
+		isBootRecoveryOverrideAllowed(
+			{ suppress_autonomous_writes: false, reason_code: null, incident_key: null },
+			{ active: true, incident_key: "wf-1|wf-2" },
+		),
+		false,
+	);
+	assert.equal(
+		isBootRecoveryOverrideAllowed(
+			{ suppress_autonomous_writes: true, reason_code: "UNRESOLVED_WORKFLOW", incident_key: "wf-1|wf-2" },
+			{ active: true, incident_key: "wf-3" },
+		),
+		false,
+	);
 });

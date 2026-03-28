@@ -1,6 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
 
+import { appendJsonlRecordSync } from "./durable-store.js";
+
 const JOURNAL_DIR = "./data";
 const DEFAULT_JOURNAL_FILE = "workflow-actions.jsonl";
 const LIFECYCLE_STATES = new Set([
@@ -29,17 +31,10 @@ export function appendActionLifecycle(record) {
     throw new Error(`invalid lifecycle state: ${record.lifecycle}`);
   }
 
-  const line = JSON.stringify({
-    ts: new Date().toISOString(),
-    ...record,
-  });
-
-  const targetPath = getActionJournalPath();
-  const parentDir = path.dirname(targetPath);
-  if (!fs.existsSync(parentDir)) {
-    fs.mkdirSync(parentDir, { recursive: true });
-  }
-  fs.appendFileSync(targetPath, `${line}\n`);
+	appendJsonlRecordSync(getActionJournalPath(), {
+		ts: new Date().toISOString(),
+		...record,
+	});
 }
 
 export function readActionJournal() {
@@ -110,6 +105,25 @@ export function foldActionJournal(entries) {
 }
 
 export function listActionJournalEntries(limit = 20) {
-  const journal = readActionJournal();
-  return journal.entries.slice(-limit).reverse();
+	const journal = readActionJournal();
+	return journal.entries.slice(-limit).reverse();
+}
+
+export function listActionJournalWorkflowsByCycle(cycleId, limit = 20) {
+	if (!cycleId) return [];
+	return foldActionJournal(readActionJournal().entries)
+		.filter((workflow) => workflow.cycle_id === cycleId)
+		.slice(-limit)
+		.map((workflow) => ({
+			workflow_id: workflow.workflow_id,
+			tool: workflow.tool,
+			lifecycle: workflow.lifecycle,
+			position_address: workflow.position_address,
+			pool_address: workflow.pool_address,
+			last_ts: workflow.last_ts,
+			reason:
+				Array.isArray(workflow.history) && workflow.history.length > 0
+					? workflow.history[workflow.history.length - 1].reason || null
+					: null,
+		}));
 }

@@ -4,7 +4,12 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { appendReplayEnvelope, createActionId, createCycleId } from "./cycle-trace.js";
+import {
+	appendReplayEnvelope,
+	createActionId,
+	createCycleId,
+	readReplayEnvelopes,
+} from "./cycle-trace.js";
 
 test("cycle trace creates stable ids and writes replay envelopes", () => {
   const originalCwd = process.cwd();
@@ -35,5 +40,21 @@ test("cycle trace creates stable ids and writes replay envelopes", () => {
   } finally {
     process.chdir(originalCwd);
     fs.rmSync(tempDir, { recursive: true, force: true });
-  }
+	}
+});
+
+test("cycle trace fails loudly on malformed replay lines", () => {
+	const originalCwd = process.cwd();
+	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "zenith-trace-invalid-test-"));
+
+	try {
+		process.chdir(tempDir);
+		const logDir = path.join(tempDir, "logs");
+		fs.mkdirSync(logDir, { recursive: true });
+		fs.writeFileSync(path.join(logDir, "replay-2026-03-27.jsonl"), "{bad json\n");
+		assert.throws(() => readReplayEnvelopes(), /invalid replay envelope/i);
+	} finally {
+		process.chdir(originalCwd);
+		fs.rmSync(tempDir, { recursive: true, force: true });
+	}
 });

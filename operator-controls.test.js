@@ -53,6 +53,7 @@ test("operator controls persist arm and resume override state across reload-styl
     acknowledgeRecoveryResume({
       reason: "manual review complete",
       source: "test",
+      incident_key: "wf-1|wf-2",
       override_minutes: 30,
       nowMs,
     });
@@ -61,6 +62,7 @@ test("operator controls persist arm and resume override state across reload-styl
     assert.equal(overrideStatus.active, true);
     assert.match(overrideStatus.reason || "", /manual review complete/i);
     assert.equal(overrideStatus.source, "test");
+    assert.equal(overrideStatus.incident_key, "wf-1|wf-2");
 
     const snapshot = getOperatorControlSnapshot({ nowMs: nowMs + 5 * 60_000, recentActionLimit: 2 });
     assert.equal(snapshot.general_write_arm.armed, false);
@@ -70,6 +72,7 @@ test("operator controls persist arm and resume override state across reload-styl
     const stateRaw = JSON.parse(fs.readFileSync(path.join(tempDir, "data", "operator-state.json"), "utf8"));
     assert.equal(stateRaw.general_write_arm_reason, "persist arm");
     assert.equal(typeof stateRaw.recovery_resume_override_until_ms, "number");
+    assert.equal(stateRaw.recovery_resume_override_incident_key, "wf-1|wf-2");
   } finally {
     process.chdir(originalCwd);
     fs.rmSync(tempDir, { recursive: true, force: true });

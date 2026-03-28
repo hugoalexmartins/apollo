@@ -24,13 +24,21 @@ import { getStartupSnapshot } from "./startup-snapshot.js";
 import { runManagementRuntimeActions } from "./management-runtime.js";
 import { listEvidenceBundles, writeEvidenceBundle } from "./evidence-bundles.js";
 import { getEvidenceBundle } from "./evidence-bundles.js";
-import { getRecoveryWorkflowReport, runBootRecovery, summarizeRecoveryBlock } from "./boot-recovery.js";
+import {
+	getRecoveryWorkflowReport,
+	isBootRecoveryOverrideAllowed,
+	runBootRecovery,
+	summarizeRecoveryBlock,
+} from "./boot-recovery.js";
 import { getOverlappingCycleType, shouldTriggerFollowOnScreening } from "./cycle-overlap.js";
 import { clearPortfolioGuardPause, evaluatePortfolioGuard } from "./portfolio-guards.js";
 import { acknowledgeRecoveryResume, armGeneralWriteTools, disarmGeneralWriteTools, getOperatorControlSnapshot } from "./operator-controls.js";
 import { updateRuntimeHealth } from "./runtime-health.js";
 import { formatReplayReview, getReplayEnvelope, getReplayReview, getReplayReviewStats } from "./replay-review.js";
-import { listActionJournalEntries } from "./action-journal.js";
+import {
+	listActionJournalEntries,
+	listActionJournalWorkflowsByCycle,
+} from "./action-journal.js";
 import { getNegativeRegimeMemory } from "./negative-regime-memory.js";
 import { handleOperatorCommandText } from "./operator-command-handlers.js";
 import {
@@ -88,9 +96,10 @@ const bootRecovery = await runBootRecovery({
 });
 
 const recoveryResumeOverride = getOperatorControlSnapshot().recovery_resume_override;
-const bootRecoveryOverrideActive = bootRecovery.suppress_autonomous_writes
-  && bootRecovery.reason_code !== "JOURNAL_INVALID"
-  && recoveryResumeOverride.active;
+const bootRecoveryOverrideActive = isBootRecoveryOverrideAllowed(
+	bootRecovery,
+	recoveryResumeOverride,
+);
 const bootRecoveryBlockActive = bootRecovery.suppress_autonomous_writes && !bootRecoveryOverrideActive;
 
 if (bootRecoveryOverrideActive) {
@@ -103,7 +112,12 @@ if (bootRecoveryOverrideActive) {
   const reason = bootRecovery.reason_code === "JOURNAL_INVALID"
     ? `action journal invalid (${bootRecovery.journal_parse_errors.length} parse error(s))`
     : `manual review required for ${bootRecovery.parked_manual_review_workflows.length} workflow(s)`;
-  setAutonomousWriteSuppression({ suppressed: true, reason });
+  setAutonomousWriteSuppression({
+		suppressed: true,
+		reason,
+		code: bootRecovery.reason_code,
+		incidentKey: bootRecovery.incident_key,
+	});
   log("recovery_block", `Autonomous write activity suppressed at boot: ${reason}`);
 } else {
   setAutonomousWriteSuppression({ suppressed: false });
@@ -217,8 +231,8 @@ export function startCronJobs() {
     getWalletBalances,
     validateStartupSnapshot,
     classifyRuntimeFailure,
-    appendReplayEnvelope,
-    writeEvidenceBundle,
+		appendReplayEnvelope,
+		writeEvidenceBundle,
     enforceManagementIntervalFromPositions,
     recordPositionSnapshot,
     getPositionPnl,
@@ -227,8 +241,9 @@ export function startCronJobs() {
     isPnlSignalStale,
     updatePnlAndCheckExits,
     evaluatePortfolioGuard,
-    runManagementRuntimeActions,
-    executeTool,
+		runManagementRuntimeActions,
+		listActionJournalWorkflowsByCycle,
+		executeTool,
     didRuntimeHandleManagementAction,
     classifyManagementModelGate,
     summarizeRuntimeActionResult,
@@ -286,8 +301,9 @@ export function startCronJobs() {
     getRiskSizingMultiplier,
     getNegativeRegimeCooldown,
     getNegativeRegimeMemory,
-    appendCounterfactualReview,
-    recordCycleEvaluation,
+		appendCounterfactualReview,
+		listActionJournalWorkflowsByCycle,
+		recordCycleEvaluation,
     refreshRuntimeHealth,
     telegramEnabled,
     sendMessage,
@@ -302,11 +318,25 @@ export function startCronJobs() {
       managementBusy: _managementBusy,
       screeningBusy: _screeningBusy,
     });
-    if (overlapWith) {
-      const cycleId = createCycleId("management");
-      log("cron", `Management skipped due to overlap with ${overlapWith} cycle`);
-      recordCycleEvaluation({
-        cycle_id: cycleId,
+		if (overlapWith) {
+			const cycleId = createCycleId("management");
+			log("cron", `Management skipped due to overlap with ${overlapWith} cycle`);
+			appendReplayEnvelope({
+				cycle_id: cycleId,
+				cycle_type: "management",
+				status: "skipped_overlap",
+				summary: {
+					overlap_with: overlapWith,
+				},
+				overlap_inputs: {
+					cycleType: "management",
+					managementBusy: _managementBusy,
+					screeningBusy: _screeningBusy,
+				},
+				write_workflows: listActionJournalWorkflowsByCycle(cycleId),
+			});
+			recordCycleEvaluation({
+				cycle_id: cycleId,
         cycle_type: "management",
         status: "skipped_overlap",
         summary: {
@@ -335,11 +365,25 @@ export function startCronJobs() {
       managementBusy: _managementBusy,
       screeningBusy: _screeningBusy,
     });
-    if (overlapWith) {
-      const cycleId = createCycleId("screening");
-      log("cron", `Screening skipped due to overlap with ${overlapWith} cycle`);
-      recordCycleEvaluation({
-        cycle_id: cycleId,
+		if (overlapWith) {
+			const cycleId = createCycleId("screening");
+			log("cron", `Screening skipped due to overlap with ${overlapWith} cycle`);
+			appendReplayEnvelope({
+				cycle_id: cycleId,
+				cycle_type: "screening",
+				status: "skipped_overlap",
+				summary: {
+					overlap_with: overlapWith,
+				},
+				overlap_inputs: {
+					cycleType: "screening",
+					managementBusy: _managementBusy,
+					screeningBusy: _screeningBusy,
+				},
+				write_workflows: listActionJournalWorkflowsByCycle(cycleId),
+			});
+			recordCycleEvaluation({
+				cycle_id: cycleId,
         cycle_type: "screening",
         status: "skipped_overlap",
         summary: {

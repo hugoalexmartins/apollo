@@ -1,6 +1,11 @@
 import fs from "node:fs";
 import path from "node:path";
 
+import {
+	readJsonSnapshotWithBackupSync,
+	writeJsonSnapshotAtomicSync,
+} from "./durable-store.js";
+
 const DATA_DIR = "./data";
 const HEALTH_FILE = path.join(DATA_DIR, "runtime-health.json");
 
@@ -22,22 +27,22 @@ function emptyHealth() {
 }
 
 function loadRuntimeHealth() {
-  if (!fs.existsSync(HEALTH_FILE)) return emptyHealth();
-  try {
-    return {
-      ...emptyHealth(),
-      ...JSON.parse(fs.readFileSync(HEALTH_FILE, "utf8")),
-    };
-  } catch {
-    return emptyHealth();
-  }
+	const snapshot = readJsonSnapshotWithBackupSync(HEALTH_FILE);
+	if (!snapshot.value) {
+		return {
+			...emptyHealth(),
+			parse_error: snapshot.error || null,
+		};
+}
+	return {
+		...emptyHealth(),
+		...snapshot.value,
+		loaded_from_backup: snapshot.source === "backup",
+	};
 }
 
 function saveRuntimeHealth(health) {
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-  }
-  fs.writeFileSync(HEALTH_FILE, JSON.stringify(health, null, 2));
+	writeJsonSnapshotAtomicSync(HEALTH_FILE, health);
 }
 
 export function getRuntimeHealth() {
@@ -66,9 +71,15 @@ export function updateRuntimeHealth(patch = {}) {
 export function formatRuntimeHealthReport(health = getRuntimeHealth()) {
   const lines = ["", "Runtime health:", ""];
   lines.push(`  updated_at: ${health.updated_at || "never"}`);
-  if (health.startup) {
-    lines.push(`  startup: ${health.startup.status}${health.startup.reason ? ` / ${health.startup.reason}` : ""}`);
-  }
+	if (health.startup) {
+		lines.push(`  startup: ${health.startup.status}${health.startup.reason ? ` / ${health.startup.reason}` : ""}`);
+	}
+	if (health.parse_error) {
+		lines.push(`  parse_error: ${health.parse_error}`);
+	}
+	if (health.loaded_from_backup) {
+		lines.push("  loaded_from_backup: true");
+	}
   for (const [cycleType, cycle] of Object.entries(health.cycles || {})) {
     if (!cycle) continue;
     lines.push(`  ${cycleType}_cycle: ${cycle.status}${cycle.reason ? ` / ${cycle.reason}` : ""}${cycle.at ? ` / ${cycle.at}` : ""}`);

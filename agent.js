@@ -4,8 +4,8 @@ import { executeTool } from "./tools/executor.js";
 import { tools } from "./tools/definitions.js";
 import { createActionId } from "./cycle-trace.js";
 
-const MANAGER_TOOLS  = new Set(["close_position", "claim_fees", "rebalance_on_exit", "auto_compound_fees", "swap_token", "update_config", "get_position_pnl", "get_my_positions", "set_position_note", "add_pool_note", "get_wallet_balance", "get_pool_info", "score_top_lpers", "choose_distribution_strategy", "calculate_dynamic_bin_tiers", "remember_fact", "recall_memory"]);
-const SCREENER_TOOLS = new Set(["deploy_position", "get_active_bin", "get_top_candidates", "check_smart_wallets_on_pool", "get_token_holders", "get_token_narrative", "get_token_info", "search_pools", "get_pool_memory", "add_pool_note", "add_to_blacklist", "update_config", "get_wallet_balance", "get_my_positions", "get_pool_info", "score_top_lpers", "choose_distribution_strategy", "calculate_dynamic_bin_tiers", "remember_fact", "recall_memory"]);
+const MANAGER_TOOLS  = new Set(["close_position", "claim_fees", "rebalance_on_exit", "auto_compound_fees", "swap_token", "get_position_pnl", "get_my_positions", "set_position_note", "add_pool_note", "get_wallet_balance", "get_pool_info", "score_top_lpers", "choose_distribution_strategy", "calculate_dynamic_bin_tiers", "remember_fact", "recall_memory"]);
+const SCREENER_TOOLS = new Set(["deploy_position", "get_active_bin", "get_top_candidates", "check_smart_wallets_on_pool", "get_token_holders", "get_token_narrative", "get_token_info", "search_pools", "get_pool_memory", "add_pool_note", "add_to_blacklist", "get_wallet_balance", "get_my_positions", "get_pool_info", "score_top_lpers", "choose_distribution_strategy", "calculate_dynamic_bin_tiers", "remember_fact", "recall_memory"]);
 const GENERAL_SAFE_TOOLS = new Set([
   "discover_pools",
   "get_top_candidates",
@@ -39,8 +39,12 @@ const GENERAL_SAFE_TOOLS = new Set([
 export function getToolsForRole(agentType, { allowDangerousTools = false } = {}) {
   if (agentType === "MANAGER")  return tools.filter(t => MANAGER_TOOLS.has(t.function.name));
   if (agentType === "SCREENER") return tools.filter(t => SCREENER_TOOLS.has(t.function.name));
-  if (allowDangerousTools) return tools;
+  if (allowDangerousTools) return tools.filter((tool) => tool.function.name !== "self_update");
   return tools.filter((t) => GENERAL_SAFE_TOOLS.has(t.function.name));
+}
+
+export function limitToolCallsPerTurn(toolCalls = []) {
+  return Array.isArray(toolCalls) && toolCalls.length > 0 ? [toolCalls[0]] : [];
 }
 import { getWalletBalances } from "./tools/wallet.js";
 import { getMyPositions } from "./tools/dlmm.js";
@@ -138,37 +142,41 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
         return { content: msg.content, userMessage: goal };
       }
 
-      // Execute each tool call in parallel
-      const toolResults = await Promise.all(msg.tool_calls.map(async (toolCall) => {
-        const functionName = toolCall.function.name;
-        let functionArgs;
+      const immediateToolCalls = limitToolCallsPerTurn(msg.tool_calls);
+      if (msg.tool_calls.length > immediateToolCalls.length) {
+        log(
+          "agent",
+          `Deferring ${msg.tool_calls.length - immediateToolCalls.length} additional tool call(s) until the model sees the first tool result`,
+        );
+      }
 
-        try {
-          functionArgs = JSON.parse(toolCall.function.arguments);
-        } catch (parseError) {
-          log("error", `Failed to parse args for ${functionName}: ${parseError.message}`);
-          functionArgs = {};
-        }
+      const toolCall = immediateToolCalls[0];
+      const functionName = toolCall.function.name;
+      let functionArgs;
 
-        const toolMeta = {};
-        if (options.toolContext?.cycle_id) {
-          toolMeta.cycle_id = options.toolContext.cycle_id;
-          toolMeta.cycle_type = options.toolContext.cycle_type || null;
-          toolMeta.regime_label = options.toolContext.regime_label || null;
-          toolMeta.action_id = createActionId(options.toolContext.cycle_id, functionName, toolActionIndex);
-          toolActionIndex += 1;
-        }
+      try {
+        functionArgs = JSON.parse(toolCall.function.arguments);
+      } catch (parseError) {
+        log("error", `Failed to parse args for ${functionName}: ${parseError.message}`);
+        functionArgs = {};
+      }
 
-        const result = await executeTool(functionName, functionArgs, toolMeta);
+      const toolMeta = {};
+      if (options.toolContext?.cycle_id) {
+        toolMeta.cycle_id = options.toolContext.cycle_id;
+        toolMeta.cycle_type = options.toolContext.cycle_type || null;
+        toolMeta.regime_label = options.toolContext.regime_label || null;
+        toolMeta.action_id = createActionId(options.toolContext.cycle_id, functionName, toolActionIndex);
+        toolActionIndex += 1;
+      }
 
-        return {
-          role: "tool",
-          tool_call_id: toolCall.id,
-          content: JSON.stringify(result),
-        };
-      }));
+      const result = await executeTool(functionName, functionArgs, toolMeta);
 
-      messages.push(...toolResults);
+      messages.push({
+        role: "tool",
+        tool_call_id: toolCall.id,
+        content: JSON.stringify(result),
+      });
     } catch (error) {
       log("error", `Agent loop error at step ${step}: ${error.message}`);
 

@@ -35,8 +35,9 @@ export function createScreeningCycleRunner(deps) {
       getRiskSizingMultiplier,
       getNegativeRegimeCooldown,
       getNegativeRegimeMemory,
-      appendCounterfactualReview,
-      recordCycleEvaluation,
+		appendCounterfactualReview,
+		listActionJournalWorkflowsByCycle,
+		recordCycleEvaluation,
       refreshRuntimeHealth,
       telegramEnabled,
       sendMessage,
@@ -57,9 +58,9 @@ export function createScreeningCycleRunner(deps) {
         summary: { reason_code: failure.reason_code, error: failure.message },
         candidates: [],
       });
-      appendReplayEnvelope({
-        cycle_id: cycleId,
-        cycle_type: "screening",
+		appendReplayEnvelope({
+			cycle_id: cycleId,
+			cycle_type: "screening",
         reason_code: failure.reason_code,
         error: failure.message,
       });
@@ -101,11 +102,24 @@ export function createScreeningCycleRunner(deps) {
         config,
         portfolioGuard,
       });
-      if (!screeningAdmission.allowed) {
-        log("cron", screeningAdmission.log_message);
-        recordCycleEvaluation({
-          cycle_id: cycleId,
-          cycle_type: "screening",
+		if (!screeningAdmission.allowed) {
+			log("cron", screeningAdmission.log_message);
+			appendReplayEnvelope({
+				cycle_id: cycleId,
+				cycle_type: "screening",
+				status: screeningAdmission.status,
+				summary: screeningAdmission.summary,
+				admission_inputs: {
+					positionsCount: prePositions.total_positions,
+					walletSol: preBalance.sol,
+					config,
+					portfolioGuard,
+				},
+				write_workflows: listActionJournalWorkflowsByCycle(cycleId),
+			});
+			recordCycleEvaluation({
+				cycle_id: cycleId,
+				cycle_type: "screening",
           status: screeningAdmission.status,
           summary: screeningAdmission.summary,
           candidates: [],
@@ -163,9 +177,9 @@ export function createScreeningCycleRunner(deps) {
       const activeStrategy = getActiveStrategy();
       const strategyKey = activeStrategy?.lp_strategy || "bid_ask";
 
-      if (deployAmount <= 0) {
-        log("cron", "Screening skipped - adaptive sizing returned 0 deploy amount");
-        screeningEvaluation = {
+		if (deployAmount <= 0) {
+			log("cron", "Screening skipped - adaptive sizing returned 0 deploy amount");
+			screeningEvaluation = {
           cycle_id: cycleId,
           cycle_type: "screening",
           status: "skipped_sizing_floor",
@@ -176,10 +190,26 @@ export function createScreeningCycleRunner(deps) {
             reserve_sol: roundMetric(config.management.gasReserve),
             deploy_floor_sol: roundMetric(config.management.deployAmountSol),
           },
-          candidates: [],
-        };
-        return;
-      }
+				candidates: [],
+			};
+			appendReplayEnvelope({
+				cycle_id: cycleId,
+				cycle_type: "screening",
+				status: "skipped_sizing_floor",
+				summary: screeningEvaluation.summary,
+				sizing_inputs: {
+					regime: regimeContext.regime,
+					wallet_sol: currentBalance.sol,
+					reserve_sol: config.management.gasReserve,
+					deploy_floor_sol: config.management.deployAmountSol,
+					regime_multiplier: regimeContext.pack.deploy.regime_multiplier,
+					performance_multiplier: performanceMultiplier,
+					risk_multiplier: riskMultiplier,
+				},
+				write_workflows: listActionJournalWorkflowsByCycle(cycleId),
+			});
+			return;
+		}
 
       const strategyBlock = activeStrategy
         ? `ACTIVE STRATEGY: ${activeStrategy.name} - LP: ${activeStrategy.lp_strategy} | bins_above: ${activeStrategy.range?.bins_above ?? 0} (FIXED - never change) | deposit: ${activeStrategy.entry?.single_side === "sol" ? "SOL only (amount_y, amount_x=0)" : "dual-sided"} | best for: ${activeStrategy.best_for}`
@@ -275,10 +305,10 @@ export function createScreeningCycleRunner(deps) {
       const finalists = shortlist.slice(0, Math.min(2, shortlist.length));
       const scorePreloadLimit = finalists.length;
 
-      if (shortlist.length === 0) {
-        log("cron", "Screening skipped - no eligible candidates after deterministic filters");
-        screenReport = "Screening skipped - no eligible candidates passed deterministic filters.";
-        screeningEvaluation = {
+		if (shortlist.length === 0) {
+			log("cron", "Screening skipped - no eligible candidates after deterministic filters");
+			screenReport = "Screening skipped - no eligible candidates passed deterministic filters.";
+			screeningEvaluation = {
           cycle_id: cycleId,
           cycle_type: "screening",
           status: "skipped_no_candidates",
@@ -287,10 +317,22 @@ export function createScreeningCycleRunner(deps) {
             total_eligible: totalEligible,
             blocked_summary: blockedSummary,
           },
-          candidates: [],
-        };
-        return;
-      }
+				candidates: [],
+			};
+			appendReplayEnvelope({
+				cycle_id: cycleId,
+				cycle_type: "screening",
+				status: "skipped_no_candidates",
+				summary: screeningEvaluation.summary,
+				total_screened: screeningTopCandidates?.total_screened ?? 0,
+				candidate_inputs: screeningTopCandidates?.candidate_inputs || [],
+				occupied_pools: screeningTopCandidates?.occupied_pools || [],
+				occupied_mints: screeningTopCandidates?.occupied_mints || [],
+				shortlist_limit: Math.min(5, candidates.length),
+				write_workflows: listActionJournalWorkflowsByCycle(cycleId),
+			});
+			return;
+		}
 
       candidateEvaluations = shortlist.map((pool) => ({
         pool: pool.pool,
@@ -484,13 +526,14 @@ STEPS:
         occupied_pools: screeningTopCandidates?.occupied_pools || [],
         occupied_mints: screeningTopCandidates?.occupied_mints || [],
         candidate_inputs: screeningTopCandidates?.candidate_inputs || [],
-        shortlist: shortlist.map((pool) => ({
-          pool: pool.pool,
-          name: pool.name,
-          ranking_score: pool.deterministic_score,
-        })),
-        total_eligible: totalEligible,
-      });
+			shortlist: shortlist.map((pool) => ({
+				pool: pool.pool,
+				name: pool.name,
+				ranking_score: pool.deterministic_score,
+			})),
+			total_eligible: totalEligible,
+			write_workflows: listActionJournalWorkflowsByCycle(cycleId),
+		});
     } catch (error) {
       log("cron_error", `Screening cycle failed: ${error.message}`);
       screenReport = `Screening cycle failed: ${error.message}`;

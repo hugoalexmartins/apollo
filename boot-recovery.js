@@ -44,13 +44,7 @@ function toTrackedOpenPositions(trackedPositionsPayload) {
 
 function resolveWorkflowByObservation(workflow, observed) {
   if (workflow.tool === "deploy_position") {
-    const hasOpenInTargetPool = Boolean(
-      workflow.pool_address
-      && observed.openPools.has(workflow.pool_address)
-    );
-    return hasOpenInTargetPool
-      ? { lifecycle: "completed", reason: "open_position_observed_in_target_pool" }
-      : { lifecycle: "manual_review", reason: "deploy_intent_not_observed_in_target_pool" };
+    return { lifecycle: "manual_review", reason: "deploy_intent_requires_manual_review" };
   }
 
   if (workflow.tool === "close_position") {
@@ -64,20 +58,7 @@ function resolveWorkflowByObservation(workflow, observed) {
   }
 
   if (workflow.tool === "rebalance_on_exit") {
-    const oldPositionClosed = !workflow.position_address
-      || !observed.openPositions.has(workflow.position_address);
-    const replacementObserved = Boolean(
-      workflow.pool_address
-      && observed.openPoolPositions
-      .get(workflow.pool_address)
-      ?.some((positionAddress) => positionAddress !== workflow.position_address)
-    );
-
-    if (oldPositionClosed && replacementObserved) {
-      return { lifecycle: "completed", reason: "rebalance_replacement_position_observed" };
-    }
-
-    return { lifecycle: "manual_review", reason: "rebalance_outcome_not_fully_observable" };
+    return { lifecycle: "manual_review", reason: "rebalance_outcome_requires_manual_review" };
   }
 
   return { lifecycle: "manual_review", reason: "write_intent_not_resolvable_from_boot_observations" };
@@ -109,6 +90,19 @@ function formatJournalParseError(error) {
   return `line ${error.line}: ${error.error}`;
 }
 
+function createRecoveryIncidentKey(workflows = []) {
+	const ids = (Array.isArray(workflows) ? workflows : [])
+		.filter(Boolean)
+		.map((workflow) => typeof workflow === "string" ? workflow : workflow.workflow_id)
+		.filter(Boolean)
+		.sort();
+	return ids.length > 0 ? ids.join("|") : null;
+}
+
+function isValidOpenPositionObservation(payload) {
+  return !payload?.error && Array.isArray(payload?.positions);
+}
+
 export function getRecoveryWorkflowReport({ limit = 10 } = {}) {
   const journal = readActionJournal();
   const folded = foldActionJournal(journal.entries);
@@ -130,6 +124,7 @@ export function getRecoveryWorkflowReport({ limit = 10 } = {}) {
     journal_parse_errors: journal.parse_errors,
     total_manual_review_workflows: manualReviewWorkflows.length,
     total_unresolved_workflows: unresolvedWorkflows.length,
+    incident_key: createRecoveryIncidentKey(manualReviewWorkflows),
     manual_review_workflows: manualReviewWorkflows.slice(0, limit).map(mapRecoveryWorkflow),
     unresolved_workflows: unresolvedWorkflows.slice(0, limit).map(mapRecoveryWorkflow),
   };
@@ -179,10 +174,27 @@ export function summarizeRecoveryBlock(summary = {}) {
     };
   }
 
+	if (summary?.reason_code === "OPEN_POSITIONS_INVALID") {
+		return {
+			headline: "open-position observation is invalid",
+			detail: summary.observed?.open_positions_error || "provider state unavailable",
+		};
+	}
+
   return {
     headline: "unresolved workflow(s) were parked as manual_review",
     detail: `workflows: ${summary.parked_manual_review_workflows?.join(", ") || "unknown"}`,
   };
+}
+
+export function isBootRecoveryOverrideAllowed(summary = {}, resumeOverride = {}) {
+	return Boolean(
+		summary?.suppress_autonomous_writes
+		&& summary?.reason_code === "UNRESOLVED_WORKFLOW"
+		&& resumeOverride?.active
+		&& Boolean(summary?.incident_key)
+		&& summary.incident_key === resumeOverride.incident_key
+	);
 }
 
 export async function runBootRecovery({
@@ -192,6 +204,7 @@ export async function runBootRecovery({
   const journal = readActionJournal();
   const folded = foldActionJournal(journal.entries);
   const openPositions = await observeOpenPositions();
+  const openPositionsValid = isValidOpenPositionObservation(openPositions);
 
   let trackedPositions = [];
   let trackedStateInvalid = null;
@@ -233,11 +246,13 @@ export async function runBootRecovery({
   const completedOnBoot = [];
   const parkedManualReview = [];
   for (const workflow of unresolvedWriteWorkflows) {
-    const resolution = resolveWorkflowByObservation(workflow, {
-      openPositions: observedOpenPositions,
-      openPools,
-      openPoolPositions,
-    });
+    const resolution = openPositionsValid
+      ? resolveWorkflowByObservation(workflow, {
+        openPositions: observedOpenPositions,
+        openPools,
+        openPoolPositions,
+      })
+      : { lifecycle: "manual_review", reason: "open_position_observation_invalid" };
 
     appendActionLifecycle({
       workflow_id: workflow.workflow_id,
@@ -258,16 +273,21 @@ export async function runBootRecovery({
   }
 
   const parseErrorBlocked = journal.parse_errors.length > 0;
-  const suppressAutonomousWrites = parkedManualReview.length > 0;
+  const observationBlocked = !openPositionsValid;
+  const suppressAutonomousWrites = parkedManualReview.length > 0 || observationBlocked;
   const summary = {
     status: parseErrorBlocked
       ? "journal_invalid"
+      : observationBlocked
+        ? "manual_review_required"
       : suppressAutonomousWrites
         ? "manual_review_required"
         : "clear",
     suppress_autonomous_writes: parseErrorBlocked || suppressAutonomousWrites,
     reason_code: parseErrorBlocked
       ? "JOURNAL_INVALID"
+      : observationBlocked
+        ? "OPEN_POSITIONS_INVALID"
       : suppressAutonomousWrites
         ? "UNRESOLVED_WORKFLOW"
         : null,
@@ -280,9 +300,12 @@ export async function runBootRecovery({
     })),
     completed_on_boot_workflows: completedOnBoot,
     parked_manual_review_workflows: parkedManualReview,
+    incident_key: createRecoveryIncidentKey(parkedManualReview),
     journal_parse_errors: journal.parse_errors,
     observed: {
       open_positions_count: openPositionSet.size,
+      open_positions_invalid: !openPositionsValid,
+      open_positions_error: openPositions?.error || null,
       tracked_open_positions_count: trackedOpenSet.size,
       tracked_state_invalid: trackedStateInvalid,
     },
@@ -292,6 +315,8 @@ export async function runBootRecovery({
     "recovery",
     parseErrorBlocked
       ? `Boot recovery blocked autonomous writes because action journal has ${journal.parse_errors.length} parse error(s)`
+      : observationBlocked
+      ? `Boot recovery parked ${parkedManualReview.length} workflow(s) because open-position observation was invalid`
       : suppressAutonomousWrites
       ? `Boot recovery parked ${parkedManualReview.length} workflow(s) for manual review; autonomous writes suppressed`
       : `Boot recovery resolved ${completedOnBoot.length} workflow(s) and found no manual-review blockers`

@@ -8,13 +8,14 @@ import {
 } from "../tools/executor.js";
 
 async function main() {
-  setExecutorTestOverrides({
-    getMyPositions: async () => ({
-      total_positions: 1,
-      positions: [{ position: "pos-1", pool: "pool-1", base_mint: "mint-a" }],
-    }),
-    getWalletBalances: async () => ({ sol: 10 }),
-  });
+	setExecutorTestOverrides({
+		getMyPositions: async () => ({
+			total_positions: 1,
+			positions: [{ position: "pos-1", pool: "pool-1", base_mint: "mint-a" }],
+		}),
+		getPoolGovernanceMetadata: async () => ({ base_mint: "mint-b", bin_step: 100 }),
+		getWalletBalances: async () => ({ sol: 10 }),
+	});
   let result = await runSafetyChecks("deploy_position", {
     pool_address: "pool-1",
     amount_y: 0.5,
@@ -24,13 +25,14 @@ async function main() {
   assert.equal(result.pass, false);
   assert.match(result.reason, /already have an open position in pool/i);
 
-  setExecutorTestOverrides({
-    getMyPositions: async () => ({
-      total_positions: 1,
-      positions: [{ position: "pos-1", pool: "pool-1", base_mint: "mint-a" }],
-    }),
-    getWalletBalances: async () => ({ sol: 10 }),
-  });
+	setExecutorTestOverrides({
+		getMyPositions: async () => ({
+			total_positions: 1,
+			positions: [{ position: "pos-1", pool: "pool-1", base_mint: "mint-a" }],
+		}),
+		getPoolGovernanceMetadata: async () => ({ base_mint: "mint-a", bin_step: 100 }),
+		getWalletBalances: async () => ({ sol: 10 }),
+	});
   result = await runSafetyChecks("deploy_position", {
     pool_address: "pool-2",
     amount_y: 0.5,
@@ -40,18 +42,49 @@ async function main() {
   assert.equal(result.pass, false);
   assert.match(result.reason, /already holding base token/i);
 
-  setExecutorTestOverrides({
-    getMyPositions: async () => ({ total_positions: 0, positions: [] }),
-    getWalletBalances: async () => ({ sol: 0.55 }),
-  });
-  result = await runSafetyChecks("deploy_position", {
-    pool_address: "pool-3",
-    amount_y: 0.5,
-    base_mint: "mint-c",
-    bin_step: 100,
-  });
-  assert.equal(result.pass, false);
-  assert.match(result.reason, /insufficient sol/i);
+	setExecutorTestOverrides({
+		getMyPositions: async () => ({ total_positions: 0, positions: [] }),
+		getPoolGovernanceMetadata: async () => ({ base_mint: "mint-c", bin_step: 100 }),
+		getWalletBalances: async () => ({ sol: 0.55 }),
+	});
+	result = await runSafetyChecks("deploy_position", {
+		pool_address: "pool-3",
+		amount_y: 0.5,
+		base_mint: "mint-c",
+		bin_step: 100,
+	});
+	assert.equal(result.pass, false);
+	assert.match(result.reason, /insufficient sol/i);
+
+	setExecutorTestOverrides({
+		getMyPositions: async () => ({ total_positions: 0, positions: [] }),
+		getPoolGovernanceMetadata: async () => ({ base_mint: "mint-meta", bin_step: 101 }),
+		getWalletBalances: async () => ({ sol: 10 }),
+	});
+	const deployArgs = {
+		pool_address: "pool-meta",
+		amount_y: 0.5,
+	};
+	result = await runSafetyChecks("deploy_position", deployArgs);
+	assert.equal(result.pass, true);
+	assert.equal(deployArgs.base_mint, "mint-meta");
+	assert.equal(deployArgs.bin_step, 101);
+
+	setExecutorTestOverrides({
+		getMyPositions: async () => ({ total_positions: 0, positions: [] }),
+		getPoolGovernanceMetadata: async () => ({ base_mint: "mint-runtime", bin_step: 111 }),
+		getWalletBalances: async () => ({ sol: 10 }),
+	});
+	const spoofedArgs = {
+		pool_address: "pool-meta-override",
+		amount_y: 0.5,
+		base_mint: "mint-spoofed",
+		bin_step: 999,
+	};
+	result = await runSafetyChecks("deploy_position", spoofedArgs);
+	assert.equal(result.pass, true);
+	assert.equal(spoofedArgs.base_mint, "mint-runtime");
+	assert.equal(spoofedArgs.bin_step, 111);
 
   setExecutorTestOverrides({
     getMyPositions: async () => ({ total_positions: 0, positions: [] }),
@@ -63,10 +96,11 @@ async function main() {
   assert.match(result.reason, /not currently open/i);
 
   let receivedArgs = null;
-  setExecutorTestOverrides({
-    getMyPositions: async () => ({ total_positions: 0, positions: [] }),
-    getWalletBalances: async () => ({ sol: 10, sol_price: 120, tokens: [] }),
-    recordToolOutcome: () => {},
+	setExecutorTestOverrides({
+		getMyPositions: async () => ({ total_positions: 0, positions: [] }),
+		getPoolGovernanceMetadata: async () => ({ base_mint: "mint-d", bin_step: 100 }),
+		getWalletBalances: async () => ({ sol: 10, sol_price: 120, tokens: [] }),
+		recordToolOutcome: () => {},
     tools: {
       deploy_position: async (args) => {
         receivedArgs = args;
@@ -79,17 +113,19 @@ async function main() {
     amount_y: 0.5,
     base_mint: "mint-d",
     bin_step: 100,
+    initial_value_usd: 1,
   });
   assert.equal(result.success, true);
   assert.ok(receivedArgs);
   assert.equal(receivedArgs.initial_value_usd, 60);
 
   const outcomes = [];
-  setExecutorTestOverrides({
-    getMyPositions: async () => ({ total_positions: 0, positions: [] }),
-    getWalletBalances: async () => ({ sol: 0.4 }),
-    recordToolOutcome: (payload) => outcomes.push(payload),
-  });
+	setExecutorTestOverrides({
+		getMyPositions: async () => ({ total_positions: 0, positions: [] }),
+		getPoolGovernanceMetadata: async () => ({ base_mint: "mint-e", bin_step: 100 }),
+		getWalletBalances: async () => ({ sol: 0.4 }),
+		recordToolOutcome: (payload) => outcomes.push(payload),
+	});
   result = await executeTool("deploy_position", {
     pool_address: "pool-5",
     amount_y: 0.5,

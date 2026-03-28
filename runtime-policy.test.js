@@ -58,7 +58,35 @@ test("planManagementRuntimeAction exposes explicit subreason for fee-threshold c
   }, config);
 
   assert.equal(result.toolName, "auto_compound_fees");
-  assert.equal(result.rule, MANAGEMENT_SUBREASONS.FEE_THRESHOLD);
+	assert.equal(result.rule, MANAGEMENT_SUBREASONS.FEE_THRESHOLD);
+});
+
+test("planManagementRuntimeAction uses fee capture rather than pnl for fixed take profit", () => {
+	const result = planManagementRuntimeAction({
+		position: "pos-fee-tp",
+		in_range: true,
+		initial_value_usd: 100,
+		collected_fees_usd: 3,
+		pnl: { pnl_pct: 2, fee_per_tvl_24h: 12, unclaimed_fee_usd: 2.5 },
+		unclaimed_fees_usd: 2.5,
+	}, config);
+
+	assert.equal(result.toolName, "close_position");
+	assert.equal(result.rule, MANAGEMENT_SUBREASONS.TAKE_PROFIT);
+	assert.match(result.reason, /fees 5\.50% >= 5%/i);
+});
+
+test("planManagementRuntimeAction does not use pnl alone for fixed take profit", () => {
+	const result = planManagementRuntimeAction({
+		position: "pos-pnl-only",
+		in_range: true,
+		initial_value_usd: 100,
+		collected_fees_usd: 1,
+		pnl: { pnl_pct: 12, fee_per_tvl_24h: 12, unclaimed_fee_usd: 1 },
+		unclaimed_fees_usd: 1,
+	}, config);
+
+	assert.equal(result, null);
 });
 
 test("planManagementRuntimeAction only escalates to model when no deterministic rule applies", () => {

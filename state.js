@@ -9,6 +9,11 @@
  */
 
 import fs from "fs";
+
+import {
+	readJsonSnapshotWithBackupSync,
+	writeJsonSnapshotAtomicSync,
+} from "./durable-store.js";
 import { log } from "./logger.js";
 import { foldActionJournal, readActionJournal } from "./action-journal.js";
 import { evaluateTrackedPositionExit } from "./runtime-policy.js";
@@ -63,31 +68,34 @@ function ensureEvaluation(state) {
 }
 
 function load() {
-  if (!fs.existsSync(STATE_FILE)) {
-    return emptyState();
-  }
-  try {
-    const parsed = JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
-    const state = {
-      ...emptyState(),
-      ...parsed,
-    };
-    ensureEvaluation(state);
-    return state;
-  } catch (err) {
-    log("state_error", `Failed to read state.json: ${err.message}`);
-    throw new Error(`Invalid state.json: ${err.message}`);
-  }
+	const snapshot = readJsonSnapshotWithBackupSync(STATE_FILE);
+	if (!snapshot.value) {
+		if (!snapshot.error) {
+		return emptyState();
+		}
+		log("state_error", `Failed to read state.json: ${snapshot.error}`);
+		throw new Error(`Invalid state.json: ${snapshot.error}`);
+	}
+	const state = {
+		...emptyState(),
+		...snapshot.value,
+	};
+	ensureEvaluation(state);
+	if (snapshot.source === "backup") {
+		log("state_warn", "Recovered state.json from backup snapshot");
+	}
+	return state;
 }
 
 function save(state) {
-  try {
-    ensureEvaluation(state);
-    state.lastUpdated = new Date().toISOString();
-    fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
-  } catch (err) {
-    log("state_error", `Failed to write state.json: ${err.message}`);
-  }
+	try {
+		ensureEvaluation(state);
+		state.lastUpdated = new Date().toISOString();
+		writeJsonSnapshotAtomicSync(STATE_FILE, state);
+	} catch (err) {
+		log("state_error", `Failed to write state.json: ${err.message}`);
+		throw err;
+	}
 }
 
 function incrementCounter(state, key, amount = 1) {

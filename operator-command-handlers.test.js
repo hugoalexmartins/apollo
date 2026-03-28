@@ -45,6 +45,65 @@ test("operator command handler arms writes and reports window", async () => {
     refreshRuntimeHealth: () => {},
   });
 
-  assert.equal(result.handled, true);
-  assert.match(result.message, /armed for 7 minute\(s\)/i);
+	assert.equal(result.handled, true);
+	assert.match(result.message, /armed for 7 minute\(s\)/i);
+});
+
+test("operator resume clears suppression without clearing portfolio guard pause", async () => {
+	let suppressionCleared = false;
+	let guardCleared = false;
+	const result = await handleOperatorCommandText({
+		text: "/resume manual review complete",
+		source: "test",
+		config: { protections: { recoveryResumeOverrideMinutes: 120 } },
+		getRecoveryWorkflowReport: () => ({ status: "manual_review_required" }),
+		getAutonomousWriteSuppression: () => ({ suppressed: true, reason: "manual review required", code: "UNRESOLVED_WORKFLOW", incident_key: "wf-1|wf-2" }),
+		clearPortfolioGuardPause: () => {
+			guardCleared = true;
+			return { cleared: true };
+		},
+		setAutonomousWriteSuppression: ({ suppressed }) => {
+			suppressionCleared = suppressed === false;
+		},
+		acknowledgeRecoveryResume: ({ incident_key }) => ({ override_until: "until+120", incident_key }),
+		armGeneralWriteTools: () => ({ armed_until: null }),
+		disarmGeneralWriteTools: () => ({ armed: false }),
+		getOperatorControlSnapshot: () => ({
+			general_write_arm: { armed: false, armed_until: null },
+			recovery_resume_override: { active: true, override_until: "until+120" },
+		}),
+		refreshRuntimeHealth: () => {},
+	});
+
+	assert.equal(result.handled, true);
+	assert.equal(suppressionCleared, true);
+	assert.equal(guardCleared, false);
+	assert.match(result.message, /portfolio guard pause unchanged/i);
+});
+
+test("operator resume blocks override when suppression is not an unresolved-workflow boot block", async () => {
+	let acknowledgeCalled = false;
+	const result = await handleOperatorCommandText({
+		text: "/resume manual review complete",
+		source: "test",
+		config: { protections: { recoveryResumeOverrideMinutes: 120 } },
+		getRecoveryWorkflowReport: () => ({ status: "manual_review_required" }),
+		getAutonomousWriteSuppression: () => ({ suppressed: true, reason: "open-position observation invalid (rpc unavailable)", code: "OPEN_POSITIONS_INVALID", incident_key: null }),
+		setAutonomousWriteSuppression: () => {},
+		acknowledgeRecoveryResume: () => {
+			acknowledgeCalled = true;
+			return { override_until: null };
+		},
+		armGeneralWriteTools: () => ({ armed_until: null }),
+		disarmGeneralWriteTools: () => ({ armed: false }),
+		getOperatorControlSnapshot: () => ({
+			general_write_arm: { armed: false, armed_until: null },
+			recovery_resume_override: { active: false, override_until: null },
+		}),
+		refreshRuntimeHealth: () => {},
+	});
+
+	assert.equal(result.handled, true);
+	assert.equal(acknowledgeCalled, false);
+	assert.match(result.message, /cannot persist resume override unless autonomous writes are currently suppressed/i);
 });

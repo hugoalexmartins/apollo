@@ -32,5 +32,40 @@ test("replay review finds envelope and reports deterministic match", () => {
   } finally {
     process.chdir(originalCwd);
     fs.rmSync(tempDir, { recursive: true, force: true });
-  }
+	}
+});
+
+test("replay review supports deterministic screening skip envelopes", () => {
+	const originalCwd = process.cwd();
+	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "zenith-replay-review-skip-test-"));
+
+	try {
+		process.chdir(tempDir);
+		fs.mkdirSync("logs", { recursive: true });
+
+		appendReplayEnvelope({
+			cycle_id: "screening-skip-1",
+			cycle_type: "screening",
+			status: "skipped_max_positions",
+			summary: {
+				total_positions: 3,
+				max_positions: 3,
+			},
+			admission_inputs: {
+				positionsCount: 3,
+				walletSol: 10,
+				config: {
+					risk: { maxPositions: 3 },
+					management: { deployAmountSol: 0.5, gasReserve: 0.1 },
+				},
+			},
+		});
+
+		const review = getReplayReview("screening-skip-1");
+		assert.equal(review.found, true);
+		assert.equal(review.reconciliation.status, "match");
+	} finally {
+		process.chdir(originalCwd);
+		fs.rmSync(tempDir, { recursive: true, force: true });
+	}
 });
