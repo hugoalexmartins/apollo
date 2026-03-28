@@ -139,7 +139,7 @@ Current screening timeframe: ${config.screening.timeframe} — interpret all met
 
   if (agentType === "SCREENER") {
     basePrompt += `
-Your goal: Find high-yield, high-volume pools and DEPLOY capital.
+Your goal: Find high-yield, high-volume pools and DEPLOY capital using data-driven strategies.
 
 1. SCREEN: Use get_top_candidates as the primary screening tool. Use discover_pools only if the user explicitly asks for raw discovery output.
 2. LPER SCORING: Before deploying, prefer score_top_lpers when you need fast wallet quality ranking. Use it conservatively because it is rate-sensitive: focus on the best 1-2 candidates after cheap filters, and reuse any pre-loaded scores before fetching more.
@@ -165,9 +165,9 @@ Your goal: Find high-yield, high-volume pools and DEPLOY capital.
 `;
   } else if (agentType === "MANAGER") {
     basePrompt += `
-Your goal: Manage positions to maximize total Fee + PnL yield.
+Your goal: Manage positions to maximize total Fee + PnL yield using strategy-aware decisions.
 
-INSTRUCTION CHECK (HIGHEST PRIORITY): If a position has an instruction set (e.g. "close at 5% profit"), check get_position_pnl and compare against the condition FIRST. If the condition IS MET → close immediately. No further analysis, no hesitation. BIAS TO HOLD does NOT apply when an instruction condition is met.
+INSTRUCTION CHECK (HIGHEST PRIORITY): If a position has an instruction set (e.g. "close at 5% profit"), check get_position_pnl and compare against the condition FIRST. If the condition IS MET → close immediately.
 
 HARD EXIT RULES (checked automatically — if state says STOP_LOSS or TRAILING_TP, close immediately):
 - STOP LOSS: Close if PnL drops below ${config.management.stopLossPct}%.
@@ -176,10 +176,18 @@ HARD EXIT RULES (checked automatically — if state says STOP_LOSS or TRAILING_T
 
 BIAS TO HOLD: Unless an instruction fires, a pool is dying, volume has collapsed, or yield has vanished, hold.
 
-Decision Factors for Closing (no instruction):
-- Yield Health: Call get_position_pnl. Is the current Fee/TVL still one of the best available?
-- Price Context: Is the token price stabilizing or trending? If it's out of range, will it come back?
-- Opportunity Cost: Only close to "free up SOL" if you see a significantly better pool that justifies the gas cost of exiting and re-entering.
+CLOSE RULES (override strategy defaults when data is clear):
+- OOR UPSIDE + profitable (PnL > 10%) → close IMMEDIATELY to lock gains. Don't wait for timers.
+- OOR DOWNSIDE for >10 min with no volume recovery → close (unless single_sided_reseed strategy).
+- PnL < -25% with no volume recovery → close.
+- Take profit: total return >= 10% of deployed capital.
+
+BIAS TO HOLD: Unless above rules trigger, a pool is dying, volume has collapsed, or yield has vanished, hold.
+
+DATA-DRIVEN REBALANCE: Before closing or rebalancing, check:
+- get_pool_detail → is volume still present? fee/TVL still good?
+- get_active_bin → how far OOR? Edge or blown through?
+- get_token_info → price trend, net buyers, narrative still alive?
 
 TOOL PREFERENCES:
 - If a position is out of range and you are not closing for a higher-priority hard-exit reason, prefer rebalance_on_exit immediately rather than waiting for outOfRangeWaitMinutes.

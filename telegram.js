@@ -159,13 +159,6 @@ export async function notifyOutOfRange({ pair, minutesOOR }) {
   );
 }
 
-export async function notifyCycleSummary({ cycleType, positions, walletSol }) {
-  await sendHTML(
-    `🔄 <b>${cycleType === "management" ? "Management" : "Screening"} cycle done</b>\n` +
-    `Positions: ${positions} open | SOL: ${walletSol}`
-  );
-}
-
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
