@@ -1,27 +1,151 @@
 import "dotenv/config";
 import cron from "node-cron";
-import readline from "readline";
 import { agentLoop } from "./agent.js";
 import { log } from "./logger.js";
 import { getMyPositions, getPositionPnl, closePosition } from "./tools/dlmm.js";
 import { getWalletBalances } from "./tools/wallet.js";
-import { getTopCandidates } from "./tools/screening.js";
-import { config, reloadScreeningThresholds, computeDeployAmount } from "./config.js";
-import { evolveThresholds, getPerformanceSummary } from "./lessons.js";
-import { registerCronRestarter } from "./tools/executor.js";
+import { discoverPools, getTopCandidates } from "./tools/screening.js";
+import { config, reloadScreeningThresholds, computeDeployAmount, secretHealth } from "./config.js";
+import {
+	evolveThresholds,
+	getPerformanceHistory,
+	getPerformanceSummary,
+	getStrategyProofSummary,
+	recoverThresholdRolloutState,
+} from "./lessons.js";
+import { getScreeningThresholdSummary } from "./runtime-helpers.js";
+import { executeTool, getAutonomousWriteSuppression, registerCronRestarter, setAutonomousWriteSuppression } from "./tools/executor.js";
 import { startPolling, stopPolling, sendMessage, sendHTML, notifyOutOfRange, isEnabled as telegramEnabled } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
-import { getLastBriefingDate, setLastBriefingDate, getTrackedPosition, setPositionInstruction } from "./state.js";
+import { getEvaluationSummary, getLastBriefingDate, getTrackedPositions, recordCycleEvaluation, setLastBriefingDate, updatePnlAndCheckExits } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
-import { recordPositionSnapshot, recallForPool } from "./pool-memory.js";
-import { checkSmartWalletsOnPool } from "./smart-wallets.js";
-import { getTokenHolders, getTokenNarrative, getTokenInfo } from "./tools/token.js";
+import { getNegativeRegimeCooldown, recordPositionSnapshot, recallForPool } from "./pool-memory.js";
+import { initMemory, recallForManagement } from "./memory.js";
+import { classifyManagementModelGate, deriveExpectedVolumeProfile, isPnlSignalStale, resolveTargetManagementInterval } from "./runtime-policy.js";
+import { evaluateScreeningCycleAdmission } from "./runtime-policy.js";
+import { getLpOverview } from "./tools/lp-overview.js";
+import { appendReplayEnvelope, createCycleId } from "./cycle-trace.js";
+import { classifyRuntimeFailure, isFailClosedResult, validateStartupSnapshot } from "./degraded-mode.js";
+import { getStartupSnapshot } from "./startup-snapshot.js";
+import { runManagementRuntimeActions } from "./management-runtime.js";
+import { listEvidenceBundles, writeEvidenceBundle } from "./evidence-bundles.js";
+import { getEvidenceBundle } from "./evidence-bundles.js";
+import {
+	getRecoveryWorkflowReport,
+	isBootRecoveryOverrideAllowed,
+	runBootRecovery,
+	summarizeRecoveryBlock,
+} from "./boot-recovery.js";
+import { getOverlappingCycleType, shouldTriggerFollowOnScreening } from "./cycle-overlap.js";
+import { handleCycleOverlap } from "./cycle-harness.js";
+import { clearPortfolioGuardPause, evaluatePortfolioGuard } from "./portfolio-guards.js";
+import { acknowledgeRecoveryResume, armGeneralWriteTools, disarmGeneralWriteTools, getOperatorControlSnapshot } from "./operator-controls.js";
+import { updateRuntimeHealth } from "./runtime-health.js";
+import { formatReplayReview, getReplayEnvelope, getReplayReview, getReplayReviewStats } from "./replay-review.js";
+import {
+	listActionJournalEntries,
+	listActionJournalWorkflowsByCycle,
+} from "./action-journal.js";
+import { getNegativeRegimeMemory } from "./negative-regime-memory.js";
+import { handleOperatorCommandText } from "./operator-command-handlers.js";
+import {
+  buildOperationalHealthReport,
+  buildProviderHealthFromSnapshot,
+  buildStaticProviderHealth,
+  createHeadlessTelegramCommandHandler,
+  createRuntimeHealthRefresher,
+  formatActionJournalReport,
+  formatEvidenceBundle,
+  formatRecoveryReport,
+  formatReplayEnvelope,
+} from "./control-plane-helpers.js";
+import {
+  asNumber,
+  buildCandidateContext,
+  deriveTrendBias,
+  didRuntimeHandleManagementAction,
+  evaluateCandidateIntel,
+  formatFinalistInspectionBlock,
+  inspectCandidate,
+  roundMetric,
+  summarizeRuntimeActionResult,
+} from "./screening-intel.js";
+import { createManagementCycleRunner } from "./management-cycle-runner.js";
+import { createScreeningCycleRunner } from "./screening-cycle-runner.js";
+import { runInteractiveInterface } from "./interactive-interface.js";
+import { runNonInteractiveStartup } from "./startup-interface.js";
+import {
+  applyRegimeHysteresis,
+  classifyRuntimeRegime,
+  getRegimePack,
+  getPerformanceSizingMultiplier,
+  getRiskSizingMultiplier,
+  listCounterfactualRegimes,
+  resolveRegimePackContext,
+} from "./regime-packs.js";
+import { appendCounterfactualReview } from "./counterfactual-review.js";
 
 log("startup", "DLMM LP Agent starting...");
 log("startup", `Mode: ${process.env.DRY_RUN === "true" ? "DRY RUN" : "LIVE"}`);
 log("startup", `Model: ${process.env.LLM_MODEL || "hermes-3-405b"}`);
 
-const TP_PCT  = config.management.takeProfitFeePct;
+initMemory();
+
+const thresholdRolloutRecovery = recoverThresholdRolloutState(config, {
+	trigger: "startup",
+});
+if (thresholdRolloutRecovery?.status && thresholdRolloutRecovery.status !== "clear") {
+	log("evolve_recovery", `Threshold rollout recovery status: ${thresholdRolloutRecovery.status}`);
+}
+
+const refreshRuntimeHealth = createRuntimeHealthRefresher({
+  updateRuntimeHealth,
+  getAutonomousWriteSuppression,
+  getRecoveryWorkflowReport,
+  getOperatorControlSnapshot,
+});
+
+const bootRecovery = await runBootRecovery({
+  observeOpenPositions: () => getMyPositions({ force: true }),
+  observeTrackedPositions: () => getTrackedPositions(true),
+});
+
+const recoveryResumeOverride = getOperatorControlSnapshot().recovery_resume_override;
+const bootRecoveryOverrideActive = isBootRecoveryOverrideAllowed(
+	bootRecovery,
+	recoveryResumeOverride,
+);
+const bootRecoveryBlockActive = bootRecovery.suppress_autonomous_writes && !bootRecoveryOverrideActive;
+
+if (bootRecoveryOverrideActive) {
+  setAutonomousWriteSuppression({ suppressed: false });
+  log(
+    "recovery_override",
+    `Autonomous writes resumed due to persisted operator override until ${recoveryResumeOverride.override_until} (${recoveryResumeOverride.reason || "no reason provided"})`
+  );
+} else if (bootRecoveryBlockActive) {
+  const reason = bootRecovery.reason_code === "JOURNAL_INVALID"
+    ? `action journal invalid (${bootRecovery.journal_parse_errors.length} parse error(s))`
+    : `manual review required for ${bootRecovery.parked_manual_review_workflows.length} workflow(s)`;
+  setAutonomousWriteSuppression({
+		suppressed: true,
+		reason,
+		code: bootRecovery.reason_code,
+		incidentKey: bootRecovery.incident_key,
+	});
+  log("recovery_block", `Autonomous write activity suppressed at boot: ${reason}`);
+} else {
+  setAutonomousWriteSuppression({ suppressed: false });
+}
+
+refreshRuntimeHealth({
+  startup: {
+    status: "boot_recovery_complete",
+    reason: bootRecovery.reason_code || null,
+  },
+  provider_health: buildStaticProviderHealth({ secretHealth, telegramEnabled }),
+});
+
 const DEPLOY  = config.management.deployAmountSol;
 
 // ═══════════════════════════════════════════
@@ -43,6 +167,20 @@ function formatCountdown(seconds) {
   const m = Math.floor(seconds / 60);
   const s = Math.floor(seconds % 60);
   return m > 0 ? `${m}m ${s}s` : `${s}s`;
+}
+
+function enforceManagementIntervalFromPositions(positions) {
+  const { interval, maxVolatility } = resolveTargetManagementInterval(positions);
+  if (config.schedule.managementIntervalMin === interval) {
+    return { changed: false, interval, maxVolatility };
+  }
+
+  const previous = config.schedule.managementIntervalMin;
+  config.schedule.managementIntervalMin = interval;
+  log("cron", `Management interval adjusted ${previous}m -> ${interval}m (max open-position volatility: ${maxVolatility})`);
+
+  if (cronStarted) startCronJobs();
+  return { changed: true, interval, maxVolatility };
 }
 
 function buildPrompt() {
@@ -94,284 +232,158 @@ async function maybeRunMissedBriefing() {
 function stopCronJobs() {
   for (const task of _cronTasks) task.stop();
   _cronTasks = [];
+  cronStarted = false;
 }
-
-export async function runManagementCycle({ silent = false } = {}) {
-  log("cron", `Starting management cycle [model: ${config.llm.managementModel}]`);
-  let mgmtReport = null;
-  let positions = [];
-  try {
-      // Pre-load all positions + PnL in parallel — LLM gets everything, no fetch steps needed
-      const livePositions = await getMyPositions().catch(() => null);
-      positions = livePositions?.positions || [];
-
-      if (positions.length === 0) {
-        log("cron", "No open positions — triggering screening cycle");
-        runScreeningCycle().catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
-        return;
-      }
-
-      // Enforce management interval based on most volatile open position
-      const maxVolatility = positions.reduce((max, p) => {
-        const tracked = getTrackedPosition(p.position);
-        return Math.max(max, tracked?.volatility ?? 0);
-      }, 0);
-      const targetInterval = maxVolatility >= 5 ? 3 : maxVolatility >= 2 ? 5 : 10;
-      if (config.schedule.managementIntervalMin !== targetInterval) {
-        config.schedule.managementIntervalMin = targetInterval;
-        log("cron", `Management interval adjusted to ${targetInterval}m (max volatility: ${maxVolatility})`);
-        if (cronStarted) startCronJobs();
-      }
-
-      // Also trigger screening if under max positions — cooldown 5min to avoid spamming
-      const screeningCooldownMs = 5 * 60 * 1000;
-      if (positions.length < config.risk.maxPositions && Date.now() - _screeningLastTriggered > screeningCooldownMs) {
-        _screeningLastTriggered = Date.now();
-        log("cron", `Positions (${positions.length}/${config.risk.maxPositions}) — triggering screening in background`);
-        runScreeningCycle().catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
-      }
-
-      // Snapshot + PnL fetch in parallel for all positions
-      const positionData = await Promise.all(positions.map(async (p) => {
-        recordPositionSnapshot(p.pool, p);
-        const pnl = await getPositionPnl({ pool_address: p.pool, position_address: p.position }).catch(() => null);
-        const recall = recallForPool(p.pool);
-        return { ...p, pnl, recall };
-      }));
-
-      // Build pre-loaded position blocks for the LLM
-      const positionBlocks = positionData.map((p) => {
-        const pnl = p.pnl;
-        const lines = [
-          `POSITION: ${p.pair} (${p.position})`,
-          `  pool: ${p.pool}`,
-          `  age: ${p.age_minutes ?? "?"}m | in_range: ${p.in_range} | oor_minutes: ${p.minutes_out_of_range ?? 0}`,
-          pnl ? `  pnl_pct: ${pnl.pnl_pct}% | pnl_usd: $${pnl.pnl_usd} | unclaimed_fees: $${pnl.unclaimed_fee_usd} | claimed_fees: $${Math.max(0, (pnl.all_time_fees_usd || 0) - (pnl.unclaimed_fee_usd || 0)).toFixed(2)} | value: $${pnl.current_value_usd} | fee_per_tvl_24h: ${pnl.fee_per_tvl_24h ?? "?"}%` : `  pnl: fetch failed`,
-          pnl ? `  bins: lower=${pnl.lower_bin} upper=${pnl.upper_bin} active=${pnl.active_bin}` : null,
-          p.instruction ? `  instruction: "${p.instruction}"` : null,
-          p.recall ? `  memory: ${p.recall}` : null,
-        ].filter(Boolean);
-        return lines.join("\n");
-      }).join("\n\n");
-
-      // Hive mind pattern consensus (if enabled)
-      let hivePatterns = "";
-      try {
-        const hiveMind = await import("./hive-mind.js");
-        if (hiveMind.isEnabled()) {
-          const patterns = await hiveMind.queryPatternConsensus();
-          const significant = (patterns || []).filter(p => p.count >= 10);
-          if (significant.length > 0) {
-            hivePatterns = `\nHIVE MIND PATTERNS (supplementary):\n${significant.slice(0, 3).map(p => `[HIVE] ${p.strategy}: ${p.win_rate}% win, ${p.avg_pnl}% avg PnL (${p.count} deploys)`).join("\n")}\n`;
-          }
-        }
-      } catch { /* hive is best-effort */ }
-
-      const { content } = await agentLoop(`
-MANAGEMENT CYCLE — ${positions.length} position(s)
-
-PRE-LOADED POSITION DATA (no fetching needed):
-${positionBlocks}${hivePatterns}
-
-HARD CLOSE RULES — apply in order, first match wins:
-1. instruction set AND condition met → CLOSE (highest priority)
-2. instruction set AND condition NOT met → HOLD, skip remaining rules
-3. pnl_pct <= ${config.management.emergencyPriceDropPct}% → CLOSE (stop loss)
-4. pnl_pct >= ${config.management.takeProfitFeePct}% → CLOSE (take profit)
-5. active_bin > upper_bin + ${config.management.outOfRangeBinsToClose} → CLOSE (pumped far above range)
-6. active_bin > upper_bin AND oor_minutes >= ${config.management.outOfRangeWaitMinutes} → CLOSE (stale above range)
-7. fee_per_tvl_24h < ${config.management.minFeePerTvl24h} AND age_minutes >= 60 → CLOSE (fee yield too low)
-
-When closing: call close_position only — it handles fee claiming internally, do NOT call claim_fees first.
-
-CLAIM RULE: If unclaimed_fee_usd >= ${config.management.minClaimAmount}, call claim_fees. Do not use any other threshold.
-
-INSTRUCTIONS:
-All data is pre-loaded above — do NOT call get_my_positions or get_position_pnl.
-Apply the rules to each position and write your report immediately.
-Only call tools if a position needs to be CLOSED, FLIPPED, or fees need to be CLAIMED.
-If all positions STAY and no fees to claim, just write the report with no tool calls.
-
-REPORT FORMAT (one per position):
-**[PAIR]** | Age: [X]m | Unclaimed: $[X] | PnL: [X]% | [STAY/CLOSE]
-Range: [████████░░░░░░░░░░░░] (20 chars: █ = bins up to active, ░ = bins above active)
-Only add: **Rule [N]:** [reason] — if a close rule triggered. Omit rule line if STAY with no rule.
-
-After all positions, add one summary line:
-💼 [N] positions | $[total_value] | fees today: $[sum_unclaimed] | [any notable action taken]
-      `, config.llm.maxSteps, [], "MANAGER", config.llm.managementModel, 4096);
-      mgmtReport = content;
-    } catch (error) {
-      log("cron_error", `Management cycle failed: ${error.message}`);
-      mgmtReport = `Management cycle failed: ${error.message}`;
-    } finally {
-      if (!silent && telegramEnabled()) {
-        if (mgmtReport) sendMessage(`🔄 Management Cycle\n\n${mgmtReport}`).catch(() => {});
-        for (const p of positions) {
-          if (!p.in_range && p.minutes_out_of_range >= config.management.outOfRangeWaitMinutes) {
-            notifyOutOfRange({ pair: p.pair, minutesOOR: p.minutes_out_of_range }).catch(() => {});
-          }
-        }
-      }
-    }
-  return mgmtReport;
-}
-
-export async function runScreeningCycle({ silent = false } = {}) {
-    if (_screeningBusy) return;
-
-    // Hard guards — don't even run the agent if preconditions aren't met
-    let prePositions, preBalance;
-    try {
-      [prePositions, preBalance] = await Promise.all([getMyPositions(), getWalletBalances()]);
-      if (prePositions.total_positions >= config.risk.maxPositions) {
-        log("cron", `Screening skipped — max positions reached (${prePositions.total_positions}/${config.risk.maxPositions})`);
-        return;
-      }
-      const minRequired = config.management.deployAmountSol + config.management.gasReserve;
-      if (preBalance.sol < minRequired) {
-        log("cron", `Screening skipped — insufficient SOL (${preBalance.sol.toFixed(3)} < ${minRequired} needed for deploy + gas)`);
-        return;
-      }
-    } catch (e) {
-      log("cron_error", `Screening pre-check failed: ${e.message}`);
-      return;
-    }
-
-    _screeningBusy = true;
-    timers.screeningLastRun = Date.now();
-    log("cron", `Starting screening cycle [model: ${config.llm.screeningModel}]`);
-    let screenReport = null;
-    try {
-      // Reuse pre-fetched balance — no extra RPC call needed
-      const currentBalance = preBalance;
-      const deployAmount = computeDeployAmount(currentBalance.sol);
-      log("cron", `Computed deploy amount: ${deployAmount} SOL (wallet: ${currentBalance.sol} SOL)`);
-
-      // Load active strategy
-      const activeStrategy = getActiveStrategy();
-      const strategyBlock = activeStrategy
-        ? `ACTIVE STRATEGY: ${activeStrategy.name} — LP: ${activeStrategy.lp_strategy} | bins_above: ${activeStrategy.range?.bins_above ?? 0} (FIXED — never change) | deposit: ${activeStrategy.entry?.single_side === "sol" ? "SOL only (amount_y, amount_x=0)" : "dual-sided"} | best for: ${activeStrategy.best_for}`
-        : `No active strategy — use default bid_ask, bins_above: 0, SOL only.`;
-
-      // Pre-load top candidates + all recon data in parallel (saves 4-6 LLM steps)
-      const topCandidates = await getTopCandidates({ limit: 5 }).catch(() => null);
-      const candidates = topCandidates?.candidates || topCandidates?.pools || [];
-
-      const candidateBlocks = [];
-      for (const pool of candidates.slice(0, 5)) {
-        const mint = pool.base?.mint;
-        const [smartWallets, holders, narrative, tokenInfo, poolMemory] = await Promise.allSettled([
-            checkSmartWalletsOnPool({ pool_address: pool.pool }),
-            mint ? getTokenHolders({ mint, limit: 100 }) : Promise.resolve(null),
-            mint ? getTokenNarrative({ mint }) : Promise.resolve(null),
-            mint ? getTokenInfo({ query: mint }) : Promise.resolve(null),
-            Promise.resolve(recallForPool(pool.pool)),
-          ]);
-
-          const sw   = smartWallets.status === "fulfilled" ? smartWallets.value : null;
-          const h    = holders.status === "fulfilled" ? holders.value : null;
-          const n    = narrative.status === "fulfilled" ? narrative.value : null;
-          const ti   = tokenInfo.status === "fulfilled" ? tokenInfo.value?.results?.[0] : null;
-          const mem  = poolMemory.value;
-
-          const priceChange = ti?.stats_1h?.price_change;
-          const netBuyers = ti?.stats_1h?.net_buyers;
-
-          // Use Jupiter audit for bot/top holders (more reliable than custom detection)
-          const botPct    = ti?.audit?.bot_holders_pct ?? h?.bundlers_pct_in_top_100 ?? "?";
-          const top10Pct  = ti?.audit?.top_holders_pct ?? h?.top_10_real_holders_pct ?? "?";
-          const launchpad = ti?.launchpad ?? null;
-          const feesSol   = ti?.global_fees_sol ?? h?.global_fees_sol ?? "?";
-
-          // Hard filter: skip blocked launchpads before even showing to LLM
-          if (launchpad && config.screening.blockedLaunchpads.length > 0) {
-            if (config.screening.blockedLaunchpads.includes(launchpad)) {
-              log("screening", `Skipping ${pool.name} — blocked launchpad: ${launchpad}`);
-              continue;
-            }
-          }
-
-          // Build compact block
-          const lines = [
-            `POOL: ${pool.name} (${pool.pool})`,
-            `  metrics: bin_step=${pool.bin_step}, fee_pct=${pool.fee_pct}%, fee_tvl=${pool.fee_active_tvl_ratio}, vol=$${pool.volume_window}, tvl=$${pool.active_tvl}, volatility=${pool.volatility}, mcap=$${pool.mcap}, organic=${pool.organic_score}`,
-            `  audit: top10=${top10Pct}%, bots=${botPct}%, fees=${feesSol}SOL${launchpad ? `, launchpad=${launchpad}` : ""}`,
-            `  smart_wallets: ${sw?.in_pool?.length ?? 0} present${sw?.in_pool?.length ? ` → CONFIDENCE BOOST (${sw.in_pool.map(w => w.name).join(", ")})` : ""}`,
-            priceChange != null ? `  1h: price${priceChange >= 0 ? "+" : ""}${priceChange}%, net_buyers=${netBuyers ?? "?"}` : null,
-            n?.narrative ? `  narrative: ${n.narrative.slice(0, 500)}` : `  narrative: none`,
-            mem ? `  memory: ${mem}` : null,
-          ].filter(Boolean);
-
-          candidateBlocks.push(lines.join("\n"));
-      }
-
-      let candidateContext = candidateBlocks.length > 0
-        ? `\nPRE-LOADED CANDIDATE ANALYSIS (smart wallets, holders, narrative already fetched):\n${candidateBlocks.join("\n\n")}\n`
-        : "";
-
-      // Hive mind consensus (if enabled)
-      try {
-        const hiveMind = await import("./hive-mind.js");
-        if (hiveMind.isEnabled()) {
-          const poolAddrs = candidates.map(c => c.pool).filter(Boolean);
-          if (poolAddrs.length > 0) {
-            const hive = await hiveMind.formatPoolConsensusForPrompt(poolAddrs);
-            if (hive) candidateContext += "\n" + hive + "\n";
-          }
-        }
-      } catch { /* hive is best-effort */ }
-
-      const { content } = await agentLoop(`
-SCREENING CYCLE
-${strategyBlock}
-Positions: ${prePositions.total_positions}/${config.risk.maxPositions} | SOL: ${currentBalance.sol.toFixed(3)} | Deploy: ${deployAmount} SOL
-${candidateContext}
-DECISION RULES:
-- HARD SKIP if fees < ${config.screening.minTokenFeesSol} SOL (bundled/scam)
-- HARD SKIP if top10 > ${config.screening.maxTop10Pct}% OR bots > ${config.screening.maxBundlersPct}%
-${config.screening.blockedLaunchpads.length ? `- HARD SKIP if launchpad is any of: ${config.screening.blockedLaunchpads.join(", ")}` : ""}
-- SKIP if narrative is empty/null or pure hype with no specific story (unless smart wallets present)
-- Bots 5–25% are normal, not a skip reason on their own
-- Smart wallets present → strong confidence boost
-
-STEPS:
-1. Pick the best candidate based on narrative quality, smart wallets, and pool metrics.
-2. Call deploy_position (active_bin is pre-fetched above — no need to call get_active_bin).
-   bins_below = round(35 + (volatility/5)*55) clamped to [35,90].
-3. Report in this exact format (no tables, no extra sections):
-   Deployed: PAIR
-   bin_step=X | fee=X% | bots=X% | top10=X% | fees=XSOL
-   range=minPrice→maxPrice (downside=(minPrice/maxPrice-1)*100%)
-   smart_wallets=name1,name2 (or none)
-   narrative: <one sentence>
-   reason: <one sentence why picked over others>
-      `, config.llm.maxSteps, [], "SCREENER", config.llm.screeningModel, 2048);
-      screenReport = content;
-    } catch (error) {
-      log("cron_error", `Screening cycle failed: ${error.message}`);
-      screenReport = `Screening cycle failed: ${error.message}`;
-    } finally {
-      _screeningBusy = false;
-      if (!silent && telegramEnabled()) {
-        if (screenReport) sendMessage(`🔍 Screening Cycle\n\n${screenReport}`).catch(() => {});
-      }
-    }
-    return screenReport;
-  }
 
 export function startCronJobs() {
-  stopCronJobs();
-
-  const mgmtTask = cron.schedule(`*/${Math.max(1, config.schedule.managementIntervalMin)} * * * *`, async () => {
-    if (_managementBusy) return;
-    _managementBusy = true;
-    timers.managementLastRun = Date.now();
-    try { await runManagementCycle(); }
-    finally { _managementBusy = false; }
+  const screeningCooldownMs = 5 * 60 * 1000;
+  stopCronJobs(); // stop any running tasks before (re)starting
+  cronStarted = true;
+  const runManagementCycle = createManagementCycleRunner({
+    log,
+    config,
+    getMyPositions,
+    getWalletBalances,
+    validateStartupSnapshot,
+    classifyRuntimeFailure,
+		appendReplayEnvelope,
+		writeEvidenceBundle,
+    enforceManagementIntervalFromPositions,
+    recordPositionSnapshot,
+    getPositionPnl,
+    recallForPool,
+    recallForManagement,
+    isPnlSignalStale,
+    updatePnlAndCheckExits,
+    evaluatePortfolioGuard,
+		runManagementRuntimeActions,
+		listActionJournalWorkflowsByCycle,
+		executeTool,
+    didRuntimeHandleManagementAction,
+    classifyManagementModelGate,
+    summarizeRuntimeActionResult,
+    roundMetric,
+    agentLoop,
+    shouldTriggerFollowOnScreening,
+    runTriggeredScreening: async () => {
+      const triggeredCycleId = createCycleId("screening");
+      await runScreeningCycle({ cycleId: triggeredCycleId });
+    },
+    recordCycleEvaluation,
+    refreshRuntimeHealth,
+    telegramEnabled,
+    sendMessage,
+    notifyOutOfRange,
+    getManagementBusy: () => _managementBusy,
+    getScreeningBusy: () => _screeningBusy,
+    getScreeningLastTriggered: () => _screeningLastTriggered,
+    setManagementBusy: (value) => { _managementBusy = value; },
+    setManagementLastRun: (value) => { timers.managementLastRun = value; },
   });
 
-  const screenTask = cron.schedule(`*/${Math.max(1, config.schedule.screeningIntervalMin)} * * * *`, runScreeningCycle);
+  const runScreeningCycle = createScreeningCycleRunner({
+    log,
+    config,
+    getMyPositions,
+    getWalletBalances,
+    discoverPools,
+    getTopCandidates,
+    classifyRuntimeFailure,
+    validateStartupSnapshot,
+    appendReplayEnvelope,
+    writeEvidenceBundle,
+    getActiveStrategy,
+    computeDeployAmount,
+    asNumber,
+    deriveExpectedVolumeProfile,
+    executeTool,
+    inspectCandidate,
+    deriveTrendBias,
+    evaluateCandidateIntel,
+    formatFinalistInspectionBlock,
+    buildCandidateContext,
+    roundMetric,
+    agentLoop,
+    evaluatePortfolioGuard,
+    evaluateScreeningCycleAdmission,
+    getPerformanceSummary,
+    classifyRuntimeRegime,
+    applyRegimeHysteresis,
+    resolveRegimePackContext,
+    listCounterfactualRegimes,
+    getRegimePack,
+    getPerformanceSizingMultiplier,
+    getRiskSizingMultiplier,
+    getNegativeRegimeCooldown,
+    getNegativeRegimeMemory,
+		appendCounterfactualReview,
+		listActionJournalWorkflowsByCycle,
+		recordCycleEvaluation,
+    refreshRuntimeHealth,
+    telegramEnabled,
+    sendMessage,
+    setScreeningBusy: (value) => { _screeningBusy = value; },
+    setScreeningLastTriggered: (value) => { _screeningLastTriggered = value; },
+    setScreeningLastRun: (value) => { timers.screeningLastRun = value; },
+  });
+
+  const mgmtTask = cron.schedule(`*/${Math.max(1, config.schedule.managementIntervalMin)} * * * *`, async () => {
+    const overlapWith = getOverlappingCycleType({
+      cycleType: "management",
+      managementBusy: _managementBusy,
+      screeningBusy: _screeningBusy,
+    });
+		if (overlapWith) {
+			handleCycleOverlap({
+				cycleType: "management",
+				overlapWith,
+				createCycleId,
+				log,
+				appendReplayEnvelope,
+				recordCycleEvaluation,
+				refreshRuntimeHealth,
+				listActionJournalWorkflowsByCycle,
+				overlapInputs: {
+					cycleType: "management",
+					managementBusy: _managementBusy,
+					screeningBusy: _screeningBusy,
+				},
+			});
+			return;
+		}
+    const cycleId = createCycleId("management");
+    await runManagementCycle({ cycleId, screeningCooldownMs });
+  });
+
+  const runScreeningScheduled = async () => {
+    const overlapWith = getOverlappingCycleType({
+      cycleType: "screening",
+      managementBusy: _managementBusy,
+      screeningBusy: _screeningBusy,
+    });
+		if (overlapWith) {
+			handleCycleOverlap({
+				cycleType: "screening",
+				overlapWith,
+				createCycleId,
+				log,
+				appendReplayEnvelope,
+				recordCycleEvaluation,
+				refreshRuntimeHealth,
+				listActionJournalWorkflowsByCycle,
+				overlapInputs: {
+					cycleType: "screening",
+					managementBusy: _managementBusy,
+					screeningBusy: _screeningBusy,
+				},
+			});
+			return;
+		}
+    const cycleId = createCycleId("screening");
+    await runScreeningCycle({ cycleId });
+  };
+
+  const screenTask = cron.schedule(`*/${Math.max(1, config.schedule.screeningIntervalMin)} * * * *`, runScreeningScheduled);
 
   const healthTask = cron.schedule(`0 * * * *`, async () => {
     if (_managementBusy) return;
@@ -381,10 +393,28 @@ export function startCronJobs() {
       await agentLoop(`
 HEALTH CHECK
 
-Summarize the current portfolio health, total fees earned, and performance of all open positions. Recommend any high-level adjustments if needed.
+        Summarize the current portfolio health, total fees earned, and performance of all open positions. Recommend any high-level adjustments if needed.
       `, config.llm.maxSteps, [], "MANAGER");
+      refreshRuntimeHealth({
+        cycles: {
+          health: {
+            status: "completed",
+            reason: null,
+            at: new Date().toISOString(),
+          },
+        },
+      });
     } catch (error) {
       log("cron_error", `Health check failed: ${error.message}`);
+      refreshRuntimeHealth({
+        cycles: {
+          health: {
+            status: "failed",
+            reason: error.message,
+            at: new Date().toISOString(),
+          },
+        },
+      });
     } finally {
       _managementBusy = false;
     }
@@ -419,53 +449,72 @@ process.on("SIGINT",  () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 
 // ═══════════════════════════════════════════
-//  FORMAT CANDIDATES TABLE
-// ═══════════════════════════════════════════
-function formatCandidates(candidates) {
-  if (!candidates.length) return "  No eligible pools found right now.";
-
-  const lines = candidates.map((p, i) => {
-    const name   = (p.name || "unknown").padEnd(20);
-    const ftvl   = `${p.fee_active_tvl_ratio ?? p.fee_tvl_ratio}%`.padStart(8);
-    const vol    = `$${((p.volume_24h || 0) / 1000).toFixed(1)}k`.padStart(8);
-    const active = `${p.active_pct}%`.padStart(6);
-    const org    = String(p.organic_score).padStart(4);
-    return `  [${i + 1}]  ${name}  fee/aTVL:${ftvl}  vol:${vol}  in-range:${active}  organic:${org}`;
-  });
-
-  return [
-    "  #   pool                  fee/aTVL     vol    in-range  organic",
-    "  " + "─".repeat(68),
-    ...lines,
-  ].join("\n");
-}
-
-// ═══════════════════════════════════════════
 //  INTERACTIVE REPL
 // ═══════════════════════════════════════════
 const isTTY = process.stdin.isTTY;
 let cronStarted = false;
-let busy = false;
-const sessionHistory = []; // persists conversation across REPL turns
-const MAX_HISTORY = 20;    // keep last 20 messages (10 exchanges)
-
-function appendHistory(userMsg, assistantMsg) {
-  sessionHistory.push({ role: "user", content: userMsg });
-  sessionHistory.push({ role: "assistant", content: assistantMsg });
-  // Trim to last MAX_HISTORY messages
-  if (sessionHistory.length > MAX_HISTORY) {
-    sessionHistory.splice(0, sessionHistory.length - MAX_HISTORY);
-  }
-}
 
 // Register restarter — when update_config changes intervals, running cron jobs get replaced
 registerCronRestarter(() => { if (cronStarted) startCronJobs(); });
 
 if (isTTY) {
-  const rl = readline.createInterface({
-    input: process.stdin,
-    output: process.stdout,
-    prompt: buildPrompt(),
+  await runInteractiveInterface({
+    buildPrompt,
+    bootRecovery,
+    bootRecoveryBlockActive,
+    summarizeRecoveryBlock,
+    startCronJobs,
+    maybeRunMissedBriefing,
+    getStartupSnapshot,
+    getWalletBalances,
+    getMyPositions,
+    getTopCandidates,
+    isFailClosedResult,
+    buildOperationalHealthReport,
+    buildStaticProviderHealth,
+    buildProviderHealthFromSnapshot,
+    refreshRuntimeHealth,
+    getOperatorControlSnapshot,
+    secretHealth,
+    telegramEnabled,
+    generateBriefing,
+    getRecoveryWorkflowReport,
+    getAutonomousWriteSuppression,
+    formatRecoveryReport,
+    handleOperatorCommandText,
+    clearPortfolioGuardPause,
+    setAutonomousWriteSuppression,
+    acknowledgeRecoveryResume,
+    armGeneralWriteTools,
+    disarmGeneralWriteTools,
+    log,
+    agentLoop,
+    config,
+    startPolling,
+    sendMessage,
+    sendHTML,
+    getEvaluationSummary,
+    getStateSummary: () => ({ evaluation: getEvaluationSummary() }),
+    listEvidenceBundles,
+    formatEvidenceBundle,
+    getEvidenceBundle,
+    formatActionJournalReport,
+    listActionJournalEntries,
+    formatReplayEnvelope,
+    getReplayEnvelope,
+    formatReplayReview,
+    getReplayReview,
+    getReplayReviewStats,
+    getPerformanceSummary,
+    getPerformanceHistory,
+    getLpOverview,
+    getStrategyProofSummary,
+    getScreeningThresholdSummary,
+    evolveThresholds,
+    reloadScreeningThresholds,
+    executeTool,
+    shutdown,
+    deployAmountSol: DEPLOY,
   });
 
   // Update prompt countdown every 10 seconds
@@ -833,18 +882,46 @@ Focus on: hold duration, entry/exit timing, what win rates look like, whether sc
   rl.on("close", () => shutdown("stdin closed"));
 
 } else {
-  // Non-TTY: start immediately
-  log("startup", "Non-TTY mode — starting cron cycles immediately.");
-  startCronJobs();
-  maybeRunMissedBriefing().catch(() => {});
-  (async () => {
-    try {
-      await agentLoop(`
-STARTUP CHECK
-1. get_wallet_balance. 2. get_my_positions. 3. If SOL >= ${config.management.minSolToOpen}: get_top_candidates then deploy ${DEPLOY} SOL. 4. Report.
-      `, config.llm.maxSteps, [], "SCREENER");
-    } catch (e) {
-      log("startup_error", e.message);
-    }
-  })();
+  const onHeadlessTelegramMessage = createHeadlessTelegramCommandHandler({
+		handleOperatorCommandText: async ({ text, source }) => handleOperatorCommandText({
+			text,
+			source,
+			config,
+			getRecoveryWorkflowReport,
+			getAutonomousWriteSuppression,
+			setAutonomousWriteSuppression,
+			acknowledgeRecoveryResume,
+			armGeneralWriteTools,
+			disarmGeneralWriteTools,
+			getOperatorControlSnapshot,
+			refreshRuntimeHealth,
+		}),
+		buildOperationalHealthReport: async () => buildOperationalHealthReport({
+			getStartupSnapshot,
+			getWalletBalances,
+			getMyPositions,
+			getTopCandidates,
+			isFailClosedResult,
+			buildStaticProviderHealth,
+			buildProviderHealthFromSnapshot,
+			refreshRuntimeHealth,
+			getOperatorControlSnapshot,
+			secretHealth,
+			telegramEnabled,
+		}),
+		getRecoveryWorkflowReport,
+		getAutonomousWriteSuppression,
+		formatRecoveryReport,
+		sendMessage,
+	});
+  await runNonInteractiveStartup({
+    bootRecoveryBlockActive,
+    bootRecovery,
+    summarizeRecoveryBlock,
+    log,
+    startCronJobs,
+    maybeRunMissedBriefing,
+		startPolling,
+		onTelegramMessage: onHeadlessTelegramMessage,
+  });
 }

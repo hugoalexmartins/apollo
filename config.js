@@ -1,17 +1,21 @@
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
+import { computeAdaptiveDeployAmount, getEffectiveMinSolToOpen, normalizeOptionalNonNegativeNumber } from "./runtime-helpers.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const USER_CONFIG_PATH = path.join(__dirname, "user-config.json");
+const USER_CONFIG_PATH = process.env.ZENITH_USER_CONFIG_PATH || path.join(__dirname, "user-config.json");
 
 const u = fs.existsSync(USER_CONFIG_PATH)
   ? JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8"))
   : {};
 
+export const secretHealth = {
+  wallet_key_source: process.env.WALLET_PRIVATE_KEY ? "env" : "missing",
+};
+
 // Apply wallet/RPC from user-config if not already in env
 if (u.rpcUrl)    process.env.RPC_URL            ||= u.rpcUrl;
-if (u.walletKey) process.env.WALLET_PRIVATE_KEY ||= u.walletKey;
 if (u.llmModel)  process.env.LLM_MODEL          ||= u.llmModel;
 if (u.dryRun !== undefined) process.env.DRY_RUN ||= String(u.dryRun);
 
@@ -34,6 +38,8 @@ export const config = {
     maxMcap:           u.maxMcap           ?? 10_000_000,
     minBinStep:        u.minBinStep        ?? 80,
     maxBinStep:        u.maxBinStep        ?? 125,
+    minTokenAgeHours:  normalizeOptionalNonNegativeNumber(u.minTokenAgeHours, null),
+    maxTokenAgeHours:  normalizeOptionalNonNegativeNumber(u.maxTokenAgeHours, null),
     timeframe:         u.timeframe         ?? "5m",
     category:          u.category          ?? "trending",
     minTokenFeesSol:   u.minTokenFeesSol   ?? 30,  // global fees paid (priority+jito tips). below = bundled/scam
@@ -50,12 +56,33 @@ export const config = {
     outOfRangeWaitMinutes: u.outOfRangeWaitMinutes ?? 30,
     minVolumeToRebalance:  u.minVolumeToRebalance  ?? 1000,
     emergencyPriceDropPct: u.emergencyPriceDropPct ?? -50,
+    stopLossPct:           u.stopLossPct           ?? -20,
     takeProfitFeePct:      u.takeProfitFeePct      ?? 5,
+    trailingTakeProfit:    u.trailingTakeProfit    ?? true,
+    trailingTriggerPct:    u.trailingTriggerPct    ?? 3,
+    trailingDropPct:       u.trailingDropPct       ?? 1.5,
     minFeePerTvl24h:       u.minFeePerTvl24h       ?? 7,
-    minSolToOpen:          u.minSolToOpen          ?? 0.55,
+    slowReviewIntervalMin: u.slowReviewIntervalMin ?? 15,
+    minSolToOpen:          getEffectiveMinSolToOpen({
+      minSolToOpen: u.minSolToOpen ?? 0.55,
+      deployAmountSol: u.deployAmountSol ?? 0.5,
+      gasReserve: u.gasReserve ?? 0.2,
+    }),
     deployAmountSol:       u.deployAmountSol       ?? 0.5,
     gasReserve:            u.gasReserve            ?? 0.2,
     positionSizePct:       u.positionSizePct       ?? 0.35,
+  },
+
+  protections: {
+    enabled: u.protectionsEnabled ?? true,
+    maxRecentRealizedLossUsd: u.maxRecentRealizedLossUsd ?? 100,
+    maxDrawdownPct: u.maxDrawdownPct ?? 25,
+    maxOpenUnrealizedLossUsd: u.maxOpenUnrealizedLossUsd ?? 150,
+    recentLossWindowHours: u.recentLossWindowHours ?? 24,
+    stopLossStreakLimit: u.stopLossStreakLimit ?? 3,
+    pauseMinutes: u.portfolioPauseMinutes ?? 180,
+    maxReviewedCloses: u.maxReviewedCloses ?? 50,
+    recoveryResumeOverrideMinutes: u.recoveryResumeOverrideMinutes ?? 180,
   },
 
   // ─── Strategy Mapping ───────────────────
@@ -66,7 +93,7 @@ export const config = {
 
   // ─── Scheduling ─────────────────────────
   schedule: {
-    managementIntervalMin:  u.managementIntervalMin  ?? 10,
+    managementIntervalMin:  u.managementIntervalMin  ?? 3,
     screeningIntervalMin:   u.screeningIntervalMin   ?? 30,
     healthCheckIntervalMin: u.healthCheckIntervalMin ?? 60,
   },
@@ -101,15 +128,31 @@ export const config = {
  *   3.0 SOL wallet → 0.98 SOL deploy
  *   4.0 SOL wallet → 1.33 SOL deploy
  */
-export function computeDeployAmount(walletSol) {
+export function computeDeployAmount(walletSol, {
+  regimeMultiplier = 1,
+  performanceMultiplier = 1,
+  riskMultiplier = 1,
+  skipBelowFloor = true,
+  floorOverride,
+  reserveOverride,
+  positionSizePctOverride,
+  maxDeployOverride,
+} = {}) {
   const reserve  = config.management.gasReserve      ?? 0.2;
   const pct      = config.management.positionSizePct ?? 0.35;
   const floor    = config.management.deployAmountSol;
   const ceil     = config.risk.maxDeployAmount;
-  const deployable = Math.max(0, walletSol - reserve);
-  const dynamic    = deployable * pct;
-  const result     = Math.min(ceil, Math.max(floor, dynamic));
-  return parseFloat(result.toFixed(2));
+  return computeAdaptiveDeployAmount({
+    walletSol,
+    reserve: reserveOverride ?? reserve,
+    floor: floorOverride ?? floor,
+    ceil: maxDeployOverride ?? ceil,
+    positionSizePct: positionSizePctOverride ?? pct,
+    regimeMultiplier,
+    performanceMultiplier,
+    riskMultiplier,
+    skipBelowFloor,
+  });
 }
 
 /**
@@ -122,6 +165,7 @@ export function reloadScreeningThresholds() {
   try {
     const fresh = JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8"));
     const s = config.screening;
+    const hasOwn = (key) => Object.hasOwn(fresh, key);
     if (fresh.minFeeActiveTvlRatio != null) s.minFeeActiveTvlRatio = fresh.minFeeActiveTvlRatio;
     if (fresh.minOrganic     != null) s.minOrganic     = fresh.minOrganic;
     if (fresh.minHolders     != null) s.minHolders     = fresh.minHolders;
@@ -132,8 +176,11 @@ export function reloadScreeningThresholds() {
     if (fresh.minVolume      != null) s.minVolume      = fresh.minVolume;
     if (fresh.minBinStep     != null) s.minBinStep     = fresh.minBinStep;
     if (fresh.maxBinStep     != null) s.maxBinStep     = fresh.maxBinStep;
+    if (fresh.maxBundlersPct != null) s.maxBundlersPct = fresh.maxBundlersPct;
+    if (fresh.maxTop10Pct    != null) s.maxTop10Pct    = fresh.maxTop10Pct;
+    if (hasOwn("minTokenAgeHours")) s.minTokenAgeHours = normalizeOptionalNonNegativeNumber(fresh.minTokenAgeHours, s.minTokenAgeHours);
+    if (hasOwn("maxTokenAgeHours")) s.maxTokenAgeHours = normalizeOptionalNonNegativeNumber(fresh.maxTokenAgeHours, s.maxTokenAgeHours);
     if (fresh.timeframe      != null) s.timeframe      = fresh.timeframe;
     if (fresh.category       != null) s.category       = fresh.category;
   } catch { /* ignore */ }
 }
-

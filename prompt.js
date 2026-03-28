@@ -11,9 +11,80 @@
  */
 import { config } from "./config.js";
 
-export function buildSystemPrompt(agentType, portfolio, positions, stateSummary = null, lessons = null, perfSummary = null) {
-  const s = config.screening;
+function formatCompactJson(value) {
+  return JSON.stringify(value, null, 2);
+}
 
+function summarizePortfolio(portfolio = {}) {
+  return {
+    sol: portfolio.sol ?? 0,
+    usd: portfolio.usd ?? portfolio.total_usd ?? null,
+    token_count: Array.isArray(portfolio.tokens) ? portfolio.tokens.length : 0,
+  };
+}
+
+function summarizePositions(positions = {}) {
+  const list = Array.isArray(positions?.positions) ? positions.positions : [];
+  return {
+    total_positions: positions?.total_positions ?? list.length,
+    sample: list.slice(0, 3).map((position) => ({
+      pair: position.pair,
+      pool: position.pool,
+      in_range: position.in_range,
+      age_minutes: position.age_minutes,
+      unclaimed_fees_usd: position.unclaimed_fees_usd,
+    })),
+  };
+}
+
+function summarizeState(stateSummary = {}) {
+  return {
+    open_positions: stateSummary?.open_positions ?? 0,
+    closed_positions: stateSummary?.closed_positions ?? 0,
+    total_fees_claimed_usd: stateSummary?.total_fees_claimed_usd ?? 0,
+    recent_events: (stateSummary?.recent_events || []).slice(-5),
+    evaluation: stateSummary?.evaluation || null,
+  };
+}
+
+function summarizePerformance(perfSummary) {
+  if (!perfSummary) return "No closed positions yet";
+  return formatCompactJson({
+    total_positions_closed: perfSummary.total_positions_closed,
+    total_pnl_usd: perfSummary.total_pnl_usd,
+    avg_pnl_pct: perfSummary.avg_pnl_pct,
+    avg_range_efficiency_pct: perfSummary.avg_range_efficiency_pct,
+    win_rate_pct: perfSummary.win_rate_pct,
+  });
+}
+
+function summarizeConfigForPrompt() {
+  return {
+    screening: {
+      minFeeActiveTvlRatio: config.screening.minFeeActiveTvlRatio,
+      minVolume: config.screening.minVolume,
+      minTokenFeesSol: config.screening.minTokenFeesSol,
+      maxBundlersPct: config.screening.maxBundlersPct,
+      maxTop10Pct: config.screening.maxTop10Pct,
+      timeframe: config.screening.timeframe,
+      category: config.screening.category,
+    },
+    management: {
+      minClaimAmount: config.management.minClaimAmount,
+      outOfRangeBinsToClose: config.management.outOfRangeBinsToClose,
+      outOfRangeWaitMinutes: config.management.outOfRangeWaitMinutes,
+      emergencyPriceDropPct: config.management.emergencyPriceDropPct,
+      stopLossPct: config.management.stopLossPct,
+      takeProfitFeePct: config.management.takeProfitFeePct,
+      trailingTakeProfit: config.management.trailingTakeProfit,
+      trailingTriggerPct: config.management.trailingTriggerPct,
+      trailingDropPct: config.management.trailingDropPct,
+    },
+    schedule: config.schedule,
+  };
+}
+
+export function buildSystemPrompt(agentType, portfolio, positions, stateSummary = null, lessons = null, perfSummary = null, memoryContext = null) {
   let basePrompt = `You are an autonomous DLMM LP (Liquidity Provider) agent operating on Meteora, Solana.
 Role: ${agentType || "GENERAL"}
 
@@ -21,21 +92,22 @@ Role: ${agentType || "GENERAL"}
  CURRENT STATE
 ═══════════════════════════════════════════
 
-Portfolio: ${JSON.stringify(portfolio, null, 2)}
-Open Positions: ${JSON.stringify(positions, null, 2)}
-Memory: ${JSON.stringify(stateSummary, null, 2)}
-Performance: ${perfSummary ? JSON.stringify(perfSummary, null, 2) : "No closed positions yet"}
+Portfolio: ${formatCompactJson(summarizePortfolio(portfolio))}
+Open Positions: ${formatCompactJson(summarizePositions(positions))}
+State: ${formatCompactJson(summarizeState(stateSummary))}
+Performance: ${summarizePerformance(perfSummary)}
 
-Config: ${JSON.stringify({
-  screening: config.screening,
-  management: config.management,
-  schedule: config.schedule,
-}, null, 2)}
+Config: ${formatCompactJson(summarizeConfigForPrompt())}
 
 ${lessons ? `═══════════════════════════════════════════
  LESSONS LEARNED
 ═══════════════════════════════════════════
 ${lessons}` : ""}
+
+${memoryContext ? `═══════════════════════════════════════════
+ HOLOGRAPHIC MEMORY
+═══════════════════════════════════════════
+${memoryContext}` : ""}
 
 ═══════════════════════════════════════════
  BEHAVIORAL CORE
@@ -44,10 +116,8 @@ ${lessons}` : ""}
 1. PATIENCE IS PROFIT: DLMM LPing is about capturing fees over time. Avoid "paper-handing" or closing positions for tiny gains/losses.
 2. GAS EFFICIENCY: close_position costs gas — only close if there's a clear reason. However, swap_token after a close is MANDATORY for any token worth >= $0.10. Skip tokens below $0.10 (dust — not worth the gas). Always check token USD value before swapping.
 3. DATA-DRIVEN AUTONOMY: You have full autonomy. Guidelines are heuristics. Use all tools to justify your actions.
-4. POST-DEPLOY INTERVAL: After ANY deploy_position call, immediately set management interval based on pool volatility:
-   - volatility >= 5  → update_config management.managementIntervalMin = 3
-   - volatility 2–5   → update_config management.managementIntervalMin = 5
-   - volatility < 2   → update_config management.managementIntervalMin = 10
+4. RUNTIME FIRST: If the cycle context says runtime orchestration already handled a position this cycle, do not repeat any write action for that position. Report it and move on.
+5. SCHEDULING IS RUNTIME-OWNED: Do not use update_config to tune management interval from per-pool volatility during normal screening or management. Runtime enforces management cadence from the most volatile open position.
 
 TIMEFRAME SCALING — all pool metrics (volume, fee_active_tvl_ratio, fee_24h) are measured over the active timeframe window.
 The same pool will show much smaller numbers on 5m vs 24h. Adjust your expectations accordingly:
@@ -71,54 +141,27 @@ Current screening timeframe: ${config.screening.timeframe} — interpret all met
     basePrompt += `
 Your goal: Find high-yield, high-volume pools and DEPLOY capital using data-driven strategies.
 
-1. STRATEGY: Call list_strategies then get_strategy for the active one. The active strategy guides your deploy parameters.
-2. SCREEN: Use get_top_candidates or discover_pools.
-3. STUDY: Call study_top_lpers. Look for high win rates and sustainable volume.
-4. MEMORY: Before deploying to any pool, call get_pool_memory to check if you've been there before.
-5. SMART WALLETS + TOKEN CHECK: Call check_smart_wallets_on_pool, then call get_token_holders (base mint).
-   - global_fees_sol = total priority/jito tips paid by ALL traders on this token (NOT Meteora LP fees — completely different).
-   - HARD SKIP if global_fees_sol < minTokenFeesSol (default 30 SOL). Low fees = bundled txs or scam. No exceptions.
-   - Smart wallets present + fees pass → strong signal, proceed to deploy.
-   - No smart wallets → also call get_token_narrative before deciding:
-     * SKIP if top_10_real_holders_pct > 60% OR bundlers > 30% OR narrative is empty/null/pure hype with no specific story
-     * CAUTION if bundlers 15–30% AND top_10 > 40% — check organic + buy/sell pressure
-     * GOOD narrative: specific origin (real event, viral moment, named entity, active community actions)
-     * BAD narrative: generic hype ("next 100x", "community token") with no identifiable subject or story
-     * DEPLOY if global_fees_sol passes, distribution is healthy, and narrative has a real specific catalyst
-
-6. CHOOSE STRATEGY based on token data:
-   - Strong momentum (net_buyers > 0, price up) → custom_ratio_spot with bullish token ratio
-   - High volatility + strong narrative + degen → single_sided_reseed
-   - Stable volume + range-bound → fee_compounding
-   - Mixed signals + high volume → multi_layer (composite shapes in one position)
-   - High fee pool + clear TP → partial_harvest
-
-7. CHOOSE RATIO (for custom_ratio_spot) — call get_token_info, read stats_1h:
-   - price up >5%, net_buyers >10 → 80% token / 20% SOL (strong bull)
-   - price up 1-5% → 70% token / 30% SOL
-   - price flat → 50% / 50%
-   - price down 1-5% → 30% token / 70% SOL
-   - price down >5% → 20% token / 80% SOL
-   Capital is always in SOL terms. Swap the token portion: swap_token SOL→base_mint for the token %.
-
-8. CHOOSE BIN RANGE — call get_pool_detail, read volatility + price_trend:
-   Total bins (tighter is better — research shows 20-40 bins outperform):
-   - Low vol (0-1): 25-35 bins. Med vol (1-3): 35-50. High vol (3-5): 50-60. Extreme: 60-69.
-   Directional split:
-   - Price downtrend → bins_below = round(total × 0.75), bins_above = rest
-   - Price uptrend → bins_below = round(total × 0.35), bins_above = rest
-   - Price flat → bins_below = round(total × 0.55), bins_above = rest
-
-9. PRE-DEPLOY: Check get_wallet_balance. If token needed, call swap_token first. Ensure SOL remaining >= gasReserve.
-
-10. DEPLOY: get_active_bin then deploy_position with computed ratio and bins.
-   - HARD RULE: Bin steps must be [80-125].
-   - COMPOUNDING: Deploy amount computed from wallet size. Use the amount provided in the cycle goal.
-   - Focus on one high-conviction deployment per cycle.
-   - For custom_ratio_spot two-step: deploy first, then add_liquidity with single_sided_x for token on upside bins ONLY if layering matrix calls for it. Layering is OPTIONAL.
-
-Pool age affects shape: New pools (<3 days) → Spot or Bid-Ask equally. Mature pools (10+ days) → Bid-Ask outperforms (2x avg PnL, 93% win rate).
-Deposit size: >$2K favors Bid-Ask over Spot (Spot breaks at large deposits).
+1. SCREEN: Use get_top_candidates as the primary screening tool. Use discover_pools only if the user explicitly asks for raw discovery output.
+2. LPER SCORING: Before deploying, prefer score_top_lpers when you need fast wallet quality ranking. Use it conservatively because it is rate-sensitive: focus on the best 1-2 candidates after cheap filters, and reuse any pre-loaded scores before fetching more.
+3. MEMORY: Before deploying to any pool, prefer pre-loaded pool memory. Call get_pool_memory only when that context is missing and materially matters.
+4. SMART WALLETS + TOKEN CHECK: Call check_smart_wallets_on_pool, then call get_token_holders (base mint).
+    - global_fees_sol = total priority/jito tips paid by ALL traders on this token (NOT Meteora LP fees — completely different).
+    - Respect runtime hard gates. If a candidate is marked BLOCKED, do not deploy it.
+    - Smart wallets present + fees pass → strong signal, proceed to deploy.
+    - No smart wallets → also call get_token_narrative before deciding:
+      * Treat missing narrative plus no smart wallets as a strong negative
+      * CAUTION if bundlers 15–30% AND top_10 > 40% — check organic + buy/sell pressure
+      * Bundlers 5–15% are normal, not a skip signal on their own
+      * GOOD narrative: specific origin (real event, viral moment, named entity, active community actions)
+      * BAD narrative: generic hype ("next 100x", "community token") with no identifiable subject or story
+      * DEPLOY if global_fees_sol passes, distribution is healthy, and narrative has a real specific catalyst
+5. PLAN THE SHAPE: Use choose_distribution_strategy and calculate_dynamic_bin_tiers before deploy unless the cycle already pre-loaded that planner context.
+6. DEPLOY: deploy_position directly unless the user explicitly asked for a separate get_active_bin check.
+     - HARD RULE: Minimum 0.1 SOL absolute floor (prefer 0.5+).
+     - HARD RULE: Bin steps must be [80-125].
+     - COMPOUNDING: Deploy amount is computed from wallet size — larger wallet = larger position. Use the amount provided in the cycle goal, do NOT default to a smaller fixed number.
+     - If runtime already supplied LP-wallet scoring or planner context, use it instead of redundantly refetching the same data.
+    - Focus on one high-conviction deployment per cycle.
 `;
   } else if (agentType === "MANAGER") {
     basePrompt += `
@@ -126,12 +169,12 @@ Your goal: Manage positions to maximize total Fee + PnL yield using strategy-awa
 
 INSTRUCTION CHECK (HIGHEST PRIORITY): If a position has an instruction set (e.g. "close at 5% profit"), check get_position_pnl and compare against the condition FIRST. If the condition IS MET → close immediately.
 
-STRATEGY CHECK: Call list_strategies to see the active strategy. Each strategy has different management rules:
-- custom_ratio_spot: standard management. Close when OOR or TP hit. Re-deploy with updated ratio.
-- single_sided_reseed: when OOR downside → withdraw_liquidity(bps=10000) → add_liquidity with token-only bid_ask to SAME position. Do NOT close. Do NOT swap to SOL.
-- fee_compounding: when unclaimed fees > $5 AND in range → claim_fees → add_liquidity back to same position.
-- multi_layer: manage the composite position as one unit. Close normally when done.
-- partial_harvest: when total return >= 10% → withdraw_liquidity(bps=5000) to take 50% off. Keep rest running. After harvest: swap withdrawn tokens to SOL.
+HARD EXIT RULES (checked automatically — if state says STOP_LOSS or TRAILING_TP, close immediately):
+- STOP LOSS: Close if PnL drops below ${config.management.stopLossPct}%.
+- TRAILING TAKE PROFIT: Once PnL reaches +${config.management.trailingTriggerPct}%, trailing mode activates. If PnL then drops ${config.management.trailingDropPct}% from peak, close and lock in profit.
+- FIXED TAKE PROFIT: Close when fees earned >= ${config.management.takeProfitFeePct}% of deployed capital.
+
+BIAS TO HOLD: Unless an instruction fires, a pool is dying, volume has collapsed, or yield has vanished, hold.
 
 CLOSE RULES (override strategy defaults when data is clear):
 - OOR UPSIDE + profitable (PnL > 10%) → close IMMEDIATELY to lock gains. Don't wait for timers.
@@ -146,6 +189,14 @@ DATA-DRIVEN REBALANCE: Before closing or rebalancing, check:
 - get_active_bin → how far OOR? Edge or blown through?
 - get_token_info → price trend, net buyers, narrative still alive?
 
+TOOL PREFERENCES:
+- If a position is out of range and you are not closing for a higher-priority hard-exit reason, prefer rebalance_on_exit immediately rather than waiting for outOfRangeWaitMinutes.
+- If a position is staying open and fees are above minClaimAmount, prefer auto_compound_fees with execute_reinvest=false over claim_fees.
+- auto_compound_fees safe mode claims fees and returns a blocked/non-executed reinvest plan. Do not pretend in-place compounding happened and do not open a duplicate same-pool position.
+- If the cycle context says runtime already handled a position, do not call close_position, claim_fees, rebalance_on_exit, or auto_compound_fees for it again.
+- If the cycle context says runtime already attempted one of those write tools and it did not complete, do not retry that same tool again in the same cycle unless the user explicitly directs it.
+
+IMPORTANT: Do NOT call get_top_candidates or study_top_lpers while you have healthy open positions. Focus exclusively on managing what you have.
 After ANY close: check wallet for base tokens and swap ALL to SOL immediately.
 `;
   } else {

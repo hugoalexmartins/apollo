@@ -4,7 +4,7 @@ import { fileURLToPath } from "url";
 import { log } from "./logger.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const USER_CONFIG_PATH = path.join(__dirname, "user-config.json");
+const USER_CONFIG_PATH = process.env.ZENITH_USER_CONFIG_PATH || path.join(__dirname, "user-config.json");
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN || null;
 const BASE  = TOKEN ? `https://api.telegram.org/bot${TOKEN}` : null;
@@ -21,18 +21,6 @@ function loadChatId() {
       if (cfg.telegramChatId) chatId = cfg.telegramChatId;
     }
   } catch { /**/ }
-}
-
-function saveChatId(id) {
-  try {
-    let cfg = fs.existsSync(USER_CONFIG_PATH)
-      ? JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8"))
-      : {};
-    cfg.telegramChatId = id;
-    fs.writeFileSync(USER_CONFIG_PATH, JSON.stringify(cfg, null, 2));
-  } catch (e) {
-    log("telegram_error", `Failed to persist chatId: ${e.message}`);
-  }
 }
 
 loadChatId();
@@ -94,23 +82,15 @@ async function poll(onMessage) {
       );
       if (!res.ok) { await sleep(5000); continue; }
       const data = await res.json();
-      for (const update of data.result || []) {
-        _offset = update.update_id + 1;
-        const msg = update.message;
-        if (!msg?.text) continue;
+		for (const update of data.result || []) {
+			_offset = update.update_id + 1;
+			const msg = update.message;
+			if (!msg?.text) continue;
 
-        const incomingChatId = String(msg.chat.id);
+			const incomingChatId = String(msg.chat.id);
 
-        // Auto-register first sender as the owner
-        if (!chatId) {
-          chatId = incomingChatId;
-          saveChatId(chatId);
-          log("telegram", `Registered chat ID: ${chatId}`);
-          await sendMessage("Connected! I'm your LP agent. Ask me anything or use commands like /status.");
-        }
-
-        // Only accept messages from the registered chat
-        if (incomingChatId !== chatId) continue;
+			// Only accept messages from the registered chat
+			if (incomingChatId !== chatId) continue;
 
         await onMessage(msg.text);
       }
@@ -125,6 +105,10 @@ async function poll(onMessage) {
 
 export function startPolling(onMessage) {
   if (!TOKEN) return;
+  if (!chatId) {
+    log("telegram_warn", "TELEGRAM_CHAT_ID not configured; polling disabled.");
+    return;
+  }
   _polling = true;
   poll(onMessage); // fire-and-forget
   log("telegram", "Bot polling started");

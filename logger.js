@@ -66,7 +66,8 @@ export function logAction(action) {
   const status = action.success ? "✓" : "✗";
   const dur = action.duration_ms != null ? ` (${action.duration_ms}ms)` : "";
   const hint = actionHint(action);
-  console.log(`[${action.tool}] ${status}${hint}${dur}`);
+  const correlation = [action.cycle_id, action.action_id].filter(Boolean).join("/");
+  console.log(`[${action.tool}] ${status}${hint}${dur}${correlation ? ` [${correlation}]` : ""}`);
 
   // File: full JSON for audit trail
   const dateStr = timestamp.split("T")[0];

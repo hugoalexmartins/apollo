@@ -48,10 +48,10 @@ Use this as the primary tool for finding new LP opportunities.`,
     type: "function",
     function: {
       name: "get_top_candidates",
-      description: `Get the top pre-scored pool candidates ready for deployment.
-All filtering, scoring, and rule-checking is done in code — no analysis needed.
-Returns the top N eligible pools ranked by score (fee/TVL, organic, stability, volume).
-Each pool includes a score (0-100) and has already passed all hard disqualifiers.
+      description: `Get the top deterministic pool candidates ready for deployment.
+All base filtering, scoring, and occupied-position checks are done in code before the result is returned.
+Returns the top N eligible pools ranked by deterministic score (fee efficiency, volume, organic score, holder depth, active liquidity, volatility fit).
+Each pool includes deterministic_score, score_breakdown, gate_results, and eligibility metadata.
 Use this instead of discover_pools for screening cycles.`,
       parameters: {
         type: "object",
@@ -106,7 +106,7 @@ This is an on-chain call via the SDK. Returns:
 - price: human-readable price (token X per token Y)
 - pricePerLamport: raw price in lamports
 
-Only call this if you need the current price to calculate a specific bin range (e.g. user requested a % range). Do NOT call before every deploy — deploy_position fetches the active bin internally.`,
+Use this when you explicitly need a standalone active-bin check. deploy_position already fetches the active bin internally.`,
       parameters: {
         type: "object",
         properties: {
@@ -123,8 +123,60 @@ Only call this if you need the current price to calculate a specific bin range (
   {
     type: "function",
     function: {
+      name: "choose_distribution_strategy",
+      description: `Choose a deterministic DLMM distribution strategy from pool inputs and expected volume profile.
+Returns a code-driven recommendation using only supported strategy names: bid_ask or spot.
+Also returns lower/center/upper allocation guidance and the normalized inputs needed for the next planning step.`,
+      parameters: {
+        type: "object",
+        properties: {
+          pool_data: {
+            type: "object",
+            description: "Pool snapshot for planning. Useful fields: six_hour_volatility or volatility, fee_tvl_ratio, organic_score, bin_step, price_change_pct, active_tvl, volume_24h."
+          },
+          expected_volume_profile: {
+            type: "string",
+            enum: ["low", "balanced", "high", "bursty"],
+            description: "Expected near-term volume regime. 'balanced' is the safe default when unsure."
+          }
+        },
+        required: ["pool_data", "expected_volume_profile"]
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "calculate_dynamic_bin_tiers",
+      description: `Build a deterministic 5-tier DLMM bin plan from 6h volatility and optional trend bias.
+The executable logic hard-clamps every side to a maximum of 34 bins.
+Returns lower, center, and upper tier metadata that can later drive live LP placement or re-entry logic.`,
+      parameters: {
+        type: "object",
+        properties: {
+          six_hour_volatility: {
+            type: "number",
+            description: "6h volatility input for planning. Higher values widen the bin plan up to the 34-bins-per-side hard cap."
+          },
+          trend_bias: {
+            type: "string",
+            enum: ["bearish", "neutral", "bullish"],
+            description: "Optional directional bias. Default neutral. Bullish shifts more bins and weight upward; bearish shifts downward."
+          }
+        },
+        required: ["six_hour_volatility"]
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
       name: "deploy_position",
       description: `Open a new DLMM liquidity position.
+
+This tool already fetches the active bin internally. Do not pre-call get_active_bin unless you explicitly need a standalone bin read for analysis.
 
 PRIORITY ORDER for strategy and bins:
 1. User explicitly specifies → always follow exactly (user override is absolute)
@@ -179,7 +231,7 @@ WARNING: This executes a real on-chain transaction. Check DRY_RUN mode.`,
           volatility: { type: "number", description: "Pool volatility at deploy time" },
           fee_tvl_ratio: { type: "number", description: "fee/TVL ratio at deploy time" },
           organic_score: { type: "number", description: "Base token organic score at deploy time" },
-          initial_value_usd: { type: "number", description: "USD value being deployed — REQUIRED for accurate PnL tracking" }
+          initial_value_usd: { type: "number", description: "Runtime-computed USD deploy basis. Ignored if supplied by the caller." }
         },
         required: ["pool_address", "initial_value_usd"]
       }
@@ -271,9 +323,89 @@ WARNING: This executes a real on-chain transaction. Cannot be undone.`,
             type: "string",
             description: "The position public key to close"
           },
+          reason: {
+            type: "string",
+            description: "Optional close reason for performance/accounting records"
+          },
           skip_swap: {
             type: "boolean",
             description: "Set to true if user explicitly wants to hold/keep the base token after closing. Default: false (auto-swaps base token back to SOL)."
+          }
+        },
+        required: ["position_address"]
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "rebalance_on_exit",
+      description: `Rebalance a position only when it is out of range.
+Builds a deterministic close + redeploy plan using choose_distribution_strategy and calculate_dynamic_bin_tiers.
+The bin planner keeps the 34-bins-per-side hard cap.
+
+Behavior:
+- If the position is still in range, it will skip unless force_rebalance=true.
+- In DRY_RUN it returns the full action plan and does not send transactions.
+- In live mode it fails safely if required state (position, wallet balances, deploy amounts) is missing.`,
+      parameters: {
+        type: "object",
+        properties: {
+          position_address: {
+            type: "string",
+            description: "The position public key to evaluate and rebalance"
+          },
+          force_rebalance: {
+            type: "boolean",
+            description: "Override in-range protection and force rebalance planning/execution. Default false."
+          },
+          expected_volume_profile: {
+            type: "string",
+            enum: ["low", "balanced", "high", "bursty"],
+            description: "Optional volume regime hint used by deterministic strategy planning."
+          },
+          execute: {
+            type: "boolean",
+            description: "Set false to return plan only in live mode. Default true."
+          }
+        },
+        required: ["position_address"]
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "auto_compound_fees",
+      description: `Claim fees and prepare a location-aware compounding plan for a position.
+Classifies active-bin location as near lower / center / upper and biases reinvestment accordingly:
+- near_lower -> base-heavy
+- near_center -> balanced
+- near_upper -> quote-heavy
+
+Uses deterministic helpers (choose_distribution_strategy + calculate_dynamic_bin_tiers) for planning.
+In DRY_RUN it returns claim + reinvest plans only. In live mode it claims first, then optionally opens an additional compounded position when execute_reinvest=true.`,
+      parameters: {
+        type: "object",
+        properties: {
+          position_address: {
+            type: "string",
+            description: "The position public key to claim and compound"
+          },
+          execute_reinvest: {
+            type: "boolean",
+            description: "If true, execute reinvest deployment after claiming fees. Default false (plan-only after claim)."
+          },
+          force_claim: {
+            type: "boolean",
+            description: "Attempt claim even when detected unclaimed fee amount is zero. Default false."
+          },
+          expected_volume_profile: {
+            type: "string",
+            enum: ["low", "balanced", "high", "bursty"],
+            description: "Optional volume regime hint used by deterministic strategy planning."
           }
         },
         required: ["position_address"]
@@ -368,12 +500,20 @@ WARNING: This executes a real on-chain transaction.`,
 Changes persist to user-config.json and take effect immediately — no restart needed.
 
 VALID KEYS (use EXACTLY these key names, nothing else):
-Screening: minFeeActiveTvlRatio, minTvl, maxTvl, minVolume, minOrganic, minHolders, minMcap, maxMcap, minBinStep, maxBinStep, timeframe, category, minTokenFeesSol
-Management: minClaimAmount, outOfRangeBinsToClose, outOfRangeWaitMinutes, minVolumeToRebalance, emergencyPriceDropPct, takeProfitFeePct, minSolToOpen, deployAmountSol, gasReserve, positionSizePct
+Screening: minFeeActiveTvlRatio, minTvl, maxTvl, minVolume, minOrganic, minHolders, minMcap, maxMcap, minBinStep, maxBinStep, timeframe, category, minTokenFeesSol, maxBundlersPct, maxTop10Pct
+Protections: protectionsEnabled, maxRecentRealizedLossUsd, maxDrawdownPct, maxOpenUnrealizedLossUsd, recentLossWindowHours, stopLossStreakLimit, portfolioPauseMinutes, maxReviewedCloses, recoveryResumeOverrideMinutes
+Management: minClaimAmount, outOfRangeBinsToClose, outOfRangeWaitMinutes, minVolumeToRebalance, emergencyPriceDropPct, stopLossPct, takeProfitFeePct, trailingTakeProfit, trailingTriggerPct, trailingDropPct, minSolToOpen, deployAmountSol, gasReserve, positionSizePct
 Risk: maxPositions, maxDeployAmount
 Schedule: managementIntervalMin, screeningIntervalMin
 Models: managementModel, screeningModel, generalModel
 Strategy: binsBelow
+
+Examples:
+- { takeProfitFeePct: 8 }        — raise the fixed take-profit target
+- { stopLossPct: -15 }           — tighten downside protection
+- { trailingTakeProfit: true }   — enable trailing exits
+- { trailingTriggerPct: 5 }      — only arm trailing after +5%
+- { trailingDropPct: 2 }         — close after a 2% pullback from peak
 
 Reason is optional but helpful — logged as a lesson when provided.`,
       parameters: {
@@ -628,6 +768,53 @@ Use this before deploying into a new pool to:
   {
     type: "function",
     function: {
+      name: "score_top_lpers",
+      description: `Score top LP wallets for a pool using LP Agent as the primary source.
+Returns ranked wallet candidates with transparent component metrics for sample size, win rate, fee yield,
+capital efficiency, diversification, and recency. Persists the scored wallet snapshot into long-term memory.
+
+If Dune credentials/query IDs are configured, the tool adds a small optional bonus from Dune wallet enrichment.
+If Dune is unavailable or not configured, the tool still succeeds with LP Agent-only scoring.`,
+      parameters: {
+        type: "object",
+        properties: {
+          pool_address: {
+            type: "string",
+            description: "Pool address to score top LP wallets for"
+          },
+          limit: {
+            type: "number",
+            description: "Max wallets to score. Default 4 and capped to 4 to stay within LP Agent rate safety."
+          }
+        },
+        required: ["pool_address"]
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "get_pool_info",
+      description: `Get deep pool intelligence from LP Agent API — token audit, fee trends, holder concentration, and trading flow.
+Use this for extra due diligence before deploying or when you need richer context than get_pool_detail provides.
+Rate limited to 5 calls per minute. Results are also saved into long-term memory for later recall.`,
+      parameters: {
+        type: "object",
+        properties: {
+          pool_address: {
+            type: "string",
+            description: "Pool address to inspect"
+          }
+        },
+        required: ["pool_address"]
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
       name: "clear_lessons",
       description: `Remove lessons from memory. Use when the user asks to erase lessons, or when lessons contain bad data (e.g. bug-caused -100% PnL records).
 
@@ -721,6 +908,41 @@ Examples:
           }
         },
         required: ["rule"]
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "remember_fact",
+      description: `Store a fact in long-term memory for cross-session recall.
+Use this to remember pool outcomes, strategy patterns, timing effects, or any other information worth reusing later.`,
+      parameters: {
+        type: "object",
+        properties: {
+          nugget: { type: "string", description: "Memory category, e.g. pools, strategies, lessons, patterns" },
+          key: { type: "string", description: "Short descriptive key for this fact" },
+          value: { type: "string", description: "What should be remembered" }
+        },
+        required: ["nugget", "key", "value"]
+      }
+    }
+  },
+
+  {
+    type: "function",
+    function: {
+      name: "recall_memory",
+      description: `Query long-term memory for relevant facts from prior sessions.
+Supports fuzzy matching, so you can search by related pool name, strategy, pattern, or concept.`,
+      parameters: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "What to search for in memory" },
+          nugget: { type: "string", description: "Optional memory category to search within" }
+        },
+        required: ["query"]
       }
     }
   },
