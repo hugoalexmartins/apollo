@@ -141,23 +141,23 @@ export function createManagementCycleRunner(deps) {
 
       positionData = await Promise.all(positions.map(async (p) => {
         recordPositionSnapshot(p.pool, p);
-        const pnl = await getPositionPnl({ pool_address: p.pool, position_address: p.position }).catch(() => null);
+        const pnl = await getPositionPnl({ pool_address: p.pool, position_address: p.position }).catch((error) => ({ error: error.message, stale: true, status: "stale" }));
         const recall = recallForPool(p.pool);
+        const pnlStale = !pnl || pnl.error || isPnlSignalStale({ pnl });
         const enriched = {
           ...p,
-          pnl_pct: pnl?.pnl_pct ?? p.pnl_pct,
-          unclaimed_fees_usd: pnl?.unclaimed_fee_usd ?? p.unclaimed_fees_usd,
-          fee_tvl_ratio: pnl?.fee_active_tvl_ratio ?? p.fee_tvl_ratio,
+          pnl_pct: pnlStale ? null : (pnl?.pnl_pct ?? p.pnl_pct),
+          unclaimed_fees_usd: pnlStale ? null : (pnl?.unclaimed_fee_usd ?? p.unclaimed_fees_usd),
+          fee_tvl_ratio: pnlStale ? null : (pnl?.fee_active_tvl_ratio ?? p.fee_tvl_ratio),
         };
         const memoryHits = recallForManagement(enriched);
         const memoryRecall = memoryHits.length
           ? memoryHits.map((hit) => `[${hit.source}] ${hit.key}: ${hit.answer}`).join(" | ")
           : null;
-        const pnlStale = isPnlSignalStale({ pnl });
         const exitAlert = pnl?.pnl_pct != null
           ? updatePnlAndCheckExits(p.position, pnl.pnl_pct, config, { stale: pnlStale })
           : null;
-        return { ...enriched, pnl, recall, memoryRecall, exitAlert };
+        return { ...enriched, pnl: pnlStale ? { ...(pnl || {}), stale: true, status: "stale" } : pnl, recall, memoryRecall, exitAlert };
       }));
 
       evaluatePortfolioGuard({

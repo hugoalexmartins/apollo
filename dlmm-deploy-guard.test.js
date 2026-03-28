@@ -75,3 +75,25 @@ test("rebalanceOnExit does not hard-block on portfolio guard pauses", async () =
 		fs.rmSync(tempDir, { recursive: true, force: true });
 	}
 });
+
+test("rebalanceOnExit blocks redeploy when remaining open risk is unknown", async () => {
+	const originalCwd = process.cwd();
+	const originalDryRun = process.env.DRY_RUN;
+	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "zenith-rebalance-open-risk-test-"));
+
+	try {
+		process.chdir(tempDir);
+		fs.mkdirSync(path.join(tempDir, "logs"), { recursive: true });
+		process.env.DRY_RUN = "true";
+		const result = await rebalanceOnExit({
+			position_address: "missing-position",
+			force_rebalance: true,
+		});
+		assert.notEqual(result.error, undefined);
+	} finally {
+		if (originalDryRun == null) delete process.env.DRY_RUN;
+		else process.env.DRY_RUN = originalDryRun;
+		process.chdir(originalCwd);
+		fs.rmSync(tempDir, { recursive: true, force: true });
+	}
+});

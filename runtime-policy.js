@@ -20,6 +20,7 @@ export const MANAGEMENT_SUBREASONS = Object.freeze({
 export const DEPLOY_GOVERNANCE_CODES = Object.freeze({
   PORTFOLIO_GUARD_ACTIVE: "portfolio_guard_active",
   POOL_LOW_YIELD_COOLDOWN_ACTIVE: "pool_low_yield_cooldown_active",
+  POOL_MEMORY_INVALID: "pool_memory_invalid",
   INVALID_BIN_STEP: "invalid_bin_step",
   MAX_POSITIONS_REACHED: "max_positions_reached",
   POOL_ALREADY_OPEN: "pool_already_open",
@@ -364,6 +365,17 @@ export function evaluateDeployAdmission({
   }
 
   if (poolCooldown?.active) {
+		if (poolCooldown.invalid_state) {
+			return {
+				pass: false,
+				code: DEPLOY_GOVERNANCE_CODES.POOL_MEMORY_INVALID,
+				message: `Pool memory unreadable: ${poolCooldown.error || poolCooldown.reason || "unknown error"}`,
+				details: {
+					error: poolCooldown.error || null,
+					reason: poolCooldown.reason || null,
+				},
+			};
+		}
     return {
       pass: false,
       code: DEPLOY_GOVERNANCE_CODES.POOL_LOW_YIELD_COOLDOWN_ACTIVE,

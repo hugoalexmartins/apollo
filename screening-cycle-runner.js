@@ -164,10 +164,66 @@ export function createScreeningCycleRunner(deps) {
       const regimeClassification = applyRegimeHysteresis({
         classification: rawRegimeClassification,
       });
+      if (regimeClassification?.invalid_state) {
+			screeningEvaluation = {
+				cycle_id: cycleId,
+				cycle_type: "screening",
+				status: "failed_precheck",
+				summary: {
+					reason_code: "REGIME_STATE_INVALID",
+					error: regimeClassification.error,
+				},
+				candidates: [],
+			};
+			appendReplayEnvelope({
+				cycle_id: cycleId,
+				cycle_type: "screening",
+				reason_code: "REGIME_STATE_INVALID",
+				error: regimeClassification.error,
+			});
+			writeEvidenceBundle({
+				cycle_id: cycleId,
+				cycle_type: "screening",
+				status: "failed_precheck",
+				reason_code: "REGIME_STATE_INVALID",
+				error: regimeClassification.error,
+				written_at: new Date().toISOString(),
+			});
+			screenReport = `Screening failed closed: [REGIME_STATE_INVALID] ${regimeClassification.error}`;
+			return;
+		}
       const regimeContext = resolveRegimePackContext({
         baseScreeningConfig: config.screening,
         classification: regimeClassification,
       });
+      if (regimeContext?.invalid_state) {
+			screeningEvaluation = {
+				cycle_id: cycleId,
+				cycle_type: "screening",
+				status: "failed_precheck",
+				summary: {
+					reason_code: "REGIME_STATE_INVALID",
+					error: regimeContext.error,
+				},
+				candidates: [],
+			};
+			appendReplayEnvelope({
+				cycle_id: cycleId,
+				cycle_type: "screening",
+				reason_code: "REGIME_STATE_INVALID",
+				error: regimeContext.error,
+			});
+			writeEvidenceBundle({
+				cycle_id: cycleId,
+				cycle_type: "screening",
+				status: "failed_precheck",
+				reason_code: "REGIME_STATE_INVALID",
+				error: regimeContext.error,
+				written_at: new Date().toISOString(),
+			});
+			screenReport = `Screening failed closed: [REGIME_STATE_INVALID] ${regimeContext.error}`;
+			return;
+		}
       const performanceMultiplier = getPerformanceSizingMultiplier(performanceSummary);
       const riskMultiplier = getRiskSizingMultiplier({
         positionsCount: prePositions.total_positions,
@@ -226,6 +282,16 @@ export function createScreeningCycleRunner(deps) {
           regime_label: regimeLabel,
           strategy: strategyKey,
         });
+			if (cooldown.invalid_state) {
+				return {
+					blocked: true,
+					reason: "negative_regime_cooldown_invalid_state",
+					penalty_score: 100,
+					details: {
+						error: cooldown.error,
+					},
+				};
+			}
         if (!cooldown.active) return null;
         return {
           blocked: true,
@@ -250,6 +316,16 @@ export function createScreeningCycleRunner(deps) {
               regime_label: regimeContext.regime,
               strategy: strategyKey,
             });
+				if (globalCooldown.invalid_state) {
+					return {
+						blocked: true,
+						reason: "negative_regime_memory_invalid_state",
+						penalty_score: 100,
+						details: {
+							error: globalCooldown.error,
+						},
+					};
+				}
             if (globalCooldown.active) {
               return {
                 blocked: true,
