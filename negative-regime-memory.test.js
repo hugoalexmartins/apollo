@@ -43,5 +43,51 @@ test("negative regime memory requires stronger sample quality before activation"
     if (originalFile) process.env.ZENITH_NEGATIVE_REGIME_MEMORY_FILE = originalFile;
     else delete process.env.ZENITH_NEGATIVE_REGIME_MEMORY_FILE;
     fs.rmSync(tempDir, { recursive: true, force: true });
-  }
+	}
+});
+
+test("negative regime memory fails closed on corrupt state", async () => {
+	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "zenith-negative-regime-memory-invalid-test-"));
+	const originalFile = process.env.ZENITH_NEGATIVE_REGIME_MEMORY_FILE;
+
+	try {
+		process.env.ZENITH_NEGATIVE_REGIME_MEMORY_FILE = path.join(tempDir, "negative-regime-memory.json");
+		fs.writeFileSync(process.env.ZENITH_NEGATIVE_REGIME_MEMORY_FILE, "{bad json");
+		const { getNegativeRegimeMemory } = await import(`./negative-regime-memory.js?test=${Date.now()}`);
+		const state = getNegativeRegimeMemory({ regime_label: "defensive", strategy: "bid_ask" });
+		assert.equal(state.invalid_state, true);
+		assert.equal(state.active, true);
+	} finally {
+		if (originalFile) process.env.ZENITH_NEGATIVE_REGIME_MEMORY_FILE = originalFile;
+		else delete process.env.ZENITH_NEGATIVE_REGIME_MEMORY_FILE;
+		fs.rmSync(tempDir, { recursive: true, force: true });
+	}
+});
+
+test("negative regime memory fails closed on malformed cooldown timestamp", async () => {
+	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "zenith-negative-regime-memory-bad-ts-test-"));
+	const originalFile = process.env.ZENITH_NEGATIVE_REGIME_MEMORY_FILE;
+
+	try {
+		process.env.ZENITH_NEGATIVE_REGIME_MEMORY_FILE = path.join(tempDir, "negative-regime-memory.json");
+		fs.writeFileSync(process.env.ZENITH_NEGATIVE_REGIME_MEMORY_FILE, JSON.stringify({
+			cooldowns: {
+				"defensive|bid_ask": {
+					cooldown_until: "not-a-date",
+					hits: 2,
+					sample_quality: "confirmed",
+					cumulative_negative_pnl_abs: 13,
+					reason: "negative outcome",
+				},
+			},
+		}, null, 2));
+		const { getNegativeRegimeMemory } = await import(`./negative-regime-memory.js?test=${Date.now()}`);
+		const state = getNegativeRegimeMemory({ regime_label: "defensive", strategy: "bid_ask" });
+		assert.equal(state.invalid_state, true);
+		assert.equal(state.active, true);
+	} finally {
+		if (originalFile) process.env.ZENITH_NEGATIVE_REGIME_MEMORY_FILE = originalFile;
+		else delete process.env.ZENITH_NEGATIVE_REGIME_MEMORY_FILE;
+		fs.rmSync(tempDir, { recursive: true, force: true });
+	}
 });

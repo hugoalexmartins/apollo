@@ -6,6 +6,11 @@
  */
 
 import fs from "fs";
+
+import {
+	readJsonSnapshotWithBackupSync,
+	writeJsonSnapshotAtomicSync,
+} from "./durable-store.js";
 import { log } from "./logger.js";
 
 const POOL_MEMORY_FILE = "./pool-memory.json";
@@ -13,6 +18,23 @@ const LOW_YIELD_COOLDOWN_MS = 4 * 60 * 60 * 1000;
 const NEGATIVE_REGIME_COOLDOWN_MS = 6 * 60 * 60 * 1000;
 const NEGATIVE_REGIME_COOLDOWN_MAX_MS = 24 * 60 * 60 * 1000;
 export const CANONICAL_LOW_YIELD_REASON = "fee yield too low";
+
+function isObject(value) {
+	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function isPoolMemoryShape(value) {
+	if (!isObject(value)) return false;
+	return Object.values(value).every((entry) => {
+		if (!isObject(entry)) return false;
+		if (entry.deploys != null && !Array.isArray(entry.deploys)) return false;
+		if (entry.notes != null && !Array.isArray(entry.notes)) return false;
+		if (entry.snapshots != null && !Array.isArray(entry.snapshots)) return false;
+		if (entry.token_type_distribution_stats != null && !isObject(entry.token_type_distribution_stats)) return false;
+		if (entry.negative_regime_cooldowns != null && !isObject(entry.negative_regime_cooldowns)) return false;
+		return true;
+	});
+}
 
 function createPoolEntry(name, baseMint = null) {
   return {
@@ -112,7 +134,21 @@ export function getNegativeRegimeCooldown({
     };
   }
 
-  const db = load();
+	const db = load();
+	if (db._invalid_state) {
+		return {
+			pool_address,
+			key: buildNegativeRegimeCooldownKey({ regime_label, strategy }),
+			active: true,
+			cooldown_until: null,
+			remaining_ms: 0,
+			reason: `pool memory unreadable: ${db._error}`,
+			hits: 0,
+			invalid_state: true,
+			error: db._error,
+			loaded_from_backup: Boolean(db._loaded_from_backup),
+		};
+	}
   const entry = db[pool_address];
   if (!entry?.negative_regime_cooldowns) {
     return {
@@ -145,11 +181,13 @@ export function getNegativeRegimeCooldown({
     return {
       pool_address,
       key,
-      active: false,
-      cooldown_until: null,
+      active: true,
+			cooldown_until: cooldown.cooldown_until,
       remaining_ms: 0,
-      reason: null,
+      reason: `negative regime cooldown has invalid timestamp: ${cooldown.cooldown_until}`,
       hits: Number(cooldown.hits) || 0,
+			invalid_state: true,
+			error: "invalid cooldown_until",
     };
   }
 
@@ -190,7 +228,19 @@ export function getPoolDeployCooldown({ pool_address, nowMs = Date.now() } = {})
     };
   }
 
-  const db = load();
+	const db = load();
+	if (db._invalid_state) {
+		return {
+			pool_address,
+			active: true,
+			cooldown_until: null,
+			remaining_ms: 0,
+			reason: `pool memory unreadable: ${db._error}`,
+			invalid_state: true,
+			error: db._error,
+			loaded_from_backup: Boolean(db._loaded_from_backup),
+		};
+	}
   const entry = db[pool_address];
   if (!entry?.low_yield_cooldown_until) {
     return {
@@ -206,10 +256,12 @@ export function getPoolDeployCooldown({ pool_address, nowMs = Date.now() } = {})
   if (!Number.isFinite(cooldownUntilMs)) {
     return {
       pool_address,
-      active: false,
-      cooldown_until: null,
+			active: true,
+			cooldown_until: entry.low_yield_cooldown_until,
       remaining_ms: 0,
-      reason: null,
+			reason: `pool cooldown has invalid timestamp: ${entry.low_yield_cooldown_until}`,
+			invalid_state: true,
+			error: "invalid low_yield_cooldown_until",
     };
   }
 
@@ -264,16 +316,22 @@ function updateTokenTypeDistributionStats(entry, deploy) {
 }
 
 function load() {
-  if (!fs.existsSync(POOL_MEMORY_FILE)) return {};
-  try {
-    return JSON.parse(fs.readFileSync(POOL_MEMORY_FILE, "utf8"));
-  } catch {
-    return {};
-  }
+	const snapshot = readJsonSnapshotWithBackupSync(POOL_MEMORY_FILE);
+	if (!snapshot.value) {
+		if (!snapshot.error) return {};
+		return { _invalid_state: true, _error: snapshot.error };
+	}
+	if (!isPoolMemoryShape(snapshot.value)) {
+		return { _invalid_state: true, _error: "pool-memory has invalid shape" };
+	}
+	return {
+		...snapshot.value,
+		_loaded_from_backup: snapshot.source === "backup",
+	};
 }
 
 function save(data) {
-  fs.writeFileSync(POOL_MEMORY_FILE, JSON.stringify(data, null, 2));
+	writeJsonSnapshotAtomicSync(POOL_MEMORY_FILE, data);
 }
 
 // ─── Write ─────────────────────────────────────────────────────
@@ -302,6 +360,13 @@ export function recordPoolDeploy(poolAddress, deployData) {
   if (!poolAddress) return;
 
   const db = load();
+  if (db._invalid_state) {
+		return {
+			recorded: false,
+			invalid_state: true,
+			error: db._error,
+		};
+	}
   const entry = ensurePoolEntry(db, poolAddress, {
     name: deployData.pool_name || poolAddress.slice(0, 8),
     base_mint: deployData.base_mint || null,
@@ -353,6 +418,7 @@ export function recordPoolDeploy(poolAddress, deployData) {
 
   save(db);
   log("pool-memory", `Recorded deploy for ${entry.name} (${poolAddress.slice(0, 8)}): PnL ${deploy.pnl_pct}%`);
+	return { recorded: true };
 }
 
 // ─── Read ──────────────────────────────────────────────────────
@@ -364,7 +430,17 @@ export function recordPoolDeploy(poolAddress, deployData) {
 export function getPoolMemory({ pool_address }) {
   if (!pool_address) return { error: "pool_address required" };
 
-  const db = load();
+	const db = load();
+	if (db._invalid_state) {
+		return {
+			pool_address,
+			known: false,
+			invalid_state: true,
+			error: db._error,
+			loaded_from_backup: Boolean(db._loaded_from_backup),
+			message: `Pool memory unreadable: ${db._error}`,
+		};
+	}
   const entry = db[pool_address];
 
   if (!entry) {
@@ -400,6 +476,13 @@ export function getPoolMemory({ pool_address }) {
 export function recordPositionSnapshot(poolAddress, snapshot) {
   if (!poolAddress) return;
   const db = load();
+	if (db._invalid_state) {
+		return {
+			recorded: false,
+			invalid_state: true,
+			error: db._error,
+		};
+	}
   const entry = ensurePoolEntry(db, poolAddress, {
     name: snapshot.pair || poolAddress.slice(0, 8),
   });
@@ -415,12 +498,13 @@ export function recordPositionSnapshot(poolAddress, snapshot) {
     age_minutes: snapshot.age_minutes ?? null,
   });
 
-  // Keep last 48 snapshots (~4h at 5min intervals)
-  if (entry.snapshots.length > 48) {
-    entry.snapshots = entry.snapshots.slice(-48);
-  }
+	// Keep last 48 snapshots (~4h at 5min intervals)
+	if (entry.snapshots.length > 48) {
+		entry.snapshots = entry.snapshots.slice(-48);
+	}
 
-  save(db);
+	save(db);
+	return { recorded: true };
 }
 
 /**

@@ -148,6 +148,7 @@ function updateEquitySnapshots(state, equityUsd, nowIso) {
 
 function computeOpenRiskMetrics(openPositionPnls = []) {
 	const rows = Array.isArray(openPositionPnls) ? openPositionPnls : [];
+	const unknownOpenRiskCount = rows.filter((row) => row?.unknown === true).length;
 	const openUnrealizedLossUsd = rows.reduce((sum, row) => {
 		const pnlUsd = Number(row?.pnl_usd);
 		if (!Number.isFinite(pnlUsd) || pnlUsd >= 0) return sum;
@@ -156,6 +157,7 @@ function computeOpenRiskMetrics(openPositionPnls = []) {
 	return {
 		open_unrealized_loss_usd: Number(openUnrealizedLossUsd.toFixed(2)),
 		open_positions_considered: rows.length,
+		unknown_open_risk_count: unknownOpenRiskCount,
 	};
 }
 
@@ -170,6 +172,15 @@ function buildTrigger(metrics) {
 		return {
 			reason_code: "PORTFOLIO_DRAWDOWN_LIMIT",
 			reason: `portfolio drawdown ${metrics.drawdown_pct.toFixed(2)}% >= ${protections.maxDrawdownPct.toFixed(2)}%`,
+		};
+	}
+
+	if (
+		metrics.unknown_open_risk_count > 0
+	) {
+		return {
+			reason_code: "OPEN_RISK_STATE_UNKNOWN",
+			reason: `open risk is unknown for ${metrics.unknown_open_risk_count} live position(s)`,
 		};
 	}
 

@@ -1,6 +1,11 @@
 import fs from "fs";
 import path from "path";
 
+import {
+	readJsonSnapshotWithBackupSync,
+	writeJsonSnapshotAtomicSync,
+} from "./durable-store.js";
+
 const REGIME_PACKS = {
   defensive: {
     regime: "defensive",
@@ -41,42 +46,62 @@ const REGIME_STATE_FILE = process.env.ZENITH_REGIME_STATE_FILE || path.join("./d
 const ACTIVE_DWELL_MS = 45 * 60 * 1000;
 const PENDING_DECAY_MS = 3 * 60 * 60 * 1000;
 
+function isObject(value) {
+	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function isRegimeStateShape(value) {
+	if (!isObject(value)) return false;
+	const validRegime = (regime) => regime == null || REGIME_NAMES.includes(regime);
+	const validTimestamp = (ts) => ts == null || Number.isFinite(Date.parse(ts));
+	const validPendingHits = value.pending_hits == null || Number.isFinite(Number(value.pending_hits));
+	return validRegime(value.active_regime)
+		&& validRegime(value.pending_regime)
+		&& validTimestamp(value.activated_at)
+		&& validTimestamp(value.pending_since)
+		&& validPendingHits;
+}
+
 function loadRegimeState() {
-  if (!fs.existsSync(REGIME_STATE_FILE)) {
-    return {
-      active_regime: null,
-      activated_at: null,
-      pending_regime: null,
-      pending_hits: 0,
-      pending_since: null,
-      last_reason: null,
-    };
-  }
-  try {
-    const parsed = JSON.parse(fs.readFileSync(REGIME_STATE_FILE, "utf8"));
-    return {
-      active_regime: parsed?.active_regime || null,
-      activated_at: parsed?.activated_at || null,
-      pending_regime: parsed?.pending_regime || null,
-      pending_hits: Number(parsed?.pending_hits) || 0,
-      pending_since: parsed?.pending_since || null,
-      last_reason: parsed?.last_reason || null,
-    };
-  } catch {
-    return {
-      active_regime: null,
-      activated_at: null,
-      pending_regime: null,
-      pending_hits: 0,
-      pending_since: null,
-      last_reason: null,
-    };
-  }
+	const empty = {
+		active_regime: null,
+		activated_at: null,
+		pending_regime: null,
+		pending_hits: 0,
+		pending_since: null,
+		last_reason: null,
+	};
+	const snapshot = readJsonSnapshotWithBackupSync(REGIME_STATE_FILE);
+	if (!snapshot.value) {
+		if (!snapshot.error) return empty;
+		return {
+			...empty,
+			invalid_state: true,
+			error: snapshot.error,
+		};
+	}
+	if (!isRegimeStateShape(snapshot.value)) {
+		return {
+			...empty,
+			invalid_state: true,
+			error: "regime-state has invalid shape",
+		};
+	}
+	return {
+		...empty,
+		active_regime: snapshot.value?.active_regime || null,
+		activated_at: snapshot.value?.activated_at || null,
+		pending_regime: snapshot.value?.pending_regime || null,
+		pending_hits: Number(snapshot.value?.pending_hits) || 0,
+		pending_since: snapshot.value?.pending_since || null,
+		last_reason: snapshot.value?.last_reason || null,
+		loaded_from_backup: snapshot.source === "backup",
+	};
 }
 
 function saveRegimeState(state) {
-  fs.mkdirSync(path.dirname(REGIME_STATE_FILE), { recursive: true });
-  fs.writeFileSync(REGIME_STATE_FILE, JSON.stringify(state, null, 2));
+	fs.mkdirSync(path.dirname(REGIME_STATE_FILE), { recursive: true });
+	writeJsonSnapshotAtomicSync(REGIME_STATE_FILE, state);
 }
 
 function isImmediateProtectiveClassification(classification = {}) {
@@ -195,6 +220,17 @@ export function resolveRegimePackContext({
   baseScreeningConfig,
   classification,
 } = {}) {
+	if (classification?.invalid_state) {
+		return {
+			regime: null,
+			pack: null,
+			effectiveScreeningConfig: baseScreeningConfig || {},
+			reason: classification.reason || "invalid_state",
+			confidence: classification.confidence || "high",
+			invalid_state: true,
+			error: classification.error || null,
+		};
+	}
   const regime = classification?.regime && REGIME_PACKS[classification.regime]
     ? classification.regime
     : "neutral";
@@ -218,6 +254,20 @@ export function applyRegimeHysteresis({
   nowMs = Date.now(),
 } = {}) {
   const state = loadRegimeState();
+	if (state.invalid_state) {
+		return {
+			...classification,
+			regime: null,
+			switched: false,
+			hysteresis_reason: "invalid_state",
+			proposed_regime: classification?.regime || null,
+			pending_regime: null,
+			pending_hits: 0,
+			invalid_state: true,
+			error: state.error,
+			loaded_from_backup: Boolean(state.loaded_from_backup),
+		};
+	}
   const proposedRegime = classification?.regime || "neutral";
   const activeRegime = state.active_regime || null;
   const activeAgeMs = Number.isFinite(Date.parse(state.activated_at || ""))

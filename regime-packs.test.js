@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 
 import {
+	applyRegimeHysteresis,
   classifyRuntimeRegime,
   getPerformanceSizingMultiplier,
   getRiskSizingMultiplier,
@@ -155,5 +156,50 @@ test("applyRegimeHysteresis decays stale pending regime proposals", async () => 
     if (originalStateFile) process.env.ZENITH_REGIME_STATE_FILE = originalStateFile;
     else delete process.env.ZENITH_REGIME_STATE_FILE;
     fs.rmSync(tempDir, { recursive: true, force: true });
-  }
+	}
+});
+
+test("applyRegimeHysteresis fails closed on corrupt state", async () => {
+	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "zenith-regime-invalid-test-"));
+	const originalStateFile = process.env.ZENITH_REGIME_STATE_FILE;
+
+	try {
+		process.env.ZENITH_REGIME_STATE_FILE = path.join(tempDir, "regime-state.json");
+		fs.writeFileSync(process.env.ZENITH_REGIME_STATE_FILE, "{bad json");
+		const { applyRegimeHysteresis, resolveRegimePackContext } = await import(`./regime-packs.js?test=${Date.now()}`);
+		const classification = applyRegimeHysteresis({ classification: { regime: "offensive", reason: "seed", confidence: "medium" } });
+		assert.equal(classification.invalid_state, true);
+		const context = resolveRegimePackContext({ baseScreeningConfig: { minOrganic: 60 }, classification });
+		assert.equal(context.invalid_state, true);
+	} finally {
+		if (originalStateFile) process.env.ZENITH_REGIME_STATE_FILE = originalStateFile;
+		else delete process.env.ZENITH_REGIME_STATE_FILE;
+		fs.rmSync(tempDir, { recursive: true, force: true });
+	}
+});
+
+test("applyRegimeHysteresis fails closed on parseable invalid regime state", async () => {
+	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "zenith-regime-bad-shape-test-"));
+	const originalStateFile = process.env.ZENITH_REGIME_STATE_FILE;
+
+	try {
+		process.env.ZENITH_REGIME_STATE_FILE = path.join(tempDir, "regime-state.json");
+		fs.writeFileSync(process.env.ZENITH_REGIME_STATE_FILE, JSON.stringify({
+			active_regime: "not-a-real-regime",
+			activated_at: "not-a-date",
+			pending_regime: null,
+			pending_hits: 1,
+			pending_since: null,
+			last_reason: "seed",
+		}, null, 2));
+		const { applyRegimeHysteresis, resolveRegimePackContext } = await import(`./regime-packs.js?test=${Date.now()}`);
+		const classification = applyRegimeHysteresis({ classification: { regime: "offensive", reason: "seed", confidence: "medium" } });
+		assert.equal(classification.invalid_state, true);
+		const context = resolveRegimePackContext({ baseScreeningConfig: { minOrganic: 60 }, classification });
+		assert.equal(context.invalid_state, true);
+	} finally {
+		if (originalStateFile) process.env.ZENITH_REGIME_STATE_FILE = originalStateFile;
+		else delete process.env.ZENITH_REGIME_STATE_FILE;
+		fs.rmSync(tempDir, { recursive: true, force: true });
+	}
 });

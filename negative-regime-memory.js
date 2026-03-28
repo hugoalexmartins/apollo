@@ -1,6 +1,11 @@
 import fs from "fs";
 import path from "path";
 
+import {
+	readJsonSnapshotWithBackupSync,
+	writeJsonSnapshotAtomicSync,
+} from "./durable-store.js";
+
 const FILE = process.env.ZENITH_NEGATIVE_REGIME_MEMORY_FILE || path.join("./data", "negative-regime-memory.json");
 const BASE_COOLDOWN_MS = 6 * 60 * 60 * 1000;
 const MAX_COOLDOWN_MS = 24 * 60 * 60 * 1000;
@@ -8,21 +13,32 @@ const EVIDENCE_WINDOW_MS = 48 * 60 * 60 * 1000;
 const MIN_HITS_FOR_ACTIVATION = 2;
 const MIN_CUMULATIVE_LOSS_FOR_ACTIVATION = 10;
 
+function isObject(value) {
+	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function isCooldownShape(value) {
+	return isObject(value) && isObject(value.cooldowns);
+}
+
 function load() {
-  if (!fs.existsSync(FILE)) return { cooldowns: {} };
-  try {
-    const parsed = JSON.parse(fs.readFileSync(FILE, "utf8"));
-    return {
-      cooldowns: parsed?.cooldowns && typeof parsed.cooldowns === "object" ? parsed.cooldowns : {},
-    };
-  } catch {
-    return { cooldowns: {} };
-  }
+	const snapshot = readJsonSnapshotWithBackupSync(FILE);
+	if (!snapshot.value) {
+		if (!snapshot.error) return { cooldowns: {} };
+		return { cooldowns: {}, invalid_state: true, error: snapshot.error };
+	}
+	if (!isCooldownShape(snapshot.value)) {
+		return { cooldowns: {}, invalid_state: true, error: "negative-regime-memory has invalid shape" };
+	}
+	return {
+		cooldowns: snapshot.value?.cooldowns && typeof snapshot.value.cooldowns === "object" ? snapshot.value.cooldowns : {},
+		loaded_from_backup: snapshot.source === "backup",
+	};
 }
 
 function save(state) {
-  fs.mkdirSync(path.dirname(FILE), { recursive: true });
-  fs.writeFileSync(FILE, JSON.stringify(state, null, 2));
+	fs.mkdirSync(path.dirname(FILE), { recursive: true });
+	writeJsonSnapshotAtomicSync(FILE, state);
 }
 
 function normalize(value, fallback) {
@@ -46,8 +62,11 @@ export function recordNegativeRegimeOutcome({ regime_label, strategy, pnl_pct, c
     return { recorded: false, reason: "outcome_not_negative_enough" };
   }
 
-  const state = load();
-  const key = buildNegativeRegimeMemoryKey({ regime_label, strategy });
+	const state = load();
+	if (state.invalid_state) {
+		return { recorded: false, invalid_state: true, error: state.error };
+	}
+	const key = buildNegativeRegimeMemoryKey({ regime_label, strategy });
   const existing = state.cooldowns[key];
   const lastRecordedMs = Number.isFinite(Date.parse(existing?.last_recorded_at || ""))
     ? Date.parse(existing.last_recorded_at)
@@ -86,8 +105,22 @@ export function recordNegativeRegimeOutcome({ regime_label, strategy, pnl_pct, c
 }
 
 export function getNegativeRegimeMemory({ regime_label, strategy, nowMs = Date.now() } = {}) {
-  const state = load();
-  const key = buildNegativeRegimeMemoryKey({ regime_label, strategy });
+	const state = load();
+	if (state.invalid_state) {
+		return {
+			key: buildNegativeRegimeMemoryKey({ regime_label, strategy }),
+			active: true,
+			cooldown_until: null,
+			remaining_ms: 0,
+			hits: 0,
+			sample_quality: "invalid",
+			cumulative_negative_pnl_abs: 0,
+			reason: `negative regime memory unreadable: ${state.error}`,
+			invalid_state: true,
+			error: state.error,
+		};
+	}
+	const key = buildNegativeRegimeMemoryKey({ regime_label, strategy });
   const cooldown = state.cooldowns[key];
   if (!cooldown) {
     return {
@@ -119,13 +152,15 @@ export function getNegativeRegimeMemory({ regime_label, strategy, nowMs = Date.n
   if (!Number.isFinite(untilMs)) {
     return {
       key,
-      active: false,
-      cooldown_until: null,
+      active: true,
+      cooldown_until: cooldown.cooldown_until,
       remaining_ms: 0,
       hits: Number(cooldown.hits) || 0,
       sample_quality: cooldown.sample_quality || "weak",
       cumulative_negative_pnl_abs: Number(cooldown.cumulative_negative_pnl_abs) || 0,
-      reason: cooldown.reason || null,
+      reason: `negative regime memory has invalid cooldown timestamp: ${cooldown.cooldown_until}`,
+			invalid_state: true,
+			error: "invalid cooldown_until",
     };
   }
 
