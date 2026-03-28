@@ -289,6 +289,7 @@ export function syncOpenPositions(active_addresses) {
 
     pos.closed = true;
     pos.closed_at = new Date().toISOString();
+    if (!Array.isArray(pos.notes)) pos.notes = [];
     pos.notes.push(`Auto-closed during state sync (not found on-chain)`);
     changed = true;
     log("state", `Position ${posId} auto-closed (missing from on-chain data)`);

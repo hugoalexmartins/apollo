@@ -4,7 +4,6 @@
     "allow": [
       "Bash(node *)",
       "Bash(npm *)",
-      "Bash(onchainos *)",
       "Bash(curl *)",
       "Bash(git status)",
       "Bash(git log *)",
@@ -16,12 +15,7 @@
       "Glob",
       "Grep"
     ],
-    "deny": [
-      "Bash(rm -rf *)",
-      "Bash(wget *)",
-      "Read(./.env)",
-      "Read(./.env.*)"
-    ]
+    "deny": ["Bash(rm -rf *)", "Bash(wget *)", "Read(./.env)", "Read(./.env.*)"]
   },
   "hooks": {
     "PreToolUse": [
@@ -30,8 +24,9 @@
         "hooks": [
           {
             "type": "command",
-            "command": "input=$(cat); echo \"$input\" | jq -e '.tool_input.run_in_background == true' > /dev/null 2>&1 && echo '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"Background execution is disabled in this project\"}}' || echo '{}'",
-            "timeout": 5
+            "command": "input=$(cat); bg=$(echo \"$input\" | jq -r '.tool_input.run_in_background // false'); if [ \"$bg\" = \"true\" ]; then echo '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"Background execution is disabled in this project\"}}'; else echo '{}'; fi",
+            "timeout": 5,
+            "async": false
           }
         ]
       }

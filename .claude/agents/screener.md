@@ -14,17 +14,10 @@ You have access to these CLI commands:
 - `curl -s "https://dlmm.datapi.meteora.ag/pools/<addr>/volume/history?timeframe=1h"` — volume trend
 - `curl -s "https://dlmm.datapi.meteora.ag/stats/protocol_metrics"` — protocol-wide TVL/volume/fees
 
-**OKX signals (use `onchainos <cmd>`):****
-- `onchainos signal list --chain solana --wallet-type 1` — smart money buy signals (type 1=smart money, 2=KOL, 3=whale)
-- `onchainos token advanced-info --address <mint> --chain solana` — risk level, rug pull count, honeypot flag, dev holding %
-- `onchainos token holders --address <mint> --chain solana --tag-filter 3` — smart money holders
-- `onchainos token trending --chains solana` — trending tokens by volume
-
 **Meridian CLI (use `node cli.js <cmd>`):**
 - `node cli.js lessons` — learned rules from past positions (read this first every cycle)
 - `node cli.js performance` — closed position history, win rate, range efficiency
 - `node cli.js pool-memory --pool <addr>` — previous deploy history for a pool
-- `node cli.js discord-signals` — check incoming discord signal queue (always check this FIRST before running candidates)
 - `node cli.js blacklist list` — blocked tokens (never deploy to these)
 - `node cli.js blacklist add --mint <addr> --reason <text>` — block a token
 - `node cli.js candidates --limit 5` — top pool candidates with full enrichment
@@ -33,7 +26,6 @@ You have access to these CLI commands:
 - `node cli.js token-narrative --mint <addr>` — token narrative/story
 - `node cli.js pool-detail --pool <addr>` — detailed pool metrics
 - `node cli.js active-bin --pool <addr>` — current active bin and price
-- `node cli.js study --pool <addr>` — top LPer behaviour on a pool
 - `node cli.js search-pools --query <name>` — search for pools by name
 
 ## Screening Criteria
@@ -52,7 +44,6 @@ You have access to these CLI commands:
 - net buyers positive in last 1h
 - narrative is strong and genuine
 - top LPers on this pool have >60% win rate
-- discord signal present = strong positive social signal, boosts confidence score
 
 **Risk factors (reduce confidence):**
 - price dumping >15% in 1h
@@ -73,11 +64,8 @@ After choosing a pool candidate, the deploy parameters must be derived from REAL
 | `node cli.js token-narrative --mint <mint>` | narrative strength, community story | Strategy choice |
 | `node cli.js pool-detail --pool <addr>` | volatility, fee_active_tvl_ratio, volume, price_trend[], swap_count, active_positions | Bin range + Strategy |
 | `node cli.js active-bin --pool <addr>` | current binId, price | Deploy params |
-| `node cli.js study --pool <addr>` | top LPer win rate, avg hold hours, range widths used | Bin range calibration |
 | `node cli.js pool-memory --pool <addr>` | previous deploys, win_rate, avg_pnl_pct | Confidence adjustment |
 | `node cli.js lessons` | learned rules from past positions | Override any default |
-| `onchainos signal list --chain solana --wallet-type 1` | smart money buy/sell signals | Ratio direction |
-| `onchainos token advanced-info --address <mint> --chain solana` | risk level, rug pull count, honeypot, dev holding % | Hard rejects |
 
 ### 2. Choose Strategy
 
@@ -105,15 +93,15 @@ Each strategy uses the gathered data differently. After choosing a strategy, fol
 
 #### custom_ratio_spot
 
-**Ratio** — derived from `token-info` → `stats_1h` + `onchainos signals`:
+**Ratio** — derived from `token-info` → `stats_1h`:
 
-| price_change_1h | net_buyers_1h | smart money | Ratio | Bias |
-|-----------------|---------------|-------------|-------|------|
-| > +5% | > +10 | buying | 80% token / 20% SOL | strong bull |
-| +1% to +5% | positive | — | 70% token / 30% SOL | mild bull |
-| -1% to +1% | mixed | — | 50% / 50% | neutral |
-| -1% to -5% | negative | — | 30% token / 70% SOL | mild bear |
-| < -5% | < -10 | selling | 20% token / 80% SOL | strong bear |
+| price_change_1h | net_buyers_1h | Ratio | Bias |
+|-----------------|---------------|-------|------|
+| > +5% | > +10 | 80% token / 20% SOL | strong bull |
+| +1% to +5% | positive | 70% token / 30% SOL | mild bull |
+| -1% to +1% | mixed | 50% / 50% | neutral |
+| -1% to -5% | negative | 30% token / 70% SOL | mild bear |
+| < -5% | < -10 | 20% token / 80% SOL | strong bear |
 
 **Capital allocation — total deploy amount is always in SOL:**
 1. Read `total_sol` from pre-deploy checks (section 4)
@@ -124,7 +112,7 @@ Each strategy uses the gathered data differently. After choosing a strategy, fol
 
 Example: 0.25 SOL total, 70% token / 30% SOL → swap 0.175 SOL to token, keep 0.075 SOL.
 
-**Bin range** — from `pool-detail` → `price_trend[]`, `volatility` + `study` → top LPer widths.
+**Bin range** — from `pool-detail` → `price_trend[]`, `volatility`:
 
 Research on 3,214 top LPer positions shows: **tighter ranges outperform in every strategy.** 31-69 bins beats 70+, but 20-40 bins is the sweet spot. Default to fewer bins, not more.
 
@@ -146,7 +134,6 @@ Research on 3,214 top LPer positions shows: **tighter ranges outperform in every
 
 **Deposit size threshold:** If deploying >$2K into a single position, favor Bid-Ask — Spot breaks at large deposits (IL drags returns negative). Bid-Ask scales consistently up to $5-10K.
 
-Calibrate with `study` data — if top LPers who win on this pool use specific bin counts, match their width.
 
 **Deploy** — standard deploy with the ratio-split amounts:
 `node cli.js deploy --pool <addr> --amount <sol_portion> --amount-x <token_amount> --bins-below <N> --bins-above <M> --strategy spot`
@@ -187,11 +174,9 @@ The position stays open — same bins, same range. You're just refilling it with
 
 **Entry data** — from `pool-detail` → `fee_active_tvl_ratio`, `volume`, `volatility`:
 - Only deploy if fee/TVL > 0.15 AND volatility < 2 (stable enough to compound)
-- From `study` → confirm top LPers hold long (avg_hold_hours > 4)
 
-**Bin range** — balanced, from `study` → match winning LPer range widths:
+**Bin range** — balanced:
 - Default: `bins_below = 35, bins_above = 34` (balanced 69)
-- If `study` shows narrower ranges win: tighten to ±25
 
 **Deploy** — standard two-sided spot:
 `node cli.js deploy --pool <addr> --amount <sol> --bins-below <N> --bins-above <M> --strategy spot`
@@ -200,8 +185,7 @@ The position stays open — same bins, same range. You're just refilling it with
 
 #### multi_layer
 
-**Entry data** — from `pool-detail` → `volatility`, `volume`, `price_trend` + `study` → how top LPers layer:
-- From `study` → look at what shapes winning LPers use — match their pattern
+**Entry data** — from `pool-detail` → `volatility`, `volume`, `price_trend`:
 - Decide number of layers (2 or 3) and which shapes based on market conditions
 
 **Layer design** — data-driven, not fixed. All layers go into ONE position:
@@ -228,7 +212,7 @@ All layers share the position's bin range. Capital split per layer depends on co
 
 **IMPORTANT: Layering is OPTIONAL.** After the initial deploy, STOP and evaluate — does the data specifically call for a layer? If no condition below matches, the deploy is COMPLETE. Do not layer by default. Layering is a tool for specific situations, not a checklist item.
 
-Only consider adding a layer when data from `pool-detail`, `token-info`, and `study` shows a clear reason:
+Only consider adding a layer when data from `pool-detail` and `token-info` shows a clear reason:
 
 **What to layer — TOKEN (single-sided-x, fills upside bins):**
 
@@ -267,7 +251,6 @@ Only consider adding a layer when data from `pool-detail`, `token-info`, and `st
 - `pool-detail` → `volatility` > 2 = favor Bid-Ask layers. < 1 = favor Curve layers.
 - `pool-detail` → `price_trend[]` trending = favor directional token layers. Oscillating = favor Spot/Curve SOL layers.
 - `pool-detail` → `swap_count` high + stable = Curve center boost works well.
-- `study` → if winning LPers use concentrated shapes, match with Curve layer. If they use wide, match with Spot.
 - `token-info` → `net_buyers_1h` positive = layer token upside (sell wall). Negative = layer SOL (buy dips).
 
 **IMPORTANT: Before EVERY layer** (including step 2, 3, etc.):
@@ -283,7 +266,7 @@ Only consider adding a layer when data from `pool-detail`, `token-info`, and `st
 **Entry data** — from `pool-detail` → `fee_active_tvl_ratio`, `volume`:
 - Best for pools with fee/TVL > 0.2 (high enough to hit profit targets)
 
-**Bin range** — from `pool-detail` → `volatility` + `study`:
+**Bin range** — from `pool-detail` → `volatility`:
 - Slightly wider than fee_compounding to stay in range longer, but still biased tight
 - Use total_bins from the volatility table above, then: `bins_below = round(total_bins × 0.55)`, `bins_above = total_bins - bins_below`
 

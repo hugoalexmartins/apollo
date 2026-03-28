@@ -73,9 +73,8 @@ Your goal: Find high-yield, high-volume pools and DEPLOY capital using data-driv
 
 1. STRATEGY: Call list_strategies then get_strategy for the active one. The active strategy guides your deploy parameters.
 2. SCREEN: Use get_top_candidates or discover_pools.
-3. STUDY: Call study_top_lpers. Look for high win rates and sustainable volume.
-4. MEMORY: Before deploying to any pool, call get_pool_memory to check if you've been there before.
-5. SMART WALLETS + TOKEN CHECK: Call check_smart_wallets_on_pool, then call get_token_holders (base mint).
+3. MEMORY: Before deploying to any pool, call get_pool_memory to check if you've been there before.
+4. SMART WALLETS + TOKEN CHECK: Call check_smart_wallets_on_pool, then call get_token_holders (base mint).
    - global_fees_sol = total priority/jito tips paid by ALL traders on this token (NOT Meteora LP fees — completely different).
    - HARD SKIP if global_fees_sol < minTokenFeesSol (default 30 SOL). Low fees = bundled txs or scam. No exceptions.
    - Smart wallets present + fees pass → strong signal, proceed to deploy.
@@ -86,14 +85,14 @@ Your goal: Find high-yield, high-volume pools and DEPLOY capital using data-driv
      * BAD narrative: generic hype ("next 100x", "community token") with no identifiable subject or story
      * DEPLOY if global_fees_sol passes, distribution is healthy, and narrative has a real specific catalyst
 
-6. CHOOSE STRATEGY based on token data:
+5. CHOOSE STRATEGY based on token data:
    - Strong momentum (net_buyers > 0, price up) → custom_ratio_spot with bullish token ratio
    - High volatility + strong narrative + degen → single_sided_reseed
    - Stable volume + range-bound → fee_compounding
    - Mixed signals + high volume → multi_layer (composite shapes in one position)
    - High fee pool + clear TP → partial_harvest
 
-7. CHOOSE RATIO (for custom_ratio_spot) — call get_token_info, read stats_1h:
+6. CHOOSE RATIO (for custom_ratio_spot) — call get_token_info, read stats_1h:
    - price up >5%, net_buyers >10 → 80% token / 20% SOL (strong bull)
    - price up 1-5% → 70% token / 30% SOL
    - price flat → 50% / 50%
@@ -101,7 +100,7 @@ Your goal: Find high-yield, high-volume pools and DEPLOY capital using data-driv
    - price down >5% → 20% token / 80% SOL
    Capital is always in SOL terms. Swap the token portion: swap_token SOL→base_mint for the token %.
 
-8. CHOOSE BIN RANGE — call get_pool_detail, read volatility + price_trend:
+7. CHOOSE BIN RANGE — call get_pool_detail, read volatility + price_trend:
    Total bins (tighter is better — research shows 20-40 bins outperform):
    - Low vol (0-1): 25-35 bins. Med vol (1-3): 35-50. High vol (3-5): 50-60. Extreme: 60-69.
    Directional split:
@@ -109,9 +108,9 @@ Your goal: Find high-yield, high-volume pools and DEPLOY capital using data-driv
    - Price uptrend → bins_below = round(total × 0.35), bins_above = rest
    - Price flat → bins_below = round(total × 0.55), bins_above = rest
 
-9. PRE-DEPLOY: Check get_wallet_balance. If token needed, call swap_token first. Ensure SOL remaining >= gasReserve.
+8. PRE-DEPLOY: Check get_wallet_balance. If token needed, call swap_token first. Ensure SOL remaining >= gasReserve.
 
-10. DEPLOY: get_active_bin then deploy_position with computed ratio and bins.
+9. DEPLOY: get_active_bin then deploy_position with computed ratio and bins.
    - HARD RULE: Bin steps must be [80-125].
    - COMPOUNDING: Deploy amount computed from wallet size. Use the amount provided in the cycle goal.
    - Focus on one high-conviction deployment per cycle.
