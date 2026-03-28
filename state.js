@@ -8,32 +8,61 @@
  * - Actions taken (claims, rebalances)
  */
 
-import fs from "fs";
+import {
+	readJsonSnapshotWithBackupSync,
+	writeJsonSnapshotAtomicSync,
+} from "./durable-store.js";
 import { log } from "./logger.js";
+import { foldActionJournal, readActionJournal } from "./action-journal.js";
+import { evaluateTrackedPositionExit } from "./runtime-policy.js";
+import {
+	ensureEvaluationState,
+	getEvaluationSummaryFromState,
+	recordCycleEvaluationInState,
+	recordToolOutcomeInState,
+} from "./state-evaluation.js";
 
 const STATE_FILE = "./state.json";
 
 const MAX_RECENT_EVENTS = 20;
+function emptyState() {
+  return {
+    positions: {},
+    recentEvents: [],
+    evaluation: ensureEvaluationState({}).evaluation,
+    lastUpdated: null,
+  };
+}
 
 function load() {
-  if (!fs.existsSync(STATE_FILE)) {
-    return { positions: {}, recentEvents: [], lastUpdated: null };
-  }
-  try {
-    return JSON.parse(fs.readFileSync(STATE_FILE, "utf8"));
-  } catch (err) {
-    log("state_error", `Failed to read state.json: ${err.message}`);
-    return { positions: {}, lastUpdated: null };
-  }
+	const snapshot = readJsonSnapshotWithBackupSync(STATE_FILE);
+	if (!snapshot.value) {
+		if (!snapshot.error) {
+		return emptyState();
+		}
+		log("state_error", `Failed to read state.json: ${snapshot.error}`);
+		throw new Error(`Invalid state.json: ${snapshot.error}`);
+	}
+	const state = {
+		...emptyState(),
+		...snapshot.value,
+	};
+	ensureEvaluationState(state);
+	if (snapshot.source === "backup") {
+		log("state_warn", "Recovered state.json from backup snapshot");
+	}
+	return state;
 }
 
 function save(state) {
-  try {
-    state.lastUpdated = new Date().toISOString();
-    fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2));
-  } catch (err) {
-    log("state_error", `Failed to write state.json: ${err.message}`);
-  }
+	try {
+		ensureEvaluationState(state);
+		state.lastUpdated = new Date().toISOString();
+		writeJsonSnapshotAtomicSync(STATE_FILE, state);
+	} catch (err) {
+		log("state_error", `Failed to write state.json: ${err.message}`);
+		throw err;
+	}
 }
 
 // ─── Position Registry ─────────────────────────────────────────
@@ -45,6 +74,7 @@ export function trackPosition({
   position,
   pool,
   pool_name,
+  base_mint = null,
   strategy,
   bin_range = {},
   amount_sol,
@@ -55,17 +85,26 @@ export function trackPosition({
   fee_tvl_ratio,
   organic_score,
   initial_value_usd,
+  opened_by_cycle_id = null,
+  opened_by_action_id = null,
+  opened_by_workflow_id = null,
+  regime_label = null,
 }) {
   const state = load();
   state.positions[position] = {
     position,
     pool,
     pool_name,
+    base_mint,
     strategy,
     bin_range,
     amount_sol,
-    amount_x,
-    active_bin_at_deploy: active_bin,
+      amount_x,
+      opened_by_cycle_id,
+      opened_by_action_id,
+      opened_by_workflow_id,
+      regime_label,
+      active_bin_at_deploy: active_bin,
     bin_step,
     volatility,
     fee_tvl_ratio,
@@ -74,9 +113,13 @@ export function trackPosition({
     initial_value_usd,
     deployed_at: new Date().toISOString(),
     out_of_range_since: null,
+    out_of_range_direction: null,
     last_claim_at: null,
     total_fees_claimed_usd: 0,
+    claim_count: 0,
     rebalance_count: 0,
+    peak_pnl_pct: 0,
+    trailing_active: false,
     closed: false,
     closed_at: null,
     notes: [],
@@ -89,15 +132,16 @@ export function trackPosition({
 /**
  * Mark a position as out of range (sets timestamp on first detection).
  */
-export function markOutOfRange(position_address) {
+export function markOutOfRange(position_address, direction = null) {
   const state = load();
   const pos = state.positions[position_address];
   if (!pos) return;
   if (!pos.out_of_range_since) {
     pos.out_of_range_since = new Date().toISOString();
-    save(state);
-    log("state", `Position ${position_address} marked out of range`);
   }
+  pos.out_of_range_direction = direction || pos.out_of_range_direction || null;
+  save(state);
+  log("state", `Position ${position_address} marked out of range${pos.out_of_range_direction ? ` (${pos.out_of_range_direction})` : ""}`);
 }
 
 /**
@@ -109,6 +153,7 @@ export function markInRange(position_address) {
   if (!pos) return;
   if (pos.out_of_range_since) {
     pos.out_of_range_since = null;
+    pos.out_of_range_direction = null;
     save(state);
     log("state", `Position ${position_address} back in range`);
   }
@@ -135,6 +180,7 @@ export function recordClaim(position_address, fees_usd) {
   if (!pos) return;
   pos.last_claim_at = new Date().toISOString();
   pos.total_fees_claimed_usd = (pos.total_fees_claimed_usd || 0) + (fees_usd || 0);
+   pos.claim_count = (pos.claim_count || 0) + 1;
   pos.notes.push(`Claimed ~$${fees_usd?.toFixed(2) || "?"} fees at ${pos.last_claim_at}`);
   save(state);
 }
@@ -148,6 +194,39 @@ function pushEvent(state, event) {
   if (state.recentEvents.length > MAX_RECENT_EVENTS) {
     state.recentEvents = state.recentEvents.slice(-MAX_RECENT_EVENTS);
   }
+}
+
+export function recordCycleEvaluation({
+  cycle_id = null,
+  cycle_type,
+  status = "completed",
+  summary = {},
+  candidates = [],
+  positions = [],
+}) {
+  const state = load();
+  recordCycleEvaluationInState(state, {
+		cycle_id,
+		cycle_type,
+		status,
+		summary,
+		candidates,
+		positions,
+	});
+
+  save(state);
+}
+
+export function recordToolOutcome({ tool, outcome, reason = null, metadata = null }) {
+  const state = load();
+  recordToolOutcomeInState(state, { tool, outcome, reason, metadata });
+
+  save(state);
+}
+
+export function getEvaluationSummary(limit = 5) {
+  const state = load();
+  return getEvaluationSummaryFromState(state, limit);
 }
 
 /**
@@ -199,6 +278,35 @@ export function setPositionInstruction(position_address, instruction) {
 }
 
 /**
+ * Update peak PnL and check trailing take profit / stop loss.
+ * Returns an action string if a threshold is hit, or null.
+ */
+export function updatePnlAndCheckExits(position_address, currentPnlPct, config, { stale = false } = {}) {
+  const state = load();
+  const pos = state.positions[position_address];
+  if (!pos || pos.closed) return null;
+
+  const exitEvaluation = evaluateTrackedPositionExit({
+    positionState: pos,
+    currentPnlPct,
+    managementConfig: config.management,
+    stale,
+  });
+
+  pos.peak_pnl_pct = exitEvaluation.peak_pnl_pct;
+  pos.trailing_active = exitEvaluation.trailing_active;
+  if (exitEvaluation.notes.length > 0) {
+    pos.notes.push(...exitEvaluation.notes);
+  }
+  if (exitEvaluation.log_message) {
+    log("state", `Position ${position_address} ${exitEvaluation.log_message}`);
+  }
+
+  save(state);
+  return exitEvaluation.action;
+}
+
+/**
  * Get all tracked positions (optionally filter open-only).
  */
 export function getTrackedPositions(openOnly = false) {
@@ -236,11 +344,13 @@ export function getStateSummary() {
       deployed_at: p.deployed_at,
       out_of_range_since: p.out_of_range_since,
       minutes_out_of_range: minutesOutOfRange(p.position),
+      out_of_range_direction: p.out_of_range_direction || null,
       total_fees_claimed_usd: p.total_fees_claimed_usd,
       initial_fee_tvl_24h: p.initial_fee_tvl_24h,
       rebalance_count: p.rebalance_count,
       instruction: p.instruction || null,
     })),
+    evaluation: getEvaluationSummary(3),
     last_updated: state.lastUpdated,
     recent_events: (state.recentEvents || []).slice(-10),
   };
@@ -276,6 +386,17 @@ export function syncOpenPositions(active_addresses) {
   const activeSet = new Set(active_addresses);
   let changed = false;
 
+  const journal = readActionJournal();
+  const unresolvedWriteWorkflows = foldActionJournal(journal.entries).filter((workflow) => {
+    if (!workflow || !workflow.tool) return false;
+    if (workflow.lifecycle === "completed" || workflow.lifecycle === "manual_review") return false;
+    return workflow.lifecycle === "intent" || workflow.lifecycle === "close_observed_pending_redeploy";
+  });
+
+  if (journal.parse_errors.length > 0) {
+    log("state_warn", `State sync skipped auto-close because action journal has ${journal.parse_errors.length} parse error(s)`);
+  }
+
   for (const posId in state.positions) {
     const pos = state.positions[posId];
     if (pos.closed || activeSet.has(posId)) continue;
@@ -284,6 +405,26 @@ export function syncOpenPositions(active_addresses) {
     const deployedAt = pos.deployed_at ? new Date(pos.deployed_at).getTime() : 0;
     if (Date.now() - deployedAt < SYNC_GRACE_MS) {
       log("state", `Position ${posId} not on-chain yet — within grace period, skipping auto-close`);
+      continue;
+    }
+
+    if (journal.parse_errors.length > 0) {
+      log("state_warn", `Position ${posId} missing on-chain but action journal is invalid; skipping auto-close`);
+      continue;
+    }
+
+    const relatedWorkflows = unresolvedWriteWorkflows.filter((workflow) => {
+      if (workflow.position_address && workflow.position_address === posId) return true;
+      if (workflow.pool_address && pos.pool && workflow.pool_address === pos.pool) return true;
+      return false;
+    });
+
+    if (relatedWorkflows.length > 0) {
+      const workflowHints = relatedWorkflows
+        .slice(0, 3)
+        .map((workflow) => `${workflow.workflow_id}:${workflow.tool}:${workflow.lifecycle}`)
+        .join(", ");
+      log("state_warn", `Position ${posId} missing on-chain but unresolved workflow(s) exist (${workflowHints}); skipping auto-close`);
       continue;
     }
 

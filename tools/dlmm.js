@@ -14,12 +14,43 @@ import {
   markInRange,
   recordClaim,
   recordClose,
+  recordRebalance,
   getTrackedPosition,
   minutesOutOfRange,
   syncOpenPositions,
 } from "../state.js";
 import { recordPerformance } from "../lessons.js";
-import { normalizeMint } from "./wallet.js";
+import { evaluatePortfolioGuard } from "../portfolio-guards.js";
+import { DEPLOY_GOVERNANCE_CODES, evaluateDeployAdmission } from "../runtime-policy.js";
+import { estimateInitialValueUsd } from "../runtime-helpers.js";
+import { getPoolDeployCooldown } from "../pool-memory.js";
+import { appendActionLifecycle } from "../action-journal.js";
+import { getWalletBalances, normalizeMint } from "./wallet.js";
+import {
+	calculateDynamicBinTierPlan,
+	chooseDistributionStrategyPlan,
+} from "./dlmm-planner.js";
+import {
+	buildPoolPlanningData,
+	calculateBalanceDeltas,
+	classifyRangeLocation,
+	getOutOfRangeDirection,
+	normalizeCompoundingLocation,
+	resolveBinSnapshot,
+	resolveCompoundingBias,
+} from "./dlmm-rebalance-helpers.js";
+import {
+	buildTrackedPositionFallback,
+	captureBalanceSnapshotForMints,
+	getPositionExecutionContext,
+	resolvePoolTokenMints,
+} from "./dlmm-position-context.js";
+import {
+	buildClosePerformancePayload,
+	evaluatePostCloseSettlementObservation,
+	getWalletTokenBalance,
+	waitForPostCloseSettlement,
+} from "./dlmm-settlement.js";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
 // @meteora-ag/dlmm → @coral-xyz/anchor uses CJS directory imports
@@ -64,6 +95,27 @@ function getWallet() {
 // ─── Pool Cache ────────────────────────────────────────────────
 const poolCache = new Map();
 
+const MAX_BINS_PER_SIDE = 34;
+
+function toFiniteNumber(value, fallback = 0) {
+  const num = Number(value);
+  return Number.isFinite(num) ? num : fallback;
+}
+
+function clampNumber(value, min, max) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function clampWholeNumber(value, min, max) {
+  return Math.round(clampNumber(toFiniteNumber(value, min), min, max));
+}
+
+function roundMetric(value, decimals = 4) {
+  const factor = Math.pow(10, decimals);
+  return Math.round(value * factor) / factor;
+}
+
+
 async function getPool(poolAddress) {
   const key = poolAddress.toString();
   if (!poolCache.has(key)) {
@@ -74,7 +126,21 @@ async function getPool(poolAddress) {
   return poolCache.get(key);
 }
 
-setInterval(() => poolCache.clear(), 5 * 60 * 1000).unref();
+export async function getPoolGovernanceMetadata({ pool_address }) {
+	pool_address = normalizeMint(pool_address);
+	try {
+		const pool = await getPool(pool_address);
+		return {
+			pool_address,
+			base_mint: pool?.lbPair?.tokenXMint?.toString() || null,
+			bin_step: pool?.lbPair?.binStep ?? null,
+		};
+	} catch (error) {
+		return { error: error.message };
+	}
+}
+
+setInterval(() => poolCache.clear(), 5 * 60 * 1000);
 
 // ─── Get Active Bin ────────────────────────────────────────────
 export async function getActiveBin({ pool_address }) {
@@ -87,6 +153,14 @@ export async function getActiveBin({ pool_address }) {
     price: pool.fromPricePerLamport(Number(activeBin.price)),
     pricePerLamport: activeBin.price.toString(),
   };
+}
+
+export async function chooseDistributionStrategy({ pool_data = {}, expected_volume_profile = "balanced" }) {
+  return chooseDistributionStrategyPlan({ pool_data, expected_volume_profile });
+}
+
+export async function calculateDynamicBinTiers({ six_hour_volatility, trend_bias = "neutral" }) {
+  return calculateDynamicBinTierPlan(six_hour_volatility, trend_bias);
 }
 
 // ─── Deploy Position ───────────────────────────────────────────
@@ -107,8 +181,52 @@ export async function deployPosition({
   fee_tvl_ratio,
   organic_score,
   initial_value_usd,
+  decision_context = null,
+  bypass_portfolio_guard = false,
 }) {
   pool_address = normalizeMint(pool_address);
+  const portfolioGuard = evaluatePortfolioGuard();
+  const cooldown = getPoolDeployCooldown({ pool_address });
+  const deployAdmission = evaluateDeployAdmission({
+    config,
+    poolAddress: pool_address,
+    amountY: amount_y ?? amount_sol ?? 0,
+    amountX: amount_x ?? 0,
+    portfolioGuard,
+    poolCooldown: cooldown,
+    enforcePositionLimit: false,
+    enforceExposure: false,
+    enforceBinStep: false,
+    enforceSize: false,
+    enforceBalance: false,
+  });
+  if (!deployAdmission.pass) {
+    if (deployAdmission.code === DEPLOY_GOVERNANCE_CODES.PORTFOLIO_GUARD_ACTIVE) {
+      if (!bypass_portfolio_guard) {
+        return {
+          success: false,
+          blocked: true,
+          reason: "portfolio_guard_pause_active",
+          pool: pool_address,
+          pause_until: portfolioGuard.pause_until,
+          guard_reason: portfolioGuard.reason,
+          guard_reason_code: portfolioGuard.reason_code,
+        };
+      }
+    }
+    if (deployAdmission.code === DEPLOY_GOVERNANCE_CODES.POOL_LOW_YIELD_COOLDOWN_ACTIVE) {
+      return {
+        success: false,
+        blocked: true,
+        reason: "pool_low_yield_cooldown_active",
+        pool: pool_address,
+        cooldown_until: cooldown.cooldown_until,
+        cooldown_reason: cooldown.reason,
+        remaining_minutes: Math.ceil((cooldown.remaining_ms || 0) / 60000),
+      };
+    }
+  }
+
   const activeStrategy = strategy || config.strategy.strategy;
 
   const activeBinsBelow = bins_below ?? config.strategy.binsBelow;
@@ -155,6 +273,14 @@ export async function deployPosition({
   // If amount_y is not provided but amount_sol is, use amount_sol (for backward compatibility)
   const finalAmountY = amount_y ?? amount_sol ?? 0;
   const finalAmountX = amount_x ?? 0;
+	const walletBalances = await getWalletBalances({}).catch(() => null);
+	const solPrice = Number(walletBalances?.sol_price) || 0;
+	const deployValueUsd = estimateInitialValueUsd({
+		amountSol: finalAmountY,
+		solPrice,
+		amountToken: finalAmountX,
+		activePrice: Number(activeBin.price),
+	});
 
   const totalYLamports = new BN(Math.floor(finalAmountY * 1e9));
   // For X, we assume it's also 9 decimals for now, or we'd need to fetch mint decimals.
@@ -241,6 +367,7 @@ export async function deployPosition({
       position: newPosition.publicKey.toString(),
       pool: pool_address,
       pool_name,
+      base_mint: pool.lbPair.tokenXMint.toString(),
       strategy: trackedStrategy,
       bin_range: { min: minBinId, max: maxBinId, bins_below: activeBinsBelow, bins_above: activeBinsAbove },
       bin_step,
@@ -250,7 +377,11 @@ export async function deployPosition({
       amount_sol: finalAmountY,
       amount_x: finalAmountX,
       active_bin: activeBin.binId,
-      initial_value_usd,
+      initial_value_usd: deployValueUsd,
+      opened_by_cycle_id: decision_context?.cycle_id || null,
+      opened_by_action_id: decision_context?.action_id || null,
+      opened_by_workflow_id: decision_context?.workflow_id || null,
+      regime_label: decision_context?.regime_label || null,
     });
 
     const actualBinStep = pool.lbPair.binStep;
@@ -379,13 +510,20 @@ export async function getMyPositions({ force = false } = {}) {
     for (const acc of accounts) {
       const positionAddress = acc.pubkey.toBase58();
       const lbPairKey = new PublicKey(acc.account.data.slice(8, 40)).toBase58();
-      // Pair name: use tracked state pool_name if available
       const tracked = getTrackedPosition(positionAddress);
       const pair = tracked?.pool_name || lbPairKey.slice(0, 8);
       raw.push({
         position: positionAddress,
         pool: lbPairKey,
         pair,
+        pool_name: tracked?.pool_name || null,
+        strategy: tracked?.strategy || null,
+        bin_range: tracked?.bin_range || null,
+        bin_step: tracked?.bin_step ?? null,
+        volatility: tracked?.volatility ?? null,
+        fee_tvl_ratio: tracked?.fee_tvl_ratio ?? null,
+        organic_score: tracked?.organic_score ?? null,
+        instruction: tracked?.instruction || null,
         base_mint: null, // enriched from PnL API below
         lower_bin: null,
         upper_bin: null,
@@ -397,17 +535,36 @@ export async function getMyPositions({ force = false } = {}) {
     const pnlMaps = await Promise.all(uniquePools.map((pool) => fetchDlmmPnlForPool(pool, walletAddress)));
     const pnlByPool = {};
     uniquePools.forEach((pool, i) => { pnlByPool[pool] = pnlMaps[i]; });
+	const mintMaps = await Promise.all(
+		uniquePools.map((pool) =>
+			resolvePoolTokenMints({
+				poolAddress: pool,
+				getPool,
+			}),
+		),
+	);
+	const mintLookupFailure = mintMaps.find((entry) => entry?.error);
+	if (mintLookupFailure) {
+		return {
+			wallet: walletAddress,
+			total_positions: 0,
+			positions: [],
+			error: `pool mint enrichment failed: ${mintLookupFailure.error}`,
+		};
+	}
+    const mintsByPool = {};
+    uniquePools.forEach((pool, i) => { mintsByPool[pool] = mintMaps[i]; });
 
     const positions = raw.map((r) => {
       const p = pnlByPool[r.pool]?.[r.position] || null;
 
-      const inRange = p ? !p.isOutOfRange : true;
-      if (inRange) markInRange(r.position);
-      else markOutOfRange(r.position);
-
       const lowerBin  = p?.lowerBinId      ?? r.lower_bin;
       const upperBin  = p?.upperBinId      ?? r.upper_bin;
       const activeBin = p?.poolActiveBinId ?? null;
+      const oorDirection = getOutOfRangeDirection(lowerBin, upperBin, activeBin);
+      const inRange = p ? !p.isOutOfRange : true;
+      if (inRange) markInRange(r.position);
+      else markOutOfRange(r.position, oorDirection);
 
       const unclaimedFees = p ? (parseFloat(p.unrealizedPnl?.unclaimedFeeTokenX?.usd || 0) + parseFloat(p.unrealizedPnl?.unclaimedFeeTokenY?.usd || 0)) : 0;
       const totalValue    = p ? parseFloat(p.unrealizedPnl?.balances || 0) : 0;
@@ -416,6 +573,7 @@ export async function getMyPositions({ force = false } = {}) {
       const pnlPct        = p?.pnlPctChange ?? 0;
 
       const tracked = getTrackedPosition(r.position);
+      const poolMints = mintsByPool[r.pool] || null;
       const ageFromPnlApi = p?.createdAt
         ? Math.floor((Date.now() - p.createdAt * 1000) / 60000)
         : null;
@@ -428,11 +586,21 @@ export async function getMyPositions({ force = false } = {}) {
         position: r.position,
         pool: r.pool,
         pair: r.pair,
-        base_mint: r.base_mint,
+        pool_name: r.pool_name,
+        strategy: r.strategy,
+        bin_range: r.bin_range,
+        bin_step: r.bin_step,
+        volatility: r.volatility,
+        organic_score: r.organic_score,
+        instruction: r.instruction,
+        amount_sol: tracked?.amount_sol ?? null,
+        initial_value_usd: tracked?.initial_value_usd ?? null,
+        base_mint: tracked?.base_mint || poolMints?.token_x_mint || r.base_mint,
         lower_bin: lowerBin,
         upper_bin: upperBin,
         active_bin: activeBin,
         in_range: inRange,
+        out_of_range_direction: oorDirection,
         unclaimed_fees_usd: Math.round(unclaimedFees * 100) / 100,
         total_value_usd: Math.round(totalValue * 100) / 100,
         collected_fees_usd: Math.round(collectedFees * 100) / 100,
@@ -440,6 +608,9 @@ export async function getMyPositions({ force = false } = {}) {
         pnl_pct: Math.round(pnlPct * 100) / 100,
         age_minutes: ageMinutes,
         minutes_out_of_range: minutesOutOfRange(r.position),
+        fee_tvl_ratio: p?.feeActiveTvlRatio != null
+          ? Math.round(p.feeActiveTvlRatio * 10000) / 10000
+          : r.fee_tvl_ratio,
       };
     });
 
@@ -481,17 +652,40 @@ export async function getWalletPositions({ wallet_address }) {
     const pnlMaps = await Promise.all(uniquePools.map((pool) => fetchDlmmPnlForPool(pool, wallet_address)));
     const pnlByPool = {};
     uniquePools.forEach((pool, i) => { pnlByPool[pool] = pnlMaps[i]; });
+	const mintMaps = await Promise.all(
+		uniquePools.map((pool) =>
+			resolvePoolTokenMints({
+				poolAddress: pool,
+				getPool,
+			}),
+		),
+	);
+	const mintLookupFailure = mintMaps.find((entry) => entry?.error);
+	if (mintLookupFailure) {
+		return {
+			wallet: wallet_address,
+			total_positions: 0,
+			positions: [],
+			error: `pool mint enrichment failed: ${mintLookupFailure.error}`,
+		};
+	}
+    const mintsByPool = {};
+    uniquePools.forEach((pool, i) => { mintsByPool[pool] = mintMaps[i]; });
 
     const positions = raw.map((r) => {
       const p = pnlByPool[r.pool]?.[r.position] || null;
+      const poolMints = mintsByPool[r.pool] || null;
+      const oorDirection = getOutOfRangeDirection(p?.lowerBinId ?? null, p?.upperBinId ?? null, p?.poolActiveBinId ?? null);
 
       return {
         position:           r.position,
         pool:               r.pool,
+        base_mint:          poolMints?.token_x_mint || null,
         lower_bin:          p?.lowerBinId      ?? null,
         upper_bin:          p?.upperBinId      ?? null,
         active_bin:         p?.poolActiveBinId ?? null,
         in_range:           p ? !p.isOutOfRange : null,
+        out_of_range_direction: oorDirection,
         unclaimed_fees_usd: Math.round((p ? (parseFloat(p.unrealizedPnl?.unclaimedFeeTokenX?.usd || 0) + parseFloat(p.unrealizedPnl?.unclaimedFeeTokenY?.usd || 0)) : 0) * 100) / 100,
         total_value_usd:    Math.round((p ? parseFloat(p.unrealizedPnl?.balances || 0) : 0) * 100) / 100,
         pnl_usd:            Math.round((p?.pnlUsd ?? 0) * 100) / 100,
@@ -530,9 +724,510 @@ export async function searchPools({ query, limit = 10 }) {
   };
 }
 
+function roundAmount(value, decimals = 6) {
+  const sanitized = Math.max(0, toFiniteNumber(value, 0));
+  const factor = Math.pow(10, decimals);
+  return Math.floor(sanitized * factor) / factor;
+}
+
+
+export async function rebalanceOnExit({
+  position_address,
+  force_rebalance = false,
+  expected_volume_profile,
+  execute = true,
+  journal_workflow_id = null,
+  decision_context = null,
+} = {}) {
+  position_address = normalizeMint(position_address);
+  if (!position_address) {
+    return { success: false, error: "position_address is required" };
+  }
+
+	const context = await getPositionExecutionContext(position_address, {
+		getMyPositions,
+		getPositionPnl,
+		buildTrackedFallback: (address) => buildTrackedPositionFallback(address, { getTrackedPosition }),
+		resolveBinSnapshot,
+		classifyRangeLocation,
+		isDryRun: process.env.DRY_RUN === "true",
+	});
+  if (context.error) {
+    return { success: false, error: context.error, position: position_address };
+  }
+
+  const outOfRange = context.in_range === false || context.range_location.in_range === false;
+  if (!outOfRange && !force_rebalance) {
+    return {
+      success: false,
+      skipped: true,
+      position: position_address,
+      reason: "Position is currently in range. Set force_rebalance=true to override.",
+      range_snapshot: context.bin_snapshot,
+      range_location: context.range_location,
+    };
+  }
+
+  const planningData = buildPoolPlanningData(context.position, context.bin_snapshot);
+  const expectedVolumeProfile = expected_volume_profile || planningData.expected_volume_profile;
+  const distributionPlan = await chooseDistributionStrategy({
+    pool_data: planningData.pool_data,
+    expected_volume_profile: expectedVolumeProfile,
+  });
+  const tierPlan = await calculateDynamicBinTiers({
+    six_hour_volatility: planningData.pool_data.six_hour_volatility,
+    trend_bias: planningData.trend_bias,
+  });
+
+  const strategy = distributionPlan?.strategy || context.position.strategy || config.strategy.strategy;
+  const binsBelow = clampWholeNumber(
+    tierPlan?.range_plan?.bins_below ?? config.strategy.binsBelow,
+    0,
+    MAX_BINS_PER_SIDE
+  );
+  const binsAbove = strategy === "bid_ask"
+    ? 0
+    : clampWholeNumber(tierPlan?.range_plan?.bins_above ?? 0, 0, MAX_BINS_PER_SIDE);
+
+  const actionPlan = {
+    close_position: { position_address },
+    deploy_position: {
+      pool_address: context.position.pool,
+      pool_name: context.position.pool_name || context.position.pair || null,
+      strategy,
+      bins_below: binsBelow,
+      bins_above: binsAbove,
+      amount_x: null,
+      amount_y: null,
+      amount_source: "post_close_balance_delta",
+      bin_step: context.position.bin_step ?? null,
+      volatility: planningData.pool_data.six_hour_volatility,
+      fee_tvl_ratio: planningData.pool_data.fee_tvl_ratio,
+      organic_score: planningData.pool_data.organic_score,
+    },
+  };
+
+  const dryRun = process.env.DRY_RUN === "true";
+  if (dryRun || !execute) {
+    return {
+      success: true,
+      dry_run: dryRun,
+      executed: false,
+      position: position_address,
+      out_of_range: outOfRange,
+      force_rebalance: !!force_rebalance,
+      range_snapshot: context.bin_snapshot,
+      range_location: context.range_location,
+      planning: {
+        expected_volume_profile: expectedVolumeProfile,
+        trend_bias: planningData.trend_bias,
+        distribution_plan: distributionPlan,
+        tier_plan: tierPlan,
+        reinvestment_plan: {
+          amount_source: "post_close_balance_delta",
+          note: "Live execution redeploy amount is derived only from close balance deltas.",
+        },
+      },
+      action_plan: actionPlan,
+      message: dryRun
+        ? "DRY RUN — rebalance plan generated, no transactions sent"
+        : "Execution disabled — rebalance plan generated",
+    };
+  }
+
+  if (!context.position.pool) {
+    return {
+      success: false,
+      error: "Cannot execute live rebalance without a pool address",
+      position: position_address,
+      action_plan: actionPlan,
+    };
+  }
+
+	const poolTokenMints = await resolvePoolTokenMints({
+		poolAddress: context.position.pool,
+		getPool,
+	});
+  if (!poolTokenMints || poolTokenMints.error || !poolTokenMints.token_x_mint || !poolTokenMints.token_y_mint) {
+    return {
+      success: false,
+      error: `Cannot execute live rebalance without pool token mint metadata${poolTokenMints?.error ? `: ${poolTokenMints.error}` : ""}`,
+      position: position_address,
+      action_plan: actionPlan,
+    };
+  }
+
+	const beforeCloseSnapshot = await captureBalanceSnapshotForMints({
+		token_x_mint: poolTokenMints.token_x_mint,
+		token_y_mint: poolTokenMints.token_y_mint,
+		phase: "before close",
+		getWalletBalances,
+		normalizeMint,
+		solMint: config.tokens.SOL,
+	});
+  if (beforeCloseSnapshot?.error) {
+    return {
+      success: false,
+      error: `Cannot execute live rebalance without a pre-close balance snapshot: ${beforeCloseSnapshot.error}`,
+      position: position_address,
+      action_plan: actionPlan,
+    };
+  }
+
+  const closeResult = await closePosition({ position_address, decision_context });
+  if (!closeResult?.success) {
+    return {
+      success: false,
+      error: closeResult?.error || "Failed to close position for rebalance",
+      position: position_address,
+      close_result: closeResult,
+      action_plan: actionPlan,
+    };
+  }
+
+  if (journal_workflow_id) {
+    appendActionLifecycle({
+      workflow_id: journal_workflow_id,
+      lifecycle: "close_observed_pending_redeploy",
+      tool: "rebalance_on_exit",
+      position_address,
+      pool_address: context.position.pool,
+    });
+  }
+
+	const afterCloseSnapshot = await captureBalanceSnapshotForMints({
+		token_x_mint: poolTokenMints.token_x_mint,
+		token_y_mint: poolTokenMints.token_y_mint,
+		phase: "after close",
+		getWalletBalances,
+		normalizeMint,
+		solMint: config.tokens.SOL,
+	});
+  if (afterCloseSnapshot?.error) {
+    return {
+      success: false,
+      error: `Closed position but cannot determine recovered token deltas: ${afterCloseSnapshot.error}`,
+      position: position_address,
+      close_result: closeResult,
+      action_plan: actionPlan,
+    };
+  }
+
+  const recoveredDeltaPlan = calculateBalanceDeltas(beforeCloseSnapshot, afterCloseSnapshot);
+  if (recoveredDeltaPlan.error) {
+    return {
+      success: false,
+      error: `Closed position but redeploy delta sizing is unsafe: ${recoveredDeltaPlan.error}`,
+      position: position_address,
+      close_result: closeResult,
+      recovered_deltas: {
+        delta_x_raw: recoveredDeltaPlan.delta_x_raw ?? null,
+        delta_y_raw: recoveredDeltaPlan.delta_y_raw ?? null,
+      },
+      planning: {
+        reinvestment_plan: {
+          amount_source: "post_close_balance_delta",
+          before_close_snapshot: beforeCloseSnapshot,
+          after_close_snapshot: afterCloseSnapshot,
+        },
+      },
+      action_plan: {
+        ...actionPlan,
+        deploy_position: {
+          ...actionPlan.deploy_position,
+          amount_x: 0,
+          amount_y: 0,
+        },
+      },
+    };
+  }
+
+  if (strategy === "bid_ask" && recoveredDeltaPlan.amount_y <= 0) {
+    return {
+      success: false,
+      error: "Closed position but bid_ask redeploy requires quote-side amount_y > 0",
+      position: position_address,
+      close_result: closeResult,
+      planning: {
+        reinvestment_plan: {
+          amount_source: "post_close_balance_delta",
+          recovered_deltas: recoveredDeltaPlan,
+        },
+      },
+      action_plan: {
+        ...actionPlan,
+        deploy_position: {
+          ...actionPlan.deploy_position,
+          amount_x: recoveredDeltaPlan.amount_x,
+          amount_y: recoveredDeltaPlan.amount_y,
+        },
+      },
+    };
+  }
+
+  const deployArgs = {
+    ...actionPlan.deploy_position,
+    amount_x: recoveredDeltaPlan.amount_x,
+    amount_y: recoveredDeltaPlan.amount_y,
+    decision_context,
+    bypass_portfolio_guard: true,
+  };
+  const deployResult = await deployPosition(deployArgs);
+
+  if (!deployResult?.success) {
+    return {
+      success: false,
+      error: deployResult?.error || "Rebalance redeploy failed after close",
+      position: position_address,
+      close_result: closeResult,
+      deploy_result: deployResult,
+      planning: {
+        expected_volume_profile: expectedVolumeProfile,
+        trend_bias: planningData.trend_bias,
+        distribution_plan: distributionPlan,
+        tier_plan: tierPlan,
+        reinvestment_plan: {
+          amount_source: "post_close_balance_delta",
+          recovered_deltas: recoveredDeltaPlan,
+          before_close_snapshot: beforeCloseSnapshot,
+          after_close_snapshot: afterCloseSnapshot,
+        },
+      },
+      action_plan: {
+        ...actionPlan,
+        deploy_position: deployArgs,
+      },
+    };
+  }
+
+  recordRebalance(position_address, deployResult.position);
+
+  return {
+    success: true,
+    rebalanced: true,
+    old_position: position_address,
+    new_position: deployResult.position,
+    close_result: closeResult,
+    deploy_result: deployResult,
+    range_snapshot: context.bin_snapshot,
+    range_location: context.range_location,
+    planning: {
+      expected_volume_profile: expectedVolumeProfile,
+      trend_bias: planningData.trend_bias,
+      distribution_plan: distributionPlan,
+      tier_plan: tierPlan,
+      reinvestment_plan: {
+        amount_source: "post_close_balance_delta",
+        recovered_deltas: recoveredDeltaPlan,
+        before_close_snapshot: beforeCloseSnapshot,
+        after_close_snapshot: afterCloseSnapshot,
+      },
+    },
+    action_plan: {
+      ...actionPlan,
+      deploy_position: deployArgs,
+    },
+  };
+}
+
+export async function autoCompoundFees({
+  position_address,
+  execute_reinvest = false,
+  expected_volume_profile,
+  force_claim = false,
+} = {}) {
+  position_address = normalizeMint(position_address);
+  if (!position_address) {
+    return { success: false, error: "position_address is required" };
+  }
+
+	const context = await getPositionExecutionContext(position_address, {
+		getMyPositions,
+		getPositionPnl,
+		buildTrackedFallback: (address) => buildTrackedPositionFallback(address, { getTrackedPosition }),
+		resolveBinSnapshot,
+		classifyRangeLocation,
+		isDryRun: process.env.DRY_RUN === "true",
+	});
+  if (context.error) {
+    return { success: false, error: context.error, position: position_address };
+  }
+
+  const compoundingLocation = normalizeCompoundingLocation(context.range_location);
+  const compoundingBias = resolveCompoundingBias(context.range_location);
+
+  const planningData = buildPoolPlanningData(context.position, context.bin_snapshot);
+  const expectedVolumeProfile = expected_volume_profile || planningData.expected_volume_profile;
+  const distributionPlan = await chooseDistributionStrategy({
+    pool_data: planningData.pool_data,
+    expected_volume_profile: expectedVolumeProfile,
+  });
+  const tierPlan = await calculateDynamicBinTiers({
+    six_hour_volatility: planningData.pool_data.six_hour_volatility,
+    trend_bias: planningData.trend_bias,
+  });
+
+  let strategy = distributionPlan?.strategy || context.position.strategy || config.strategy.strategy;
+  if (compoundingLocation === "near_upper") strategy = "bid_ask";
+  if (compoundingLocation === "near_lower") strategy = "spot";
+
+  const binsBelow = clampWholeNumber(
+    tierPlan?.range_plan?.bins_below ?? config.strategy.binsBelow,
+    0,
+    MAX_BINS_PER_SIDE
+  );
+  const binsAbove = strategy === "bid_ask"
+    ? 0
+    : clampWholeNumber(tierPlan?.range_plan?.bins_above ?? 0, 0, MAX_BINS_PER_SIDE);
+
+  const reinvestmentPlan = {
+    amount_source: "post_claim_balance_delta",
+    amount_x: null,
+    amount_y: null,
+    bias: compoundingBias,
+    in_place_supported: false,
+    note: "In-place compounding is not safely implementable with current primitives. Duplicate same-pool deployment is intentionally blocked.",
+  };
+
+  const unclaimedFeeUsd = Math.max(
+    0,
+    toFiniteNumber(context.pnl?.unclaimed_fee_usd ?? context.position.unclaimed_fees_usd, 0)
+  );
+
+  const actionPlan = {
+    claim_fees: { position_address },
+    reinvest_plan: {
+      mode: "in_place_only",
+      executes_with_current_primitives: false,
+      blocked_duplicate_pool_deploy: true,
+      blocked_reason: "Current primitives do not support safe in-place compounding. Opening another position in the same pool is blocked.",
+      suggested_parameters: {
+        pool_address: context.position.pool,
+        pool_name: context.position.pool_name || context.position.pair || null,
+        strategy,
+        bins_below: binsBelow,
+        bins_above: binsAbove,
+        amount_x: null,
+        amount_y: null,
+        amount_source: "post_claim_balance_delta",
+        bin_step: context.position.bin_step ?? null,
+        volatility: planningData.pool_data.six_hour_volatility,
+        fee_tvl_ratio: planningData.pool_data.fee_tvl_ratio,
+        organic_score: planningData.pool_data.organic_score,
+      },
+    },
+  };
+
+  const dryRun = process.env.DRY_RUN === "true";
+  if (dryRun) {
+    const claimPreview = await claimFees({ position_address });
+    return {
+      success: true,
+      dry_run: true,
+      executed: false,
+      position: position_address,
+      current_range_location: compoundingLocation,
+      current_bias: compoundingBias,
+      in_range: context.in_range,
+      unclaimed_fee_usd: roundMetric(unclaimedFeeUsd, 2),
+      range_snapshot: context.bin_snapshot,
+      planning: {
+        expected_volume_profile: expectedVolumeProfile,
+        trend_bias: planningData.trend_bias,
+        distribution_plan: distributionPlan,
+        tier_plan: tierPlan,
+        reinvestment_plan: reinvestmentPlan,
+      },
+      claim_preview: claimPreview,
+      action_plan: actionPlan,
+      message: "DRY RUN — claim + compounding plan generated, no transactions sent",
+    };
+  }
+
+  if (!force_claim && unclaimedFeeUsd <= 0) {
+    return {
+      success: true,
+      skipped: true,
+      position: position_address,
+      reason: "No unclaimed fees detected to compound",
+      current_range_location: compoundingLocation,
+      current_bias: compoundingBias,
+      unclaimed_fee_usd: roundMetric(unclaimedFeeUsd, 2),
+      planning: {
+        expected_volume_profile: expectedVolumeProfile,
+        trend_bias: planningData.trend_bias,
+        distribution_plan: distributionPlan,
+        tier_plan: tierPlan,
+        reinvestment_plan: reinvestmentPlan,
+      },
+      action_plan: actionPlan,
+    };
+  }
+
+  const claimResult = await claimFees({ position_address });
+  if (!claimResult?.success) {
+    return {
+      success: false,
+      error: claimResult?.error || "Failed to claim fees before compounding",
+      position: position_address,
+      claim_result: claimResult,
+      action_plan: actionPlan,
+    };
+  }
+
+  if (!execute_reinvest) {
+    return {
+      success: true,
+      claimed: true,
+      compounded: false,
+      position: position_address,
+      current_range_location: compoundingLocation,
+      current_bias: compoundingBias,
+      unclaimed_fee_usd: roundMetric(unclaimedFeeUsd, 2),
+      claim_result: claimResult,
+      planning: {
+        expected_volume_profile: expectedVolumeProfile,
+        trend_bias: planningData.trend_bias,
+        distribution_plan: distributionPlan,
+        tier_plan: tierPlan,
+        reinvestment_plan: reinvestmentPlan,
+      },
+      action_plan: actionPlan,
+      message: "Fees claimed. In-place compounding is not safely supported by current primitives; returned a non-executed action plan.",
+    };
+  }
+
+  return {
+    success: true,
+    claimed: true,
+    compounded: false,
+    reinvest_executed: false,
+    blocked: true,
+    mode: "in_place_only",
+    position: position_address,
+    current_range_location: compoundingLocation,
+    current_bias: compoundingBias,
+    unclaimed_fee_usd: roundMetric(unclaimedFeeUsd, 2),
+    claim_result: claimResult,
+    reason: "execute_reinvest requested, but duplicate-position deployment is blocked and in-place compounding is not safely supported by current primitives.",
+    planning: {
+      expected_volume_profile: expectedVolumeProfile,
+      trend_bias: planningData.trend_bias,
+      distribution_plan: distributionPlan,
+      tier_plan: tierPlan,
+      reinvestment_plan: reinvestmentPlan,
+    },
+    action_plan: actionPlan,
+  };
+}
+
 // ─── Claim Fees ────────────────────────────────────────────────
 export async function claimFees({ position_address }) {
   position_address = normalizeMint(position_address);
+  const trackedPosition = getTrackedPosition(position_address);
+  if (trackedPosition?.closed) {
+    return { success: false, error: `Position ${position_address} is already closed` };
+  }
   if (process.env.DRY_RUN === "true") {
     return { dry_run: true, would_claim: position_address, message: "DRY RUN — no transaction sent" };
   }
@@ -544,6 +1239,12 @@ export async function claimFees({ position_address }) {
     // Clear cached pool so SDK loads fresh position fee state
     poolCache.delete(poolAddress.toString());
     const pool = await getPool(poolAddress);
+    const baseMint = pool.lbPair.tokenXMint.toString();
+    const baseBalanceBeforeClaim = await getWalletTokenBalance({
+			walletPubkey: wallet.publicKey,
+			mint: baseMint,
+			getConnection,
+		}).catch(() => null);
 
     const positionData = await pool.getPosition(new PublicKey(position_address));
     const txs = await pool.claimSwapFee({
@@ -563,8 +1264,23 @@ export async function claimFees({ position_address }) {
     log("claim", `SUCCESS txs: ${txHashes.join(", ")}`);
     _positionsCacheAt = 0; // invalidate cache after claim
     recordClaim(position_address);
+    const baseBalanceAfterClaim = await getWalletTokenBalance({
+			walletPubkey: wallet.publicKey,
+			mint: baseMint,
+			getConnection,
+		}).catch(() => null);
+    const baseAmountReceived = computeObservedTokenDelta({
+      previousBalance: baseBalanceBeforeClaim,
+      observedBalance: baseBalanceAfterClaim,
+    });
 
-    return { success: true, position: position_address, txs: txHashes, base_mint: pool.lbPair.tokenXMint.toString() };
+    return {
+      success: true,
+      position: position_address,
+      txs: txHashes,
+      base_mint: baseMint,
+      base_amount_received: baseAmountReceived,
+    };
   } catch (error) {
     log("claim_error", error.message);
     return { success: false, error: error.message };
@@ -572,8 +1288,12 @@ export async function claimFees({ position_address }) {
 }
 
 // ─── Close Position ────────────────────────────────────────────
-export async function closePosition({ position_address }) {
+export async function closePosition({ position_address, reason = "agent decision", decision_context = null }) {
   position_address = normalizeMint(position_address);
+  const trackedPosition = getTrackedPosition(position_address);
+  if (trackedPosition?.closed) {
+    return { success: false, error: `Position ${position_address} is already closed` };
+  }
   if (process.env.DRY_RUN === "true") {
     return { dry_run: true, would_close: position_address, message: "DRY RUN — no transaction sent" };
   }
@@ -585,6 +1305,12 @@ export async function closePosition({ position_address }) {
     // Clear cached pool so SDK loads fresh position fee state
     poolCache.delete(poolAddress.toString());
     const pool = await getPool(poolAddress);
+    const baseMint = pool.lbPair.tokenXMint.toString();
+    const baseBalanceBeforeClose = await getWalletTokenBalance({
+			walletPubkey: wallet.publicKey,
+			mint: baseMint,
+			getConnection,
+		}).catch(() => null);
 
     const positionPubKey = new PublicKey(position_address);
 
@@ -625,10 +1351,19 @@ export async function closePosition({ position_address }) {
       txHashes.push(txHash);
     }
     log("close", `SUCCESS txs: ${txHashes.join(", ")}`);
-    // Wait for RPC to reflect withdrawn balances before returning — prevents
-    // agent from seeing zero balance when attempting post-close swap
-    await new Promise(r => setTimeout(r, 5000));
-    recordClose(position_address, "agent decision");
+    const settlement = await waitForPostCloseSettlement({
+      walletPubkey: wallet.publicKey,
+      baseMint,
+      positionAddress: position_address,
+      previousBaseBalance: baseBalanceBeforeClose,
+			getConnection,
+			getMyPositions,
+			log,
+    });
+    if (!settlement.settled) {
+      log("close_warn", `Post-close settlement not observed before timeout (${settlement.reason})`);
+    }
+    recordClose(position_address, reason);
 
     // Record performance for learning
     const tracked = getTrackedPosition(position_address);
@@ -642,52 +1377,44 @@ export async function closePosition({ position_address }) {
       }
 
       // Snapshot PnL from cache BEFORE invalidating — this was the last known state before close
-      let pnlUsd = 0;
-      let pnlPct = 0;
-      let finalValueUsd = 0;
-      let feesUsd = tracked.total_fees_claimed_usd || 0;
-      const cachedPos = _positionsCache?.positions?.find(p => p.position === position_address);
-      if (cachedPos) {
-        pnlUsd        = cachedPos.pnl_usd   ?? 0;
-        pnlPct        = cachedPos.pnl_pct   ?? 0;
-        finalValueUsd = cachedPos.total_value_usd ?? 0;
-        feesUsd       = (cachedPos.collected_fees_usd || 0) + (cachedPos.unclaimed_fees_usd || 0);
-      }
-
+      const closePerformance = buildClosePerformancePayload({
+        tracked,
+        cachedPosition: _positionsCache?.positions?.find((position) => position.position === position_address),
+        poolAddress,
+        pool,
+        positionAddress: position_address,
+        minutesHeld,
+        minutesOutOfRange: minutesOOR,
+        reason,
+        decisionContext: decision_context,
+      });
       _positionsCacheAt = 0; // invalidate cache after snapshotting PnL
-      // Use tracked initial value; if missing (legacy positions), estimate from
-      // SOL amount at current price so pnl_pct isn't forced to 0
-      let initialUsd = tracked.initial_value_usd || 0;
-      if (!initialUsd && tracked.amount_sol > 0 && finalValueUsd > 0) {
-        // Best-effort fallback: use final value as proxy (IL makes this imprecise
-        // but it's much better than 0 which inflates pnl_usd and zeros pnl_pct)
-        initialUsd = finalValueUsd;
-        log("close", `initial_value_usd missing for ${position_address}, using finalValueUsd ($${finalValueUsd}) as fallback`);
-      }
+      await recordPerformance(closePerformance.performance);
 
-      await recordPerformance({
+      return {
+        success: true,
         position: position_address,
         pool: poolAddress,
-        pool_name: tracked.pool_name || poolAddress.slice(0, 8),
-        strategy: tracked.strategy,
-        bin_range: tracked.bin_range,
-        bin_step: tracked.bin_step || null,
-        volatility: tracked.volatility || null,
-        fee_tvl_ratio: tracked.fee_tvl_ratio || null,
-        organic_score: tracked.organic_score || null,
-        amount_sol: tracked.amount_sol,
-        fees_earned_usd: feesUsd,
-        final_value_usd: finalValueUsd,
-        initial_value_usd: initialUsd,
-        minutes_in_range: minutesHeld - minutesOOR,
-        minutes_held: minutesHeld,
-        close_reason: "agent decision",
-      });
-
-      return { success: true, position: position_address, pool: poolAddress, pool_name: tracked.pool_name || null, txs: txHashes, pnl_usd: pnlUsd, pnl_pct: pnlPct, base_mint: pool.lbPair.tokenXMint.toString() };
+        pool_name: tracked.pool_name || null,
+        txs: txHashes,
+        pnl_usd: closePerformance.result.pnl_usd,
+        pnl_pct: closePerformance.result.pnl_pct,
+        base_mint: baseMint,
+        base_amount_received: settlement.observed_balance_delta ?? 0,
+        close_reason: reason,
+      };
     }
 
-    return { success: true, position: position_address, pool: poolAddress, pool_name: null, txs: txHashes, base_mint: pool.lbPair.tokenXMint.toString() };
+    return {
+      success: true,
+      position: position_address,
+      pool: poolAddress,
+      pool_name: null,
+      txs: txHashes,
+      base_mint: baseMint,
+      base_amount_received: settlement.observed_balance_delta ?? 0,
+      close_reason: reason,
+    };
   } catch (error) {
     log("close_error", error.message);
     return { success: false, error: error.message };
@@ -898,3 +1625,5 @@ export async function addLiquidity({
     return { success: false, error: error.message };
   }
 }
+
+export { evaluatePostCloseSettlementObservation };

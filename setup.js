@@ -4,14 +4,16 @@
  * Run: npm run setup
  */
 
-import readline from "readline";
-import fs from "fs";
-import path from "path";
-import { fileURLToPath } from "url";
+import "dotenv/config";
+import fs from "node:fs";
+import path from "node:path";
+import readline from "node:readline";
+import { fileURLToPath } from "node:url";
+import { getEffectiveMinSolToOpen } from "./runtime-helpers.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CONFIG_PATH = path.join(__dirname, "user-config.json");
-const ENV_PATH    = path.join(__dirname, ".env");
+const ENV_PATH = path.join(__dirname, ".env");
 
 const DEFAULT_MODEL = "openai/gpt-oss-20b:free";
 
@@ -27,17 +29,29 @@ function ask(question, defaultVal) {
   });
 }
 
-function askNum(question, defaultVal, { min, max } = {}) {
-  return new Promise(async (resolve) => {
-    while (true) {
-      const raw = await ask(question, defaultVal);
-      const n = parseFloat(raw);
-      if (isNaN(n))                        { console.log(`  ⚠ Please enter a number.`); continue; }
-      if (min !== undefined && n < min)    { console.log(`  ⚠ Minimum is ${min}.`);     continue; }
-      if (max !== undefined && n > max)    { console.log(`  ⚠ Maximum is ${max}.`);     continue; }
-      resolve(n);
-      break;
-    }
+function askSecret(question, { hasExisting = false } = {}) {
+  return new Promise((resolve) => {
+    const hint = hasExisting ? " (leave blank to keep existing value)" : "";
+    const originalWrite = rl._writeToOutput;
+    rl.stdoutMuted = true;
+    rl._writeToOutput = function writeMasked(stringToWrite) {
+      if (!rl.stdoutMuted) {
+        originalWrite.call(rl, stringToWrite);
+        return;
+      }
+      if (stringToWrite.includes(": ")) {
+        originalWrite.call(rl, stringToWrite);
+        return;
+      }
+      originalWrite.call(rl, "*");
+    };
+
+    rl.question(`${question}${hint}: `, (ans) => {
+      rl.stdoutMuted = false;
+      rl._writeToOutput = originalWrite;
+      process.stdout.write("\n");
+      resolve(ans.trim());
+    });
   });
 }
 
@@ -54,18 +68,46 @@ function askBool(question, defaultVal) {
   });
 }
 
+function askNum(question, defaultVal, { min, max } = {}) {
+  return (async () => {
+    while (true) {
+      const raw = await ask(question, defaultVal);
+      const n = parseFloat(raw);
+      if (Number.isNaN(n))                 { console.log(`  ⚠ Please enter a number.`); continue; }
+      if (min !== undefined && n < min)    { console.log(`  ⚠ Minimum is ${min}.`);     continue; }
+      if (max !== undefined && n > max)    { console.log(`  ⚠ Maximum is ${max}.`);     continue; }
+      return n;
+    }
+  })();
+}
+
 function askChoice(question, choices) {
-  return new Promise(async (resolve) => {
+  return (async () => {
     const labels = choices.map((c, i) => `  ${i + 1}. ${c.label}`).join("\n");
     while (true) {
       console.log(`\n${question}`);
       console.log(labels);
       const raw = await ask("Enter number", "");
-      const idx = parseInt(raw) - 1;
-      if (idx >= 0 && idx < choices.length) { resolve(choices[idx]); break; }
+      const idx = parseInt(raw, 10) - 1;
+      if (idx >= 0 && idx < choices.length) return choices[idx];
       console.log("  ⚠ Invalid choice.");
     }
-  });
+  })();
+}
+
+function upsertEnvValue(key, value) {
+  const safeValue = String(value || "").trim();
+  const existing = fs.existsSync(ENV_PATH) ? fs.readFileSync(ENV_PATH, "utf8") : "";
+  const lines = existing ? existing.split(/\r?\n/) : [];
+  const nextLine = `${key}=${safeValue}`;
+  const index = lines.findIndex((line) => line.startsWith(`${key}=`));
+  if (index >= 0) {
+    lines[index] = nextLine;
+  } else {
+    if (lines.length > 0 && lines[lines.length - 1] !== "") lines.push("");
+    lines.push(nextLine);
+  }
+  fs.writeFileSync(ENV_PATH, `${lines.join("\n").replace(/\n*$/, "")}\n`);
 }
 
 function parseEnv(content) {
@@ -156,10 +198,9 @@ const openrouterKey = await ask(
   alreadySet(ev("OPENROUTER_API_KEY", ""))
 );
 
-const walletKey = await ask(
-  "Wallet private key (base58)",
-  alreadySet(ev("WALLET_PRIVATE_KEY", existingConfig.walletKey || ""))
-);
+const existingWalletPrivateKey = process.env.WALLET_PRIVATE_KEY || "";
+const walletPrivateKeyInput = await askSecret("Wallet private key (base58)", { hasExisting: Boolean(existingWalletPrivateKey) });
+const finalWalletPrivateKey = walletPrivateKeyInput || existingWalletPrivateKey;
 
 const rpcUrl = await ask(
   "RPC URL",
@@ -217,7 +258,7 @@ const maxPositions = await askNum(
 
 const minSolToOpen = await askNum(
   "Min SOL balance to open a new position",
-  e("minSolToOpen", parseFloat((deployAmountSol + 0.05).toFixed(3))),
+  e("minSolToOpen", getEffectiveMinSolToOpen({ minSolToOpen: 0.55, deployAmountSol, gasReserve: 0.2 })),
   { min: 0.05 }
 );
 
@@ -352,6 +393,9 @@ const userConfig = {
 delete userConfig.emergencyPriceDropPct;
 
 fs.writeFileSync(CONFIG_PATH, JSON.stringify(userConfig, null, 2));
+if (finalWalletPrivateKey) {
+  upsertEnvValue("WALLET_PRIVATE_KEY", finalWalletPrivateKey);
+}
 
 // ─── Summary ──────────────────────────────────────────────────────────────────
 const presetName = preset ? `${preset.label}` : "Custom";
