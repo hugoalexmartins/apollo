@@ -77,6 +77,24 @@ async function main() {
 		getPoolGovernanceMetadata: async () => ({ base_mint: "mint-runtime", bin_step: 111 }),
 		getWalletBalances: async () => ({ sol: 10 }),
 	});
+	let normalizedToolCalls = 0;
+	setExecutorTestOverrides({
+		tools: {
+			get_wallet_balance: async () => {
+				normalizedToolCalls += 1;
+				return { wallet: "ok" };
+			},
+		},
+	});
+	result = await executeTool("get_wallet_balance<|channel|>commentary", {});
+	assert.equal(result.wallet, "ok");
+	assert.equal(normalizedToolCalls, 1);
+
+	setExecutorTestOverrides({
+		getMyPositions: async () => ({ total_positions: 0, positions: [] }),
+		getPoolGovernanceMetadata: async () => ({ base_mint: "mint-runtime", bin_step: 111 }),
+		getWalletBalances: async () => ({ sol: 10 }),
+	});
 	const spoofedArgs = {
 		pool_address: "pool-meta-override",
 		amount_y: 0.5,

@@ -151,6 +151,10 @@ function getToolImplementation(name) {
 	return executorTestOverrides.tools[name] || toolMap[name];
 }
 
+function normalizeToolName(name) {
+	return typeof name === "string" ? name.replace(/<.*$/, "").trim() : "";
+}
+
 // Registered by index.js so update_config can restart cron jobs when intervals change
 let _cronRestarter = null;
 export function registerCronRestarter(fn) {
@@ -502,6 +506,7 @@ const GENERAL_APPROVAL_REQUIRED_TOOLS = new Set([...WRITE_TOOLS, "update_config"
  */
 export async function executeTool(name, args, meta = {}) {
 	const startTime = Date.now();
+	const toolName = normalizeToolName(name);
 	let normalizedArgs = args;
 	let workflowId = null;
 
@@ -510,7 +515,7 @@ export async function executeTool(name, args, meta = {}) {
 			appendActionLifecycle,
 			workflowId,
 			lifecycle: "manual_review",
-			name,
+			name: toolName,
 			args: normalizedArgs,
 			meta,
 			reason,
@@ -518,14 +523,14 @@ export async function executeTool(name, args, meta = {}) {
 	}
 
 	// ─── Validate tool exists ─────────────────
-	const fn = getToolImplementation(name);
+	const fn = getToolImplementation(toolName);
 	if (!fn) {
-		const error = `Unknown tool: ${name}`;
+		const error = `Unknown tool: ${toolName}`;
 		log("error", error);
 		return { error };
 	}
 
-	if (name === "deploy_position" && normalizedArgs) {
+	if (toolName === "deploy_position" && normalizedArgs) {
 		const wallet = await getWalletBalancesRuntime({}).catch(() => null);
 		const solPrice = Number(wallet?.sol_price) || 0;
 		const solLeg = Number(normalizedArgs.amount_y ?? normalizedArgs.amount_sol ?? 0);
@@ -545,10 +550,10 @@ export async function executeTool(name, args, meta = {}) {
 	}
 
 	// ─── Pre-execution safety checks ──────────
-	if (!meta.cycle_id && GENERAL_APPROVAL_REQUIRED_TOOLS.has(name) && !WRITE_TOOLS.has(name)) {
-		const safetyCheck = await runSafetyChecks(name, normalizedArgs, meta);
+	if (!meta.cycle_id && GENERAL_APPROVAL_REQUIRED_TOOLS.has(toolName) && !WRITE_TOOLS.has(toolName)) {
+		const safetyCheck = await runSafetyChecks(toolName, normalizedArgs, meta);
 		if (!safetyCheck.pass) {
-			log("safety_block", `${name} blocked: ${safetyCheck.reason}`);
+			log("safety_block", `${toolName} blocked: ${safetyCheck.reason}`);
 			return {
 				blocked: true,
 				reason: safetyCheck.reason,
@@ -556,26 +561,26 @@ export async function executeTool(name, args, meta = {}) {
 		}
 	}
 
-	if (meta.cycle_id && name === "remember_fact") {
+	if (meta.cycle_id && toolName === "remember_fact") {
 		return {
 			blocked: true,
 			reason: "Autonomous memory mutation is disabled for cycle-driven roles.",
 		};
 	}
-	if (meta.cycle_id && (name === "set_position_note" || name === "add_pool_note")) {
+	if (meta.cycle_id && (toolName === "set_position_note" || toolName === "add_pool_note")) {
 		return {
 			blocked: true,
 			reason: "Autonomous note mutation is disabled for cycle-driven roles.",
 		};
 	}
 
-	if (WRITE_TOOLS.has(name)) {
+	if (WRITE_TOOLS.has(toolName)) {
 		if (_autonomousWriteSuppressed) {
 			const reason =
 				_writeSuppressionReason ||
 				"manual review required before autonomous writes can resume";
 			recordToolOutcomeRuntime({
-				tool: name,
+				tool: toolName,
 				outcome: "blocked",
 				reason,
 				metadata: {
@@ -594,7 +599,7 @@ export async function executeTool(name, args, meta = {}) {
 
 		workflowId =
 			meta.action_id ||
-			`${name}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+			`${toolName}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 		normalizedArgs = attachWriteDecisionContext(
 			normalizedArgs,
 			meta,
@@ -604,25 +609,25 @@ export async function executeTool(name, args, meta = {}) {
 			appendActionLifecycle,
 			workflowId,
 			lifecycle: "intent",
-			name,
+			name: toolName,
 			args: normalizedArgs,
 			meta,
 		});
 
-		if (name === "rebalance_on_exit") {
+		if (toolName === "rebalance_on_exit") {
 			normalizedArgs = {
 				...normalizedArgs,
 				journal_workflow_id: workflowId,
 			};
 		}
 
-		const safetyCheck = await runSafetyChecks(name, normalizedArgs, meta);
+		const safetyCheck = await runSafetyChecks(toolName, normalizedArgs, meta);
 		if (!safetyCheck.pass) {
-			log("safety_block", `${name} blocked: ${safetyCheck.reason}`);
+			log("safety_block", `${toolName} blocked: ${safetyCheck.reason}`);
 			appendManualReviewTerminal("write_intent_blocked_by_safety_checks");
 			recordWriteToolOutcome({
 				recordToolOutcome: recordToolOutcomeRuntime,
-				tool: name,
+				tool: toolName,
 				outcome: "blocked",
 				reason: safetyCheck.reason,
 				args: normalizedArgs,
@@ -642,7 +647,7 @@ export async function executeTool(name, args, meta = {}) {
 		const success = result?.success !== false && !result?.error;
 
 		logAction({
-			tool: name,
+			tool: toolName,
 			args: normalizedArgs,
 			result: summarizeResult(result),
 			duration_ms: duration,
@@ -652,12 +657,12 @@ export async function executeTool(name, args, meta = {}) {
 		});
 
 		if (success) {
-			if (WRITE_TOOLS.has(name)) {
+			if (WRITE_TOOLS.has(toolName)) {
 				appendWriteLifecycleEntry({
 					appendActionLifecycle,
 					workflowId,
 					lifecycle: "completed",
-					name,
+					name: toolName,
 					args: {
 						...normalizedArgs,
 						position_address:
@@ -672,7 +677,7 @@ export async function executeTool(name, args, meta = {}) {
 				});
 				recordWriteToolOutcome({
 					recordToolOutcome: recordToolOutcomeRuntime,
-					tool: name,
+					tool: toolName,
 					outcome: "success",
 					args: normalizedArgs,
 					meta,
@@ -680,7 +685,7 @@ export async function executeTool(name, args, meta = {}) {
 				});
 			}
 			await handleSuccessfulToolSideEffects({
-				name,
+				name: toolName,
 				normalizedArgs,
 				result,
 				meta,
@@ -692,27 +697,27 @@ export async function executeTool(name, args, meta = {}) {
 				log,
 				config,
 			});
-		if (!meta.cycle_id && GENERAL_APPROVAL_REQUIRED_TOOLS.has(name)) {
+		if (!meta.cycle_id && GENERAL_APPROVAL_REQUIRED_TOOLS.has(toolName)) {
 				consumeOneShotGeneralWriteApproval({
-					tool_name: name,
+					tool_name: toolName,
 					pool_address: normalizedArgs?.pool_address || null,
 					position_address: normalizedArgs?.position_address || result?.position || null,
 					amount_sol:
-						name === "deploy_position"
+						toolName === "deploy_position"
 							? normalizedArgs?.amount_y ?? normalizedArgs?.amount_sol ?? 0
-							: name === "swap_token" && (normalizedArgs?.output_mint === "SOL" || normalizedArgs?.input_mint === "SOL")
+							: toolName === "swap_token" && (normalizedArgs?.output_mint === "SOL" || normalizedArgs?.input_mint === "SOL")
 								? Number(normalizedArgs?.amount || 0)
 								: null,
 				});
 			}
 		}
 
-		if (!success && WRITE_TOOLS.has(name)) {
+		if (!success && WRITE_TOOLS.has(toolName)) {
 			const reason = result?.error || "write_tool_reported_unsuccessful_result";
 			appendManualReviewTerminal(reason);
 			recordWriteToolOutcome({
 				recordToolOutcome: recordToolOutcomeRuntime,
-				tool: name,
+				tool: toolName,
 				outcome: "error",
 				reason,
 				args: normalizedArgs,
@@ -725,11 +730,11 @@ export async function executeTool(name, args, meta = {}) {
 	} catch (error) {
 		const duration = Date.now() - startTime;
 
-		if (WRITE_TOOLS.has(name)) {
+		if (WRITE_TOOLS.has(toolName)) {
 			appendManualReviewTerminal(error.message || "write_tool_execution_error");
 			recordWriteToolOutcome({
 				recordToolOutcome: recordToolOutcomeRuntime,
-				tool: name,
+				tool: toolName,
 				outcome: "error",
 				reason: error.message,
 				args: normalizedArgs,
@@ -738,7 +743,7 @@ export async function executeTool(name, args, meta = {}) {
 		}
 
 		logAction({
-			tool: name,
+			tool: toolName,
 			args: normalizedArgs,
 			error: error.message,
 			duration_ms: duration,
@@ -750,7 +755,7 @@ export async function executeTool(name, args, meta = {}) {
 		// Return error to LLM so it can decide what to do
 		return {
 			error: error.message,
-			tool: name,
+			tool: toolName,
 		};
 	}
 }
@@ -759,7 +764,8 @@ export async function executeTool(name, args, meta = {}) {
  * Run safety checks before executing write operations.
  */
 export async function runSafetyChecks(name, args, meta = {}) {
-	return runSafetyChecksWithDeps(name, args, meta, {
+	const toolName = normalizeToolName(name);
+	return runSafetyChecksWithDeps(toolName, args, meta, {
 		generalApprovalRequiredTools: GENERAL_APPROVAL_REQUIRED_TOOLS,
 		evaluateGeneralWriteApproval,
 		validateRecordedRiskOpeningPreflight,
