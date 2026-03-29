@@ -1,25 +1,13 @@
 import { Keypair } from "@solana/web3.js";
 import bs58 from "bs58";
 import { log } from "../logger.js";
+import { fetchLpAgentJson, hasLpAgentKeys } from "./lpagent-client.js";
 
 const LPAGENT_API = "https://api.lpagent.io/open-api/v1";
 const CACHE_TTL_MS = 5 * 60 * 1000;
 
 let cachedOverview = null;
 let cachedAt = 0;
-let keyIndex = 0;
-
-function getApiKey() {
-  const keys = (process.env.LPAGENT_API_KEY || "")
-    .split(",")
-    .map((key) => key.trim())
-    .filter(Boolean);
-
-  if (keys.length === 0) return null;
-  const key = keys[keyIndex % keys.length];
-  keyIndex += 1;
-  return key;
-}
 
 function getWalletAddress() {
   if (!process.env.WALLET_PRIVATE_KEY) return null;
@@ -31,21 +19,11 @@ export async function getLpOverview({ force = false } = {}) {
     return cachedOverview;
   }
 
-  const apiKey = getApiKey();
   const owner = getWalletAddress();
-  if (!apiKey || !owner) return cachedOverview || null;
+  if (!hasLpAgentKeys() || !owner) return cachedOverview || null;
 
   try {
-    const res = await fetch(`${LPAGENT_API}/lp-positions/overview?owner=${owner}&protocol=meteora`, {
-      headers: { "x-api-key": apiKey },
-    });
-
-    if (!res.ok) {
-      log("lp_overview", `API error: ${res.status}`);
-      return cachedOverview || null;
-    }
-
-    const json = await res.json();
+    const json = await fetchLpAgentJson(`${LPAGENT_API}/lp-positions/overview?owner=${owner}&protocol=meteora`);
     const row = (json.data || [])[0];
     if (!row) return cachedOverview || null;
 

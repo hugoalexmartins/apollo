@@ -3,6 +3,8 @@
  * Used by study/research flows — not on every management cycle.
  */
 
+import { fetchLpAgentJson, hasLpAgentKeys } from "./lpagent-client.js";
+
 const LPAGENT_API = "https://api.lpagent.io/open-api/v1";
 const DUNE_API = "https://api.dune.com/api/v1";
 const DEFAULT_SCORE_LIMIT = 4;
@@ -10,50 +12,11 @@ const MAX_SCORE_LIMIT = 4;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-const _lpagentCalls = [];
-
-function getLpAgentKey() {
-  return process.env.LPAGENT_API_KEY;
-}
-
 function getDuneConfig() {
   return {
     apiKey: process.env.DUNE_API_KEY || null,
     queryId: process.env.DUNE_TOP_LPERS_QUERY_ID || process.env.DUNE_WALLET_SCORE_QUERY_ID || null,
   };
-}
-
-function checkRateLimit() {
-  const now = Date.now();
-  while (_lpagentCalls.length > 0 && now - _lpagentCalls[0] > 60_000) {
-    _lpagentCalls.shift();
-  }
-  if (_lpagentCalls.length >= 5) {
-    const waitSec = Math.ceil((60_000 - (now - _lpagentCalls[0])) / 1000);
-    return { allowed: false, waitSec };
-  }
-  _lpagentCalls.push(now);
-  return { allowed: true };
-}
-
-async function fetchLpAgentJson(url) {
-  const lpAgentKey = getLpAgentKey();
-  if (!lpAgentKey) {
-    return { disabled: true, error: "LPAGENT_API_KEY not set" };
-  }
-
-  const res = await fetch(url, {
-    headers: { "x-api-key": lpAgentKey },
-  });
-
-  if (!res.ok) {
-    if (res.status === 429) {
-      throw new Error("Rate limit exceeded. Please wait 60 seconds before calling LP Agent again.");
-    }
-    throw new Error(`LP Agent API error: ${res.status}`);
-  }
-
-  return res.json();
 }
 
 async function fetchTopLPersRaw(poolAddress) {
@@ -126,7 +89,7 @@ function summarizePatterns(top) {
 }
 
 export async function studyTopLPers({ pool_address, limit = 4 }) {
-  if (!getLpAgentKey()) {
+  if (!hasLpAgentKeys()) {
     return { pool: pool_address, message: "LPAGENT_API_KEY not set in .env — study_top_lpers is disabled.", patterns: [], lpers: [] };
   }
 
@@ -165,7 +128,7 @@ export async function studyTopLPers({ pool_address, limit = 4 }) {
 export async function scoreTopLPers({ pool_address, limit = DEFAULT_SCORE_LIMIT } = {}) {
   const safeLimit = Math.min(Math.max(1, Math.floor(limit || DEFAULT_SCORE_LIMIT)), MAX_SCORE_LIMIT);
 
-  if (!getLpAgentKey()) {
+  if (!hasLpAgentKeys()) {
     return {
       pool: pool_address,
       message: "LPAGENT_API_KEY not set in .env — score_top_lpers is disabled.",
@@ -230,7 +193,7 @@ export async function scoreTopLPers({ pool_address, limit = DEFAULT_SCORE_LIMIT 
     },
     filters_applied: {
       source,
-      safe_limit,
+	      safe_limit: safeLimit,
       credible_filter: "total_lp >= 3, total_inflow > 1000; study flow also keeps win_rate >= 0.60",
     },
     source_status: {
@@ -424,13 +387,8 @@ function buildDuneBonus(row) {
 }
 
 export async function getPoolInfo({ pool_address }) {
-  if (!getLpAgentKey()) {
+  if (!hasLpAgentKeys()) {
     return { error: "LPAGENT_API_KEY not set — get_pool_info is disabled." };
-  }
-
-  const rateCheck = checkRateLimit();
-  if (!rateCheck.allowed) {
-    return { error: `Rate limited (5/min). Try again in ${rateCheck.waitSec}s.` };
   }
 
   const raw = await fetchLpAgentJson(`${LPAGENT_API}/pools/${pool_address}/info`);
