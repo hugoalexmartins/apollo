@@ -51,7 +51,6 @@ export function createScreeningCycleRunner(deps) {
     } = deps;
 
     setScreeningBusy(true);
-    setScreeningLastTriggered(Date.now());
 
     const failScreeningPrecheck = (failure) => {
       log("cron_error", `Screening pre-check failed: ${failure.message}`);
@@ -86,7 +85,7 @@ export function createScreeningCycleRunner(deps) {
     let candidateEvaluations = [];
 
     try {
-      [prePositions, preBalance] = await Promise.all([getMyPositions(), getWalletBalances()]);
+      [prePositions, preBalance] = await Promise.all([getMyPositions({ force: true }), getWalletBalances()]);
       const precheckFailure = validateStartupSnapshot({
         wallet: preBalance,
         positions: prePositions,
@@ -143,6 +142,7 @@ export function createScreeningCycleRunner(deps) {
         return;
       }
 
+      setScreeningLastTriggered(Date.now());
       setScreeningLastRun(Date.now());
       log("cron", `Starting screening cycle [model: ${config.llm.screeningModel}]`);
 
@@ -309,6 +309,7 @@ export function createScreeningCycleRunner(deps) {
       screeningTopCandidates = await getTopCandidates({
         limit: 8,
         pools: discoverySnapshot?.pools,
+        positionsSnapshot: prePositions,
         screeningConfig: regimeContext.effectiveScreeningConfig,
         evaluationContext: {
           extraHardBlockFn: (pool) => {
@@ -382,6 +383,45 @@ export function createScreeningCycleRunner(deps) {
       const candidates = screeningTopCandidates?.candidates || screeningTopCandidates?.pools || [];
       const totalEligible = screeningTopCandidates?.total_eligible ?? candidates.length;
       const blockedSummary = screeningTopCandidates?.blocked_summary || {};
+      const invalidNegativeRegimeState = [];
+      if (blockedSummary.negative_regime_memory_invalid_state > 0) {
+        invalidNegativeRegimeState.push("negative regime memory state invalid");
+      }
+      if (blockedSummary.negative_regime_cooldown_invalid_state > 0) {
+        invalidNegativeRegimeState.push("negative regime cooldown state invalid");
+      }
+      if (invalidNegativeRegimeState.length > 0) {
+        const failure = classifyRuntimeFailure(new Error(invalidNegativeRegimeState.join("; ")), { invalidState: true });
+        screeningEvaluation = {
+          cycle_id: cycleId,
+          cycle_type: "screening",
+          status: "failed_candidates",
+          summary: {
+            reason_code: failure.reason_code,
+            error: failure.message,
+            blocked_summary: blockedSummary,
+          },
+          candidates: [],
+        };
+        appendReplayEnvelope({
+          cycle_id: cycleId,
+          cycle_type: "screening",
+          reason_code: failure.reason_code,
+          error: failure.message,
+          blocked_summary: blockedSummary,
+        });
+        writeEvidenceBundle({
+          cycle_id: cycleId,
+          cycle_type: "screening",
+          status: "failed_candidates",
+          reason_code: failure.reason_code,
+          error: failure.message,
+          blocked_summary: blockedSummary,
+          written_at: new Date().toISOString(),
+        });
+        screenReport = `Screening failed closed: [${failure.reason_code}] ${failure.message}`;
+        return;
+      }
       const shortlist = candidates.slice(0, Math.min(5, candidates.length));
       const finalists = shortlist.slice(0, Math.min(2, shortlist.length));
       const scorePreloadLimit = finalists.length;
@@ -500,6 +540,7 @@ export function createScreeningCycleRunner(deps) {
           const altCandidates = await getTopCandidates({
             limit: 3,
             pools: discoverySnapshot?.pools,
+            positionsSnapshot: prePositions,
             screeningConfig: {
               ...config.screening,
               ...altPack.screening_overrides,
@@ -570,6 +611,11 @@ STEPS:
 3. deploy_position directly.
 4. Report: pool chosen, key signals, LP-wallet score takeaway, planner takeaway, deploy outcome.
       `, config.llm.maxSteps, [], "SCREENER", config.llm.screeningModel, 4096, {
+        disableLiveStateTools: true,
+        stateSnapshot: {
+          portfolio: currentBalance,
+          positions: prePositions,
+        },
         toolContext: {
           cycle_id: cycleId,
           cycle_type: "screening",
