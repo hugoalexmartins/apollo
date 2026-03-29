@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
+import { fetchWithTimeout } from "./fetch-utils.js";
+import { getTokenHolders } from "./token.js";
 import { discoverPools, evaluateCandidateSnapshot, getTopCandidates, rankCandidateSnapshots, resetDiscoveryCache } from "./screening.js";
 import { config } from "../config.js";
 
@@ -119,14 +121,97 @@ test("getTopCandidates throws deterministic error for error-shaped positions pay
 });
 
 test("getTopCandidates rejects malformed positions payload before dereference", async () => {
-  await assert.rejects(
-    getTopCandidates({
+	await assert.rejects(
+		getTopCandidates({
       limit: 2,
       discoverPoolsFn: async () => ({ pools: [buildPool()] }),
       getMyPositionsFn: async () => ({ total_positions: 0 }),
     }),
     /positions payload missing positions array/
-  );
+	);
+});
+
+test("getTopCandidates reuses a provided positions snapshot without re-reading positions", async () => {
+	let getMyPositionsCalls = 0;
+	const positionsSnapshot = {
+		total_positions: 1,
+		positions: [{ pool: "pool-blocked", base_mint: "mint-blocked" }],
+	};
+
+	const result = await getTopCandidates({
+		limit: 2,
+		discoverPoolsFn: async () => ({ pools: [buildPool({ pool: "pool-blocked", baseMint: "mint-blocked" }), buildPool({ pool: "pool-ok", baseMint: "mint-ok" })] }),
+		getMyPositionsFn: async () => {
+			getMyPositionsCalls += 1;
+			return { total_positions: 0, positions: [] };
+		},
+		positionsSnapshot,
+	});
+
+	assert.equal(getMyPositionsCalls, 0);
+	assert.deepEqual(result.occupied_pools, ["pool-blocked"]);
+	assert.equal(result.candidates.length, 1);
+	assert.equal(result.candidates[0].pool, "pool-ok");
+});
+
+test("fetchWithTimeout aborts hung screening fetches", async () => {
+	const originalFetch = global.fetch;
+	const originalSetTimeout = global.setTimeout;
+	const originalClearTimeout = global.clearTimeout;
+
+	global.setTimeout = ((fn) => {
+		fn();
+		return 1;
+	});
+	global.clearTimeout = (() => {});
+	global.fetch = async (_url, options = {}) => {
+		if (options.signal?.aborted) {
+			const error = new Error("This operation was aborted");
+			error.name = "AbortError";
+			throw error;
+		}
+		return new Promise(() => {});
+	};
+
+	try {
+		await assert.rejects(
+			fetchWithTimeout("https://example.com", { timeoutMs: 5, timeoutMessage: "screening fetch timed out" }),
+			/screening fetch timed out/
+		);
+	} finally {
+		global.fetch = originalFetch;
+		global.setTimeout = originalSetTimeout;
+		global.clearTimeout = originalClearTimeout;
+	}
+});
+
+test("getTokenHolders keeps holder intel when optional supply lookup times out", async () => {
+	const originalFetch = global.fetch;
+
+	global.fetch = async (url) => {
+		if (String(url).includes("/holders/")) {
+			return {
+				ok: true,
+				json: async () => ([{ address: "holder-1", amount: 50, percentage: 12.5, tags: [] }]),
+			};
+		}
+		if (String(url).includes("/assets/search")) {
+			const error = new Error("This operation was aborted");
+			error.name = "AbortError";
+			throw error;
+		}
+		throw new Error(`Unexpected URL: ${url}`);
+	};
+
+	try {
+		const result = await getTokenHolders({ mint: "mint-1", limit: 5 });
+		assert.equal(result.showing, 1);
+		assert.equal(result.holders.length, 1);
+		assert.equal(result.holders[0].pct, 12.5);
+		assert.equal(result.top_10_real_holders_pct, "12.50");
+	} finally {
+		global.fetch = originalFetch;
+	}
 });
 
 test("evaluateCandidateSnapshot blocks token_too_new and token_too_old deterministically", () => {

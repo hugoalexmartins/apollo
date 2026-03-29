@@ -2,9 +2,11 @@ import { config } from "../config.js";
 import { isBlacklisted } from "../token-blacklist.js";
 import { log } from "../logger.js";
 import { evaluateExposureAdmission } from "../runtime-policy.js";
+import { fetchWithTimeout } from "./fetch-utils.js";
 
 const POOL_DISCOVERY_BASE = "https://pool-discovery-api.datapi.meteora.ag";
 const DISCOVERY_CACHE_TTL_MS = 15 * 1000;
+const SCREENING_FETCH_TIMEOUT_MS = 15 * 1000;
 
 const discoveryCache = new Map();
 
@@ -79,7 +81,10 @@ export async function discoverPools({
     `&timeframe=${resolvedTimeframe}` +
     `&category=${resolvedCategory}`;
 
-  const res = await fetch(url);
+  const res = await fetchWithTimeout(url, {
+    timeoutMs: SCREENING_FETCH_TIMEOUT_MS,
+    timeoutMessage: `Pool discovery request timed out after ${SCREENING_FETCH_TIMEOUT_MS}ms`,
+  });
 
   if (!res.ok) {
     throw new Error(`Pool Discovery API error: ${res.status} ${res.statusText}`);
@@ -125,6 +130,7 @@ export async function getTopCandidates({
   pools,
   discoverPoolsFn,
   getMyPositionsFn,
+  positionsSnapshot,
   screeningConfig,
   evaluationContext,
 } = {}) {
@@ -135,7 +141,7 @@ export async function getTopCandidates({
 
   // Exclude pools where the wallet already has an open position
   const readPositions = getMyPositionsFn || (await import("./dlmm.js")).getMyPositions;
-  const positionsResult = await readPositions();
+  const positionsResult = positionsSnapshot || await readPositions();
   if (!positionsResult || typeof positionsResult !== "object") {
     throw new Error("positions unavailable");
   }
@@ -267,7 +273,10 @@ export async function getPoolDetail({ pool_address, timeframe = "5m" }) {
     `&filter_by=${encodeURIComponent(`pool_address=${pool_address}`)}` +
     `&timeframe=${timeframe}`;
 
-  const res = await fetch(url);
+  const res = await fetchWithTimeout(url, {
+    timeoutMs: SCREENING_FETCH_TIMEOUT_MS,
+    timeoutMessage: `Pool detail request timed out after ${SCREENING_FETCH_TIMEOUT_MS}ms`,
+  });
 
   if (!res.ok) {
     throw new Error(`Pool detail API error: ${res.status} ${res.statusText}`);

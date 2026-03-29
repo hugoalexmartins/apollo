@@ -1,11 +1,17 @@
+import { fetchWithTimeout } from "./fetch-utils.js";
+
 const DATAPI_BASE = "https://datapi.jup.ag/v1";
+const SCREENING_FETCH_TIMEOUT_MS = 15 * 1000;
 
 /**
  * Get the narrative/story behind a token from Jupiter ChainInsight.
  * Useful for understanding if a token has a real community/theme vs nothing.
  */
 export async function getTokenNarrative({ mint }) {
-  const res = await fetch(`${DATAPI_BASE}/chaininsight/narrative/${mint}`);
+  const res = await fetchWithTimeout(`${DATAPI_BASE}/chaininsight/narrative/${mint}`, {
+    timeoutMs: SCREENING_FETCH_TIMEOUT_MS,
+    timeoutMessage: `Token narrative request timed out after ${SCREENING_FETCH_TIMEOUT_MS}ms`,
+  });
   if (!res.ok) throw new Error(`Narrative API error: ${res.status}`);
   const data = await res.json();
   return {
@@ -21,7 +27,10 @@ export async function getTokenNarrative({ mint }) {
  */
 export async function getTokenInfo({ query }) {
   const url = `${DATAPI_BASE}/assets/search?query=${encodeURIComponent(query)}`;
-  const res = await fetch(url);
+  const res = await fetchWithTimeout(url, {
+    timeoutMs: SCREENING_FETCH_TIMEOUT_MS,
+    timeoutMessage: `Token info request timed out after ${SCREENING_FETCH_TIMEOUT_MS}ms`,
+  });
   if (!res.ok) throw new Error(`Token search API error: ${res.status}`);
   const data = await res.json();
   const tokens = Array.isArray(data) ? data : [data];
@@ -77,12 +86,18 @@ export async function getTokenInfo({ query }) {
 export async function getTokenHolders({ mint, limit = 20 }) {
   // Fetch holders and total supply in parallel
   const [holdersRes, tokenRes] = await Promise.all([
-    fetch(`${DATAPI_BASE}/holders/${mint}?limit=100`),
-    fetch(`${DATAPI_BASE}/assets/search?query=${mint}`),
+    fetchWithTimeout(`${DATAPI_BASE}/holders/${mint}?limit=100`, {
+      timeoutMs: SCREENING_FETCH_TIMEOUT_MS,
+      timeoutMessage: `Token holders request timed out after ${SCREENING_FETCH_TIMEOUT_MS}ms`,
+    }),
+    fetchWithTimeout(`${DATAPI_BASE}/assets/search?query=${mint}`, {
+      timeoutMs: SCREENING_FETCH_TIMEOUT_MS,
+      timeoutMessage: `Token supply request timed out after ${SCREENING_FETCH_TIMEOUT_MS}ms`,
+    }).catch(() => null),
   ]);
   if (!holdersRes.ok) throw new Error(`Holders API error: ${holdersRes.status}`);
   const data = await holdersRes.json();
-  const tokenData = tokenRes.ok ? await tokenRes.json() : null;
+  const tokenData = tokenRes?.ok ? await tokenRes.json() : null;
   const tokenInfo = Array.isArray(tokenData) ? tokenData[0] : tokenData;
   const totalSupply = tokenInfo?.totalSupply || tokenInfo?.circSupply || null;
 
@@ -161,8 +176,12 @@ export async function getTokenHolders({ mint, limit = 20 }) {
 
   if (smartWallets.length > 0) {
     const addresses = smartWallets.map((w) => w.address).join(",");
-    const kwRes = await fetch(
-      `${DATAPI_BASE}/holders/${mint}?addresses=${addresses}`
+    const kwRes = await fetchWithTimeout(
+      `${DATAPI_BASE}/holders/${mint}?addresses=${addresses}`,
+      {
+        timeoutMs: SCREENING_FETCH_TIMEOUT_MS,
+        timeoutMessage: `Smart-wallet holder lookup timed out after ${SCREENING_FETCH_TIMEOUT_MS}ms`,
+      },
     ).catch(() => null);
     const kwData = kwRes?.ok ? await kwRes.json() : null;
     const kwHolders = Array.isArray(kwData) ? kwData : (kwData?.holders || kwData?.data || []);
@@ -178,7 +197,10 @@ export async function getTokenHolders({ mint, limit = 20 }) {
 
       let pnl = null;
       try {
-        const pnlRes = await fetch(`${DATAPI_BASE}/pnl-positions?address=${h.addr}&assetId=${mint}`);
+        const pnlRes = await fetchWithTimeout(`${DATAPI_BASE}/pnl-positions?address=${h.addr}&assetId=${mint}`, {
+          timeoutMs: SCREENING_FETCH_TIMEOUT_MS,
+          timeoutMessage: `Smart-wallet PnL lookup timed out after ${SCREENING_FETCH_TIMEOUT_MS}ms`,
+        });
         if (pnlRes.ok) {
           const pnlData = await pnlRes.json();
           const pos = pnlData?.[h.addr]?.tokenPositions?.[0];
