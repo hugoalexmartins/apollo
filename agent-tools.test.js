@@ -131,7 +131,7 @@ test("agentLoop reports invalid tool arguments without executing the tool", asyn
 											id: "call-1",
 											function: {
 												name: "get_wallet_balance",
-												arguments: "{invalid-json",
+												arguments: "not json",
 											},
 										}],
 									},
@@ -155,4 +155,57 @@ test("agentLoop reports invalid tool arguments without executing the tool", asyn
 	assert.equal(result.content, "tool parse handled");
 	const toolErrorMessage = requests[1].messages.find((message) => message.role === "tool");
 	assert.match(toolErrorMessage.content, /Invalid tool arguments/);
+});
+
+test("agentLoop repairs malformed tool JSON, sanitizes history, and normalizes tool names", async () => {
+	process.env.OPENROUTER_API_KEY ||= "test-openrouter-key";
+	const { agentLoop } = await import("./agent.js");
+	const requests = [];
+	const executeCalls = [];
+
+	const result = await agentLoop("Use a repaired tool", 3, [], "GENERAL", "test-model", 128, {
+		stateSnapshot: {
+			portfolio: { wallet: null, sol: 0, sol_price: 0, sol_usd: 0, usdc: 0, tokens: [], total_usd: 0 },
+			positions: { wallet: null, total_positions: 0, positions: [] },
+		},
+		llmClient: {
+			chat: {
+				completions: {
+					create: async (request) => {
+						requests.push(JSON.parse(JSON.stringify(request)));
+						if (requests.length === 1) {
+							return {
+								choices: [{
+									message: {
+										role: "assistant",
+										content: null,
+										tool_calls: [{
+											id: "call-1",
+											function: {
+												name: "get_pool_info<|channel|>commentary",
+												arguments: '{pool_address:"pool-1",}',
+											},
+										}],
+									},
+								}],
+							};
+						}
+						return {
+							choices: [{ message: { role: "assistant", content: "tool repaired" } }],
+						};
+					},
+				},
+			},
+		},
+		executeTool: async (name, args) => {
+			executeCalls.push({ name, args });
+			return { success: true, pool: args.pool_address };
+		},
+	});
+
+	assert.equal(result.content, "tool repaired");
+	assert.deepEqual(executeCalls, [{ name: "get_pool_info", args: { pool_address: "pool-1" } }]);
+	const repairedAssistantMessage = requests[1].messages.find((message) => Array.isArray(message.tool_calls));
+	assert.equal(repairedAssistantMessage.tool_calls[0].function.name, "get_pool_info");
+	assert.equal(repairedAssistantMessage.tool_calls[0].function.arguments, '{"pool_address":"pool-1"}');
 });

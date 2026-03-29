@@ -1,4 +1,5 @@
 import OpenAI from "openai";
+import { jsonrepair } from "jsonrepair";
 import { buildSystemPrompt } from "./prompt.js";
 import { executeTool } from "./tools/executor.js";
 import { tools } from "./tools/definitions.js";
@@ -101,8 +102,59 @@ export function isTransientProviderError(error) {
   return /(timeout|timed out|fetch failed|network|econnreset|enotfound|connection reset|socket hang up|temporar|upstream unavailable|service unavailable|overloaded)/.test(text);
 }
 
+export function normalizeToolName(name) {
+  return typeof name === "string" ? name.replace(/<.*$/, "").trim() : "";
+}
+
+function isToolArgumentObject(value) {
+  return value != null && typeof value === "object" && !Array.isArray(value);
+}
+
 export function parseToolArguments(rawArguments) {
-  return JSON.parse(rawArguments);
+  const source = typeof rawArguments === "string"
+    ? rawArguments
+    : JSON.stringify(rawArguments ?? {});
+
+  try {
+    const parsed = JSON.parse(source);
+    if (!isToolArgumentObject(parsed)) {
+      throw new Error("Tool arguments must decode to a JSON object");
+    }
+    return parsed;
+  } catch {
+    const repairedSource = jsonrepair(source);
+    const repaired = JSON.parse(repairedSource);
+    if (!isToolArgumentObject(repaired)) {
+      throw new Error("Tool arguments must decode to a JSON object");
+    }
+    return repaired;
+  }
+}
+
+function sanitizeToolArgumentsForHistory(rawArguments) {
+  try {
+    return JSON.stringify(parseToolArguments(rawArguments));
+  } catch {
+    return "{}";
+  }
+}
+
+function sanitizeAssistantMessage(message) {
+  if (!Array.isArray(message?.tool_calls) || message.tool_calls.length === 0) {
+    return message;
+  }
+
+  return {
+    ...message,
+    tool_calls: message.tool_calls.map((toolCall) => ({
+      ...toolCall,
+      function: {
+        ...toolCall.function,
+        name: normalizeToolName(toolCall.function?.name),
+        arguments: sanitizeToolArgumentsForHistory(toolCall.function?.arguments),
+      },
+    })),
+  };
 }
 
 /**
@@ -197,7 +249,8 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
         log("error", `Bad API response: ${JSON.stringify(response).slice(0, 200)}`);
         throw new Error(`API returned no choices: ${response.error?.message || JSON.stringify(response)}`);
       }
-      const msg = response.choices[0].message;
+      const rawMsg = response.choices[0].message;
+      const msg = sanitizeAssistantMessage(rawMsg);
       messages.push(msg);
 
       // If the model didn't call any tools, it's done
@@ -213,16 +266,16 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
         return { content: msg.content, userMessage: goal };
       }
 
-      const immediateToolCalls = limitToolCallsPerTurn(msg.tool_calls);
-      if (msg.tool_calls.length > immediateToolCalls.length) {
+      const immediateToolCalls = limitToolCallsPerTurn(rawMsg.tool_calls);
+      if (rawMsg.tool_calls.length > immediateToolCalls.length) {
         log(
           "agent",
-          `Deferring ${msg.tool_calls.length - immediateToolCalls.length} additional tool call(s) until the model sees the first tool result`,
+          `Deferring ${rawMsg.tool_calls.length - immediateToolCalls.length} additional tool call(s) until the model sees the first tool result`,
         );
       }
 
       const toolCall = immediateToolCalls[0];
-      const functionName = toolCall.function.name;
+      const functionName = normalizeToolName(toolCall.function.name);
       let functionArgs;
 
       try {
