@@ -176,10 +176,23 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
     options.stateSnapshot?.positions != null ? options.stateSnapshot.positions : getMyPositionsRuntime(),
   ]);
   const stateSummary = getStateSummary();
-  const lessons = getLessonsForPrompt({ agentType });
+  const lessons = Object.hasOwn(options, "lessonsOverride")
+    ? options.lessonsOverride
+    : getLessonsForPrompt({ agentType });
   const perfSummary = getPerformanceSummary();
-  const memoryContext = getMemoryContext(agentType);
-  const systemPrompt = buildSystemPrompt(agentType, portfolio, positions, stateSummary, lessons, perfSummary, memoryContext);
+  const memoryContext = Object.hasOwn(options, "memoryContextOverride")
+    ? options.memoryContextOverride
+    : getMemoryContext(agentType, options.memoryContextOptions || {});
+  const baseSystemPrompt = options.systemPromptOverride
+    || buildSystemPrompt(agentType, portfolio, positions, stateSummary, lessons, perfSummary, memoryContext);
+  const systemPrompt = options.systemPromptSuffix
+    ? `${baseSystemPrompt}\n\n${options.systemPromptSuffix}`
+    : baseSystemPrompt;
+  const resolvedTools = options.disableTools
+    ? []
+    : Array.isArray(options.toolsOverride)
+      ? options.toolsOverride
+      : getToolsForRole(agentType, options);
 
   const messages = [
     { role: "system", content: systemPrompt },
@@ -204,10 +217,11 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
           response = await llmClient.chat.completions.create({
             model: usedModel,
             messages,
-            tools: getToolsForRole(agentType, options),
-            tool_choice: "auto",
             temperature: config.llm.temperature,
             max_tokens: maxOutputTokens ?? config.llm.maxTokens,
+            ...(resolvedTools.length > 0
+              ? { tools: resolvedTools, tool_choice: "auto" }
+              : { tool_choice: "none" }),
           });
         } catch (providerError) {
           lastProviderError = providerError;

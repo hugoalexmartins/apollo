@@ -9,6 +9,28 @@ import {
   setExecutorTestOverrides,
 } from "../tools/executor.js";
 
+function buildApprovedMeta(cycleId, actionId) {
+	return {
+		cycle_id: cycleId,
+		action_id: actionId,
+		decision_gate: {
+			required: true,
+			approved: true,
+			status: "approved",
+			reason_code: null,
+			thesis_id: `${actionId}:thesis`,
+			critic_version: "v1",
+			memory_version: "policy-v1",
+			shadow_memory_version: "policy-shadow-v1",
+		},
+		thesis_id: `${actionId}:thesis`,
+		decision_mode: "model",
+		critic_status: "approved",
+		memory_version: "policy-v1",
+		shadow_memory_version: "policy-shadow-v1",
+	};
+}
+
 async function main() {
 	setExecutorTestOverrides({
 		getMyPositions: async () => ({
@@ -159,13 +181,13 @@ async function main() {
       },
     },
   });
-  result = await executeTool("deploy_position", {
-    pool_address: "pool-4",
-    amount_y: 0.5,
-    base_mint: "mint-d",
-    bin_step: 100,
-    initial_value_usd: 1,
-  }, { cycle_id: "screening-test" });
+	result = await executeTool("deploy_position", {
+		pool_address: "pool-4",
+		amount_y: 0.5,
+		base_mint: "mint-d",
+		bin_step: 100,
+		initial_value_usd: 1,
+	}, buildApprovedMeta("screening-test", "screening-test:deploy_position:1"));
   assert.equal(result.success, true);
   assert.ok(receivedArgs);
   assert.equal(receivedArgs.initial_value_usd, 60);

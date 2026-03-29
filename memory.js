@@ -1,10 +1,16 @@
-import fs from "fs";
-import path from "path";
-import { fileURLToPath } from "url";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { log } from "./logger.js";
+import {
+	ensureMemoryRolloutState,
+	getMemoryVersionStatus,
+} from "./memory-rollout.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const SAVE_DIR = process.env.ZENITH_MEMORY_DIR || path.join(__dirname, "data", "nuggets");
+const MEMORY_ROOT = process.env.ZENITH_MEMORY_DIR || path.join(__dirname, "data", "nuggets");
+const OBSERVATIONAL_DIR = path.join(MEMORY_ROOT, "observational");
+const POLICY_DIR = path.join(MEMORY_ROOT, "policy");
 const DEFAULT_NUGGETS = ["strategies", "lessons", "patterns", "facts", "wallet_scores", "distribution_stats"];
 const PROMPT_MEMORY_NUGGETS = new Set(["strategies", "distribution_stats"]);
 const MEMORY_ROLE_TAGS = new Set(["manager", "screener", "general"]);
@@ -20,10 +26,10 @@ function matchesRole(fact, role = null) {
 	return factRoles.length === 0 || factRoles.includes(normalizedRole);
 }
 
-let shelf = null;
+let shelfCache = new Map();
 
-function ensureDir() {
-  fs.mkdirSync(SAVE_DIR, { recursive: true });
+function ensureDir(dirPath) {
+  fs.mkdirSync(dirPath, { recursive: true });
 }
 
 function sanitizeKey(str) {
@@ -40,12 +46,23 @@ function tokenize(str) {
     .filter(Boolean);
 }
 
-function nuggetPath(name) {
-  return path.join(SAVE_DIR, `${name}.json`);
+function resolvePolicyDir(version) {
+	return path.join(POLICY_DIR, version);
 }
 
-function loadNugget(name) {
-  const file = nuggetPath(name);
+function resolveStoreDir({ mode = "active", version = null } = {}) {
+	if (mode === "observational") return OBSERVATIONAL_DIR;
+	const versions = getMemoryVersionStatus();
+	const resolvedVersion = version || (mode === "shadow" ? versions.shadow_version : versions.active_version);
+	return resolvePolicyDir(resolvedVersion);
+}
+
+function nuggetPath(baseDir, name) {
+	return path.join(baseDir, `${name}.json`);
+}
+
+function loadNugget(baseDir, name) {
+  const file = nuggetPath(baseDir, name);
   if (!fs.existsSync(file)) return { name, facts: [] };
   try {
     const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
@@ -58,9 +75,9 @@ function loadNugget(name) {
   }
 }
 
-function saveNugget(nugget) {
-  ensureDir();
-  fs.writeFileSync(nuggetPath(nugget.name), JSON.stringify(nugget, null, 2));
+function saveNugget(baseDir, nugget) {
+	ensureDir(baseDir);
+  fs.writeFileSync(nuggetPath(baseDir, nugget.name), JSON.stringify(nugget, null, 2));
 }
 
 function normalizeFact(fact) {
@@ -81,9 +98,71 @@ function normalizeFact(fact) {
   };
 }
 
-function upsertFact(nuggetName, key, value, options = {}) {
-  const store = getShelf();
-  const nugget = store.getOrCreate(nuggetName);
+function createShelf(baseDir) {
+	const nuggets = new Map();
+	for (const name of DEFAULT_NUGGETS) nuggets.set(name, loadNugget(baseDir, name));
+	return {
+		baseDir,
+		nuggets,
+		getOrCreate(name) {
+			if (!this.nuggets.has(name)) {
+				const nugget = loadNugget(baseDir, name);
+				this.nuggets.set(name, nugget);
+				saveNugget(baseDir, nugget);
+			}
+			return this.nuggets.get(name);
+		},
+		get(name) {
+			return this.getOrCreate(name);
+		},
+		list() {
+			return [...this.nuggets.keys()].map((name) => ({ name }));
+		},
+		persist(nugget) {
+			saveNugget(baseDir, nugget);
+		},
+		get size() {
+			return this.nuggets.size;
+		},
+	};
+}
+
+function maybeMigrateLegacyMemory() {
+	const versions = ensureMemoryRolloutState();
+	if (versions.invalid_state) return;
+	const legacyFiles = DEFAULT_NUGGETS
+		.map((name) => ({
+			name,
+			legacyPath: path.join(MEMORY_ROOT, `${name}.json`),
+		}))
+		.filter((entry) => fs.existsSync(entry.legacyPath));
+	if (legacyFiles.length === 0) return;
+
+	ensureDir(OBSERVATIONAL_DIR);
+	ensureDir(resolvePolicyDir(versions.active_version));
+	ensureDir(resolvePolicyDir(versions.shadow_version));
+
+	for (const entry of legacyFiles) {
+		const observationalPath = nuggetPath(OBSERVATIONAL_DIR, entry.name);
+		if (!fs.existsSync(observationalPath)) {
+			fs.copyFileSync(entry.legacyPath, observationalPath);
+		}
+		if (PROMPT_MEMORY_NUGGETS.has(entry.name)) {
+			const activePolicyPath = nuggetPath(resolvePolicyDir(versions.active_version), entry.name);
+			if (!fs.existsSync(activePolicyPath)) {
+				fs.copyFileSync(entry.legacyPath, activePolicyPath);
+			}
+			const shadowPolicyPath = nuggetPath(resolvePolicyDir(versions.shadow_version), entry.name);
+			if (!fs.existsSync(shadowPolicyPath)) {
+				fs.copyFileSync(entry.legacyPath, shadowPolicyPath);
+			}
+		}
+	}
+}
+
+function upsertFact(nuggetName, key, value, options = {}, storeOptions = {}) {
+	const store = getShelf(storeOptions);
+	const nugget = store.getOrCreate(nuggetName);
   const safeKey = sanitizeKey(key);
   const factValue = String(value || "").slice(0, 400);
   const now = new Date().toISOString();
@@ -106,17 +185,19 @@ function upsertFact(nuggetName, key, value, options = {}) {
       updated_at: now,
       tags,
       data,
-    });
+		});
   }
 
-  saveNugget(nugget);
+	store.persist(nugget);
   return safeKey;
 }
 
-function getFactByKey(nuggetName, key) {
-  const nugget = getShelf().getOrCreate(nuggetName);
+function getFactByKey(nuggetName, key, storeOptions = {}) {
+	const store = getShelf(storeOptions);
+	const nugget = store.getOrCreate(nuggetName);
   const safeKey = sanitizeKey(key);
   return {
+		store,
     nugget,
     fact: nugget.facts.find((entry) => entry.key === safeKey) || null,
   };
@@ -140,6 +221,12 @@ export function buildStrategyMemoryKey(strategy, binStep = null) {
   return sanitizeKey(`strategy-${String(strategy || "unknown").toLowerCase()}-${getBinStepBucket(binStep)}`);
 }
 
+function buildRoleScopedStrategyMemoryKey(strategy, binStep = null, role = null) {
+	const baseKey = buildStrategyMemoryKey(strategy, binStep);
+	const normalizedRole = String(role || "").toLowerCase();
+	return normalizedRole ? sanitizeKey(`${baseKey}-${normalizedRole}`) : baseKey;
+}
+
 function buildLegacyStrategyMemoryKey(strategy, binStep = null) {
   return sanitizeKey(`${String(strategy || "unknown").toLowerCase()}_bs${binStep}`);
 }
@@ -159,8 +246,8 @@ function scoreFact(fact, query) {
   return overlap / queryTokens.length;
 }
 
-function recallBest(query, nuggetName = null, role = null) {
-  const store = getShelf();
+function recallBest(query, nuggetName = null, role = null, storeOptions = {}) {
+	const store = getShelf(storeOptions);
   const nuggets = nuggetName
     ? [store.getOrCreate(nuggetName)]
     : [...store.list()].map(({ name }) => store.get(name));
@@ -193,62 +280,78 @@ function recallBest(query, nuggetName = null, role = null) {
 }
 
 export function initMemory() {
-  ensureDir();
-  const nuggets = new Map();
-  for (const name of DEFAULT_NUGGETS) nuggets.set(name, loadNugget(name));
-
-  shelf = {
-    nuggets,
-    getOrCreate(name) {
-      if (!this.nuggets.has(name)) {
-        const nugget = loadNugget(name);
-        this.nuggets.set(name, nugget);
-        saveNugget(nugget);
-      }
-      return this.nuggets.get(name);
-    },
-    get(name) {
-      return this.getOrCreate(name);
-    },
-    list() {
-      return [...this.nuggets.keys()].map((name) => ({ name }));
-    },
-    get size() {
-      return this.nuggets.size;
-    },
-  };
-
-  log("memory", `Memory initialized (${shelf.size} nuggets loaded from ${SAVE_DIR})`);
-  return shelf;
+	maybeMigrateLegacyMemory();
+	shelfCache = new Map();
+	const observational = getShelf({ mode: "observational" });
+	const active = getShelf({ mode: "active" });
+	const shadow = getShelf({ mode: "shadow" });
+	const versions = getMemoryVersionStatus();
+	log(
+		"memory",
+		`Memory initialized (observational=${observational.size}, active=${versions.active_version}, shadow=${versions.shadow_version})`,
+	);
+	return {
+		observational,
+		active,
+		shadow,
+		versions,
+	};
 }
 
-export function getShelf() {
-  if (!shelf) initMemory();
-  return shelf;
+export function getShelf(storeOptions = {}) {
+	if (shelfCache.size === 0) {
+		maybeMigrateLegacyMemory();
+	}
+	const mode = storeOptions.mode || "active";
+	const dir = resolveStoreDir(storeOptions);
+	const cacheKey = `${mode}:${dir}`;
+	if (!shelfCache.has(cacheKey)) {
+		ensureDir(dir);
+		shelfCache.set(cacheKey, createShelf(dir));
+	}
+	return shelfCache.get(cacheKey);
+}
+
+function writeStrategyFact(pattern, result, storeTargets = [{ mode: "active" }, { mode: "shadow" }]) {
+	const role = typeof pattern === "object" && pattern !== null ? String(pattern.role || "").toLowerCase() : "";
+	const tags = MEMORY_ROLE_TAGS.has(role) ? [role] : undefined;
+	const keys = typeof pattern === "object" && pattern !== null
+		? [
+			MEMORY_ROLE_TAGS.has(role)
+				? buildRoleScopedStrategyMemoryKey(pattern.strategy, pattern.bin_step, role)
+				: buildStrategyMemoryKey(pattern.strategy, pattern.bin_step),
+		]
+		: [sanitizeKey(pattern)];
+	for (const target of storeTargets) {
+		for (const key of keys) {
+			upsertFact("strategies", key, typeof result === "string" ? result : JSON.stringify(result), { tags }, target);
+		}
+	}
+	log("memory", `Remembered strategy: ${keys.join(",")}`);
+	return keys[0];
 }
 
 export function rememberStrategy(pattern, result) {
-	const role = typeof pattern === "object" && pattern !== null ? String(pattern.role || "").toLowerCase() : "";
-	const tags = MEMORY_ROLE_TAGS.has(role) ? [role] : undefined;
-  const key = typeof pattern === "object" && pattern !== null
-    ? buildStrategyMemoryKey(pattern.strategy, pattern.bin_step)
-    : sanitizeKey(pattern);
-  upsertFact("strategies", key, typeof result === "string" ? result : JSON.stringify(result), { tags });
-  log("memory", `Remembered strategy: ${key}`);
+	writeStrategyFact(pattern, result, [{ mode: "active" }, { mode: "shadow" }]);
 }
 
-export function recallForScreening(poolData) {
+export function rememberObservedStrategy(pattern, result) {
+	writeStrategyFact(pattern, result, [{ mode: "observational" }, { mode: "shadow" }]);
+}
+
+export function recallForScreening(poolData, storeOptions = { mode: "active" }) {
   const results = [];
 
   if (poolData?.bin_step) {
     for (const strategy of ["bid_ask", "spot"]) {
       const keysToTry = [
+				buildRoleScopedStrategyMemoryKey(strategy, poolData.bin_step, "SCREENER"),
         buildStrategyMemoryKey(strategy, poolData.bin_step),
         buildLegacyStrategyMemoryKey(strategy, poolData.bin_step),
       ];
 
-      for (const key of keysToTry) {
-				const hit = recallBest(key, "strategies", "SCREENER");
+		for (const key of keysToTry) {
+				const hit = recallBest(key, "strategies", "SCREENER", storeOptions);
         if (hit.found && !results.some((result) => result.key === hit.key)) {
           results.push({ source: "strategies", ...hit });
           break;
@@ -260,31 +363,32 @@ export function recallForScreening(poolData) {
   return results.slice(0, 2);
 }
 
-export function recallForManagement(position) {
+export function recallForManagement(position, storeOptions = { mode: "active" }) {
   const results = [];
 
   if (position?.strategy && position?.bin_step != null) {
     const keysToTry = [
+			buildRoleScopedStrategyMemoryKey(position.strategy, position.bin_step, "MANAGER"),
       buildStrategyMemoryKey(position.strategy, position.bin_step),
       buildLegacyStrategyMemoryKey(position.strategy, position.bin_step),
     ];
-    for (const key of keysToTry) {
-			const hit = recallBest(key, "strategies", "MANAGER");
+		for (const key of keysToTry) {
+			const hit = recallBest(key, "strategies", "MANAGER", storeOptions);
       if (hit.found) {
         results.push({ source: "strategies", ...hit });
         break;
       }
     }
-  }
+	}
 
-	const lessonHit = recallBest("management", "lessons", "MANAGER");
+	const lessonHit = recallBest("management", "lessons", "MANAGER", storeOptions);
   if (lessonHit.found) results.push({ source: "lessons", ...lessonHit });
 
   return results;
 }
 
-export function getMemoryContext(agentType = "GENERAL") {
-  const store = getShelf();
+export function getMemoryContext(agentType = "GENERAL", storeOptions = { mode: "active" }) {
+	const store = getShelf(storeOptions);
   const facts = [];
 	const normalizedRole = String(agentType || "GENERAL").toLowerCase();
 
@@ -336,17 +440,22 @@ export function rememberFact(nuggetOrPayload, keyArg, valueArg) {
     return { saved: false, error: "key required" };
   }
 
-  const nuggetName = payload.nugget || "facts";
+	const nuggetName = payload.nugget || "facts";
   const safeKey = upsertFact(nuggetName, payload.key, payload.value, {
     data: payload.data,
     tags: payload.tags,
-  });
+	}, { mode: "observational" });
   log("memory", `Stored fact in ${nuggetName}: ${safeKey}`);
   return { saved: true, nugget: nuggetName, key: safeKey };
 }
 
 export function recallMemory(query, nuggetName) {
-	const result = recallBest(query, nuggetName || null, "GENERAL");
+	const result = recallBest(query, nuggetName || null, "GENERAL", { mode: "observational" });
+	if (!result.found) {
+		const activeResult = recallBest(query, nuggetName || null, "GENERAL", { mode: "active" });
+		log("memory", `Recall "${query}" -> ${activeResult.found ? activeResult.answer : "not found"}`);
+		return activeResult;
+	}
   log("memory", `Recall "${query}" -> ${result.found ? result.answer : "not found"}`);
   return result;
 }
@@ -374,7 +483,7 @@ export function rememberWalletScores({ pool_address, pool_name = null, scored_wa
     .map((wallet) => `${wallet.short_owner || wallet.owner?.slice(0, 8)} ${wallet.total_score}`)
     .join(", ")}`;
 
-  const safeKey = upsertFact("wallet_scores", `wallet-score-${pool_address}`, summary, {
+	const safeKey = upsertFact("wallet_scores", `wallet-score-${pool_address}`, summary, {
     tags: ["wallet_scoring", "lpagent", scoring?.dune?.enabled ? "dune_enriched" : "lpagent_only"],
     data: {
       pool_address,
@@ -385,7 +494,7 @@ export function rememberWalletScores({ pool_address, pool_name = null, scored_wa
       metadata,
       scored_wallets: topWallets,
     },
-  });
+	}, { mode: "observational" });
 
   log("memory", `Stored wallet scores for ${pool_address.slice(0, 8)} in ${safeKey}`);
   return { saved: true, nugget: "wallet_scores", key: safeKey, scored_wallet_count: topWallets.length };
@@ -394,14 +503,14 @@ export function rememberWalletScores({ pool_address, pool_name = null, scored_wa
 export function getWalletScoreMemory(poolAddress) {
   if (!poolAddress) return { found: false, error: "poolAddress required" };
 
-  const { nugget, fact } = getFactByKey("wallet_scores", `wallet-score-${poolAddress}`);
+	const { store, nugget, fact } = getFactByKey("wallet_scores", `wallet-score-${poolAddress}`, { mode: "observational" });
   if (!fact) {
     return { found: false, pool_address: poolAddress };
   }
 
   fact.hits = (fact.hits || 0) + 1;
   fact.updated_at = new Date().toISOString();
-  saveNugget(nugget);
+	store.persist(nugget);
 
   return {
     found: true,
@@ -413,10 +522,10 @@ export function getWalletScoreMemory(poolAddress) {
     scoring: fact.data?.scoring || {},
     metadata: fact.data?.metadata || {},
     scored_wallets: fact.data?.scored_wallets || [],
-  };
+	};
 }
 
-export function rememberTokenTypeDistribution({
+function rememberDistributionInternal({
   distribution_key,
   strategy = null,
   pool_address = null,
@@ -426,116 +535,126 @@ export function rememberTokenTypeDistribution({
   minutes_held = null,
   success = null,
   role = null,
-}) {
+}, storeOptions = [{ mode: "active" }, { mode: "shadow" }]) {
   if (!distribution_key) return { saved: false, error: "distribution_key required" };
+	let finalTotalClosed = null;
 
-  const { nugget, fact } = getFactByKey("distribution_stats", `distribution-${distribution_key}`);
-  const existing = fact?.data && typeof fact.data === "object"
-    ? fact.data
-    : {
-        distribution_key,
-        total_closed: 0,
-        wins: 0,
-        losses: 0,
-        avg_pnl_pct: 0,
-        avg_fee_yield_pct: 0,
-        avg_minutes_held: 0,
-        last_recorded_at: null,
-        by_strategy: {},
-        recent_pools: [],
-      };
+	for (const storeTarget of storeOptions) {
+		const { store, nugget, fact } = getFactByKey("distribution_stats", `distribution-${distribution_key}`, storeTarget);
+		const existing = fact?.data && typeof fact.data === "object"
+			? fact.data
+			: {
+				distribution_key,
+				total_closed: 0,
+				wins: 0,
+				losses: 0,
+				avg_pnl_pct: 0,
+				avg_fee_yield_pct: 0,
+				avg_minutes_held: 0,
+				last_recorded_at: null,
+				by_strategy: {},
+				recent_pools: [],
+			};
 
-  const next = {
-    ...existing,
-    total_closed: (existing.total_closed || 0) + 1,
-    wins: (existing.wins || 0) + (success ? 1 : 0),
-    losses: (existing.losses || 0) + (success === false ? 1 : 0),
-    last_recorded_at: new Date().toISOString(),
-  };
+		const next = {
+			...existing,
+			total_closed: (existing.total_closed || 0) + 1,
+			wins: (existing.wins || 0) + (success ? 1 : 0),
+			losses: (existing.losses || 0) + (success === false ? 1 : 0),
+			last_recorded_at: new Date().toISOString(),
+		};
 
-  const total = next.total_closed;
-  const currentAvgPnl = Number(existing.avg_pnl_pct || 0);
-  const currentAvgFeeYield = Number(existing.avg_fee_yield_pct || 0);
-  const currentAvgMinutesHeld = Number(existing.avg_minutes_held || 0);
+		const total = next.total_closed;
+		const currentAvgPnl = Number(existing.avg_pnl_pct || 0);
+		const currentAvgFeeYield = Number(existing.avg_fee_yield_pct || 0);
+		const currentAvgMinutesHeld = Number(existing.avg_minutes_held || 0);
 
-  if (typeof pnl_pct === "number" && Number.isFinite(pnl_pct)) {
-    next.avg_pnl_pct = round(((currentAvgPnl * (total - 1)) + pnl_pct) / total, 2);
-  }
-  if (typeof fee_yield_pct === "number" && Number.isFinite(fee_yield_pct)) {
-    next.avg_fee_yield_pct = round(((currentAvgFeeYield * (total - 1)) + fee_yield_pct) / total, 2);
-  }
-  if (typeof minutes_held === "number" && Number.isFinite(minutes_held)) {
-    next.avg_minutes_held = round(((currentAvgMinutesHeld * (total - 1)) + minutes_held) / total, 2);
-  }
+		if (typeof pnl_pct === "number" && Number.isFinite(pnl_pct)) {
+			next.avg_pnl_pct = round(((currentAvgPnl * (total - 1)) + pnl_pct) / total, 2);
+		}
+		if (typeof fee_yield_pct === "number" && Number.isFinite(fee_yield_pct)) {
+			next.avg_fee_yield_pct = round(((currentAvgFeeYield * (total - 1)) + fee_yield_pct) / total, 2);
+		}
+		if (typeof minutes_held === "number" && Number.isFinite(minutes_held)) {
+			next.avg_minutes_held = round(((currentAvgMinutesHeld * (total - 1)) + minutes_held) / total, 2);
+		}
 
-  const strategyKey = strategy || "unknown";
-  const existingStrategy = next.by_strategy[strategyKey] || {
-    total_closed: 0,
-    wins: 0,
-    losses: 0,
-    avg_pnl_pct: 0,
-  };
-  const strategyTotal = existingStrategy.total_closed + 1;
-  next.by_strategy = {
-    ...next.by_strategy,
-    [strategyKey]: {
-      total_closed: strategyTotal,
-      wins: existingStrategy.wins + (success ? 1 : 0),
-      losses: existingStrategy.losses + (success === false ? 1 : 0),
-      avg_pnl_pct: typeof pnl_pct === "number" && Number.isFinite(pnl_pct)
-        ? round(((existingStrategy.avg_pnl_pct || 0) * existingStrategy.total_closed + pnl_pct) / strategyTotal, 2)
-        : existingStrategy.avg_pnl_pct,
-    },
-  };
+		const strategyKey = strategy || "unknown";
+		const existingStrategy = next.by_strategy[strategyKey] || {
+			total_closed: 0,
+			wins: 0,
+			losses: 0,
+			avg_pnl_pct: 0,
+		};
+		const strategyTotal = existingStrategy.total_closed + 1;
+		next.by_strategy = {
+			...next.by_strategy,
+			[strategyKey]: {
+				total_closed: strategyTotal,
+				wins: existingStrategy.wins + (success ? 1 : 0),
+				losses: existingStrategy.losses + (success === false ? 1 : 0),
+				avg_pnl_pct: typeof pnl_pct === "number" && Number.isFinite(pnl_pct)
+					? round(((existingStrategy.avg_pnl_pct || 0) * existingStrategy.total_closed + pnl_pct) / strategyTotal, 2)
+					: existingStrategy.avg_pnl_pct,
+			},
+		};
 
-  if (pool_address || pool_name) {
-    const recentPools = Array.isArray(next.recent_pools) ? next.recent_pools : [];
-    recentPools.push({
-      pool_address,
-      pool_name,
-      pnl_pct: round(pnl_pct, 2),
-      success: success === true,
-      recorded_at: next.last_recorded_at,
-    });
-    next.recent_pools = recentPools.slice(-8);
-  }
+		if (pool_address || pool_name) {
+			const recentPools = Array.isArray(next.recent_pools) ? next.recent_pools : [];
+			recentPools.push({
+				pool_address,
+				pool_name,
+				pnl_pct: round(pnl_pct, 2),
+				success: success === true,
+				recorded_at: next.last_recorded_at,
+			});
+			next.recent_pools = recentPools.slice(-8);
+		}
 
-  next.win_rate_pct = total > 0 ? round((next.wins / total) * 100, 2) : null;
+		next.win_rate_pct = total > 0 ? round((next.wins / total) * 100, 2) : null;
+		finalTotalClosed = next.total_closed;
 
-  const summary = `${distribution_key}: ${next.win_rate_pct}% win rate across ${next.total_closed} closed positions, avg PnL ${next.avg_pnl_pct}%`;
-
-  if (fact) {
-    fact.value = summary;
-		fact.tags = [
+		const summary = `${distribution_key}: ${next.win_rate_pct}% win rate across ${next.total_closed} closed positions, avg PnL ${next.avg_pnl_pct}%`;
+		const tags = [
 			"distribution_success",
 			strategyKey,
 			...(MEMORY_ROLE_TAGS.has(String(role || "").toLowerCase()) ? [String(role).toLowerCase()] : []),
 		];
-    fact.data = next;
-    fact.updated_at = next.last_recorded_at;
-  } else {
-    nugget.facts.push({
-      key: sanitizeKey(`distribution-${distribution_key}`),
-      value: summary,
-      hits: 0,
-      created_at: next.last_recorded_at,
-      updated_at: next.last_recorded_at,
-			tags: [
-				"distribution_success",
-				strategyKey,
-				...(MEMORY_ROLE_TAGS.has(String(role || "").toLowerCase()) ? [String(role).toLowerCase()] : []),
-			],
-        data: next,
-      });
-  }
 
-  saveNugget(nugget);
-  log("memory", `Stored distribution stats for ${distribution_key}: ${next.win_rate_pct}% win rate`);
-  return { saved: true, nugget: "distribution_stats", distribution_key, total_closed: next.total_closed };
+		if (fact) {
+			fact.value = summary;
+			fact.tags = tags;
+			fact.data = next;
+			fact.updated_at = next.last_recorded_at;
+		} else {
+			nugget.facts.push({
+				key: sanitizeKey(`distribution-${distribution_key}`),
+				value: summary,
+				hits: 0,
+				created_at: next.last_recorded_at,
+				updated_at: next.last_recorded_at,
+				tags,
+				data: next,
+			});
+		}
+
+		store.persist(nugget);
+	}
+
+	log("memory", `Stored distribution stats for ${distribution_key}: ${finalTotalClosed} total closes`);
+	return { saved: true, nugget: "distribution_stats", distribution_key, total_closed: finalTotalClosed };
 }
 
-export function getTokenTypeDistributionMemory(distributionKey = null) {
-  const nugget = getShelf().getOrCreate("distribution_stats");
+export function rememberTokenTypeDistribution(payload) {
+	return rememberDistributionInternal(payload, [{ mode: "active" }, { mode: "shadow" }]);
+}
+
+export function rememberObservedTokenTypeDistribution(payload) {
+	return rememberDistributionInternal(payload, [{ mode: "observational" }, { mode: "shadow" }]);
+}
+
+export function getTokenTypeDistributionMemory(distributionKey = null, storeOptions = { mode: "active" }) {
+	const nugget = getShelf(storeOptions).getOrCreate("distribution_stats");
   const facts = distributionKey
     ? nugget.facts.filter((fact) => fact.data?.distribution_key === distributionKey)
     : nugget.facts;
@@ -545,7 +664,9 @@ export function getTokenTypeDistributionMemory(distributionKey = null) {
     distributions: facts.map((fact) => ({
       distribution_key: fact.data?.distribution_key || fact.key,
       summary: fact.value,
-      stats: fact.data || null,
-    })),
-  };
+		stats: fact.data || null,
+		})),
+	};
 }
+
+export { getMemoryVersionStatus };

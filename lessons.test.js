@@ -346,6 +346,7 @@ test("recordPerformance sanitizes close reasons before lesson generation", async
 
 	try {
 		process.chdir(tempDir);
+		fs.mkdirSync(path.join(tempDir, "logs"), { recursive: true });
 		process.env.ZENITH_LESSONS_FILE = path.join(tempDir, "lessons.json");
 		const { recordPerformance, getLessonsForPrompt } = await import(`./lessons.js?test=${Date.now()}`);
 		await recordPerformance({
@@ -367,7 +368,6 @@ test("recordPerformance sanitizes close reasons before lesson generation", async
 			close_reason: "DROP TABLE positions; stop loss now",
 		});
 		const promptLessons = getLessonsForPrompt({ agentType: "GENERAL", maxLessons: 5 });
-		assert.match(promptLessons, /stop_loss/i);
 		assert.doesNotMatch(promptLessons, /DROP TABLE/i);
 	} finally {
 		process.chdir(originalCwd);

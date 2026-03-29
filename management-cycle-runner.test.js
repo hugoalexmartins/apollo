@@ -34,6 +34,9 @@ test("management runner stays runtime-only when deterministic actions handle all
 			agentLoopCalls += 1;
 			return { content: "" };
 		},
+		getPerformanceHistory: () => ({ positions: [] }),
+		getMemoryContext: () => null,
+		getMemoryVersionStatus: () => ({ active_version: "policy-v1", shadow_version: "policy-shadow-v1" }),
 		shouldTriggerFollowOnScreening: () => false,
 		runTriggeredScreening: async () => {},
 		recordCycleEvaluation: (value) => evaluations.push(value),
@@ -116,6 +119,9 @@ test("management runner uses a forced positions snapshot and passes it into agen
 			agentLoopOptions.push(args[6]);
 			return { content: "model-ok" };
 		},
+		getPerformanceHistory: () => ({ positions: [] }),
+		getMemoryContext: () => null,
+		getMemoryVersionStatus: () => ({ active_version: "policy-v1", shadow_version: "policy-shadow-v1" }),
 		shouldTriggerFollowOnScreening: () => false,
 		runTriggeredScreening: async () => {},
 		recordCycleEvaluation: () => {},
@@ -133,8 +139,9 @@ test("management runner uses a forced positions snapshot and passes it into agen
 	await run({ cycleId: "management-test-snapshot", screeningCooldownMs: 0 });
 	assert.deepEqual(getMyPositionsCalls, [{ force: true }]);
 	assert.equal(getPositionPnlCalls, 0);
-	assert.equal(agentLoopOptions.length, 1);
-	assert.equal(agentLoopOptions[0].disableLiveStateTools, true);
+	assert.equal(agentLoopOptions.length, 2);
+	assert.equal(agentLoopOptions[0].disableTools, true);
+	assert.equal(agentLoopOptions[1].disableTools, true);
 	assert.equal(agentLoopOptions[0].stateSnapshot.positions, livePositions);
 	assert.equal(agentLoopOptions[0].stateSnapshot.portfolio, walletSnapshot);
 });
@@ -171,6 +178,9 @@ test("management runner fails closed when wallet snapshot is unavailable", async
 			agentLoopCalls += 1;
 			return { content: "should not run" };
 		},
+		getPerformanceHistory: () => ({ positions: [] }),
+		getMemoryContext: () => null,
+		getMemoryVersionStatus: () => ({ active_version: "policy-v1", shadow_version: "policy-shadow-v1" }),
 		shouldTriggerFollowOnScreening: () => false,
 		runTriggeredScreening: async () => {},
 		recordCycleEvaluation: (value) => evaluations.push(value),
@@ -221,6 +231,9 @@ test("management runner stamps screening trigger before follow-on empty-book scr
 		summarizeRuntimeActionResult: () => "ok",
 		roundMetric: (value) => value,
 		agentLoop: async () => ({ content: "" }),
+		getPerformanceHistory: () => ({ positions: [] }),
+		getMemoryContext: () => null,
+		getMemoryVersionStatus: () => ({ active_version: "policy-v1", shadow_version: "policy-shadow-v1" }),
 		shouldTriggerFollowOnScreening: () => true,
 		runTriggeredScreening: async () => {
 			followOnCalls += 1;

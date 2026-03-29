@@ -38,6 +38,9 @@ test("screening runner fails closed on startup precheck before invoking the mode
 		evaluatePortfolioGuard: () => ({ blocked: false }),
 		evaluateScreeningCycleAdmission: () => ({ allowed: true, status: "ready", summary: {} }),
 		getPerformanceSummary: () => null,
+		getPerformanceHistory: () => ({ positions: [] }),
+		getMemoryContext: () => null,
+		getMemoryVersionStatus: () => ({ active_version: "policy-v1", shadow_version: "policy-shadow-v1" }),
 		classifyRuntimeRegime: () => ({ proposed_regime: "neutral", confidence: 1, reason: "manual" }),
 		applyRegimeHysteresis: ({ classification }) => classification,
 		resolveRegimePackContext: () => ({ regime: "neutral", pack: { deploy: { regime_multiplier: 1 } }, effectiveScreeningConfig: {} }),
@@ -97,6 +100,9 @@ test("screening runner fails closed when regime state is invalid", async () => {
 		evaluatePortfolioGuard: () => ({ blocked: false }),
 		evaluateScreeningCycleAdmission: () => ({ allowed: true, status: "ready", summary: {} }),
 		getPerformanceSummary: () => null,
+		getPerformanceHistory: () => ({ positions: [] }),
+		getMemoryContext: () => null,
+		getMemoryVersionStatus: () => ({ active_version: "policy-v1", shadow_version: "policy-shadow-v1" }),
 		classifyRuntimeRegime: () => ({ proposed_regime: "neutral", confidence: 1, reason: "manual" }),
 		applyRegimeHysteresis: () => ({ invalid_state: true, error: "regime state unreadable" }),
 		resolveRegimePackContext: () => ({ regime: null, pack: null, effectiveScreeningConfig: {}, invalid_state: true, error: "regime state unreadable" }),
@@ -201,6 +207,9 @@ test("screening runner stamps last-triggered after admission and reuses the forc
 		evaluatePortfolioGuard: () => ({ blocked: false }),
 		evaluateScreeningCycleAdmission: () => ({ allowed: true, status: "ready", summary: {} }),
 		getPerformanceSummary: () => null,
+		getPerformanceHistory: () => ({ positions: [] }),
+		getMemoryContext: () => null,
+		getMemoryVersionStatus: () => ({ active_version: "policy-v1", shadow_version: "policy-shadow-v1" }),
 		classifyRuntimeRegime: () => ({ proposed_regime: "neutral", confidence: 1, reason: "manual" }),
 		applyRegimeHysteresis: ({ classification }) => classification,
 		resolveRegimePackContext: () => ({ regime: "neutral", reason: "manual", confidence: 1, pack: { deploy: { regime_multiplier: 1 } }, effectiveScreeningConfig: {} }),
@@ -226,8 +235,9 @@ test("screening runner stamps last-triggered after admission and reuses the forc
 	assert.equal(passedPositionsSnapshot, positionsSnapshot);
 	assert.equal(triggeredAt.length, 1);
 	assert.equal(typeof triggeredAt[0], "number");
-	assert.equal(agentLoopOptions.length, 1);
-	assert.equal(agentLoopOptions[0].disableLiveStateTools, true);
+	assert.equal(agentLoopOptions.length, 2);
+	assert.equal(agentLoopOptions[0].disableTools, true);
+	assert.equal(agentLoopOptions[1].disableTools, true);
 });
 
 test("screening runner fails closed when negative regime state is invalid inside candidate blocking", async () => {
@@ -261,6 +271,9 @@ test("screening runner fails closed when negative regime state is invalid inside
 		evaluatePortfolioGuard: () => ({ blocked: false }),
 		evaluateScreeningCycleAdmission: () => ({ allowed: true, status: "ready", summary: {} }),
 		getPerformanceSummary: () => null,
+		getPerformanceHistory: () => ({ positions: [] }),
+		getMemoryContext: () => null,
+		getMemoryVersionStatus: () => ({ active_version: "policy-v1", shadow_version: "policy-shadow-v1" }),
 		classifyRuntimeRegime: () => ({ proposed_regime: "neutral", confidence: 1, reason: "manual" }),
 		applyRegimeHysteresis: ({ classification }) => classification,
 		resolveRegimePackContext: () => ({ regime: "neutral", reason: "manual", confidence: 1, pack: { deploy: { regime_multiplier: 1 } }, effectiveScreeningConfig: {} }),

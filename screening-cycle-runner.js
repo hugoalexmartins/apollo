@@ -1,4 +1,5 @@
 import { finalizeCycleRun } from "./cycle-harness.js";
+import { runScreeningDecisionEngine } from "./autonomy-engine.js";
 
 import { buildOpenPositionPnlInputs } from "./runtime-helpers.js";
 
@@ -28,9 +29,12 @@ export function createScreeningCycleRunner(deps) {
       roundMetric,
       agentLoop,
       evaluatePortfolioGuard,
-      evaluateScreeningCycleAdmission,
-      getPerformanceSummary,
-      classifyRuntimeRegime,
+		evaluateScreeningCycleAdmission,
+		getPerformanceSummary,
+		getPerformanceHistory,
+		getMemoryContext,
+		getMemoryVersionStatus,
+		classifyRuntimeRegime,
       applyRegimeHysteresis,
       resolveRegimePackContext,
       listCounterfactualRegimes,
@@ -526,9 +530,8 @@ export function createScreeningCycleRunner(deps) {
 
       const candidateContext = buildCandidateContext({ shortlist, finalists, inspectionRows: finalistBlocks });
 
-      try {
-        const activeTop = shortlist[0] || null;
-        const alternates = [];
+		const activeTop = shortlist[0] || null;
+		const alternates = [];
         for (const altRegime of listCounterfactualRegimes(regimeContext.regime)) {
           const altPack = getRegimePack(altRegime);
           const altDeployAmount = computeDeployAmount(currentBalance.sol, {
@@ -580,85 +583,124 @@ export function createScreeningCycleRunner(deps) {
           });
         }
 
-        appendCounterfactualReview({
-          cycle_id: cycleId,
-          cycle_type: "screening",
-          active_regime: regimeContext.regime,
-          active_reason: regimeContext.reason,
-          active_deploy_amount_sol: deployAmount,
-          active_selected_pool: activeTop?.pool || null,
-          active_selected_score: activeTop?.deterministic_score ?? null,
-          alternates,
-        });
-      } catch (counterfactualError) {
-        log("screening", `Counterfactual review skipped: ${counterfactualError.message}`);
-      }
+		const recentPerformance = getPerformanceHistory
+			? (getPerformanceHistory({ hours: 72, limit: 12 })?.positions || [])
+			: [];
+		const decision = await runScreeningDecisionEngine({
+			agentLoop,
+			cycle_id: cycleId,
+			config,
+			strategyBlock,
+			regimeContext,
+			deployAmount,
+			candidateContext,
+			finalists,
+			recentPerformance,
+			getMemoryContextRuntime: getMemoryContext,
+			getMemoryVersionStatusRuntime: getMemoryVersionStatus,
+			stateSnapshot: {
+				portfolio: currentBalance,
+				positions: prePositions,
+			},
+		});
 
-      const { content } = await agentLoop(`
-SCREENING CYCLE - DEPLOY ONLY
-${strategyBlock}
-Regime: ${regimeContext.regime} (${regimeContext.reason}) | Sizing multipliers: regime=${regimeContext.pack.deploy.regime_multiplier} perf=${performanceMultiplier} risk=${riskMultiplier}
-Positions: ${prePositions.total_positions}/${config.risk.maxPositions} | SOL: ${currentBalance.sol.toFixed(3)} | Deploy: ${deployAmount} SOL
-${candidateContext}
-DECISION RULES (apply to the pre-loaded candidates above, no re-fetching needed):
-- Respect hard_gate=BLOCKED. Never deploy a blocked candidate.
-- Ranking precedence: use ranking_score first. context_score is explanatory context only; it must not override a blocked candidate.
-- Only the top ${finalists.length} finalist candidate${finalists.length === 1 ? "" : "s"} were enriched with heavy signals.
+		try {
+			appendCounterfactualReview({
+				cycle_id: cycleId,
+				cycle_type: "screening",
+				active_regime: regimeContext.regime,
+				active_reason: regimeContext.reason,
+				active_deploy_amount_sol: deployAmount,
+				active_selected_pool: activeTop?.pool || null,
+				active_selected_score: activeTop?.deterministic_score ?? null,
+				active_decision: decision.active.summary,
+				shadow_decision: {
+					...decision.shadow.summary,
+					comparison: decision.comparison,
+				},
+				alternates,
+			});
+		} catch (counterfactualError) {
+			log("screening", `Counterfactual review skipped: ${counterfactualError.message}`);
+		}
 
-STEPS:
-1. Pick the best candidate from the pre-loaded analysis above. If none pass, report why and stop.
-2. Reuse the pre-loaded LP-wallet scoring and planner context in your reasoning.
-3. deploy_position directly.
-4. Report: pool chosen, key signals, LP-wallet score takeaway, planner takeaway, deploy outcome.
-      `, config.llm.maxSteps, [], "SCREENER", config.llm.screeningModel, 4096, {
-        disableLiveStateTools: true,
-        stateSnapshot: {
-          portfolio: currentBalance,
-          positions: prePositions,
-        },
-        toolContext: {
-          cycle_id: cycleId,
-          cycle_type: "screening",
-          regime_label: regimeContext.regime,
-        },
-      });
+		let decisionResult = { skipped: true, reason: "hold" };
+		if (decision.active.critic.pass && decision.active.thesis.tool_name) {
+			decisionResult = await executeTool(decision.active.thesis.tool_name, decision.active.thesis.args, {
+				cycle_id: cycleId,
+				cycle_type: "screening",
+				regime_label: regimeContext.regime,
+				action_id: `${cycleId}:${decision.active.thesis.tool_name}:1`,
+				...decision.active.execution_meta,
+			});
+		} else if (!decision.active.critic.pass) {
+			decisionResult = {
+				blocked: true,
+				reason: decision.active.critic.reasons.join(", ") || decision.active.critic.reason_code || "critic_abstained",
+				manual_review: decision.active.critic.status === "manual_review",
+			};
+		}
 
-      screenReport = content;
-      screeningEvaluation = {
-        cycle_id: cycleId,
-        cycle_type: "screening",
-        status: "completed",
-        summary: {
-          total_screened: screeningTopCandidates?.total_screened ?? candidates.length,
-          total_eligible: totalEligible,
-            candidates_scored: candidateEvaluations.length,
-            candidates_blocked: candidateEvaluations.filter((candidate) => candidate.hard_blocked).length,
-            deploy_amount: deployAmount,
-            regime: regimeContext.regime,
-            regime_reason: regimeContext.reason,
-            regime_confidence: regimeContext.confidence,
-            regime_hysteresis_reason: regimeClassification.hysteresis_reason,
-            proposed_regime: regimeClassification.proposed_regime,
-            regime_multiplier: regimeContext.pack.deploy.regime_multiplier,
-            performance_multiplier: performanceMultiplier,
-            risk_multiplier: riskMultiplier,
-            score_preload_limit: scorePreloadLimit,
-            blocked_summary: blockedSummary,
-          },
-        candidates: candidateEvaluations,
-      };
-      appendReplayEnvelope({
-        cycle_id: cycleId,
-        cycle_type: "screening",
-        occupied_pools: screeningTopCandidates?.occupied_pools || [],
-        occupied_mints: screeningTopCandidates?.occupied_mints || [],
-        candidate_inputs: screeningTopCandidates?.candidate_inputs || [],
+		screenReport = [
+			`THESIS: ${decision.active.thesis.action}${decision.active.thesis.target_id ? ` / ${decision.active.thesis.target_id}` : ""}`,
+			`CONFIDENCE: ${decision.active.thesis.confidence?.score ?? 0}`,
+			`CRITIC: ${decision.active.critic.status}${decision.active.critic.reason_code ? ` / ${decision.active.critic.reason_code}` : ""}`,
+			`SHADOW: ${decision.shadow.thesis.action}${decision.comparison?.diverged ? ` / diverged_from_active` : " / matched_active"}`,
+			`RESULT: ${decisionResult.blocked ? `blocked - ${decisionResult.reason}` : decisionResult.error ? `error - ${decisionResult.error}` : decisionResult.success ? "completed successfully" : decisionResult.reason || "hold"}`,
+		].join("\n");
+		screeningEvaluation = {
+			cycle_id: cycleId,
+			cycle_type: "screening",
+			status: decision.active.critic.pass && decision.active.thesis.tool_name ? "completed" : decision.active.critic.status === "manual_review" ? "manual_review" : "held",
+			summary: {
+				total_screened: screeningTopCandidates?.total_screened ?? candidates.length,
+				total_eligible: totalEligible,
+				candidates_scored: candidateEvaluations.length,
+				candidates_blocked: candidateEvaluations.filter((candidate) => candidate.hard_blocked).length,
+				deploy_amount: deployAmount,
+				regime: regimeContext.regime,
+				regime_reason: regimeContext.reason,
+				regime_confidence: regimeContext.confidence,
+				regime_hysteresis_reason: regimeClassification.hysteresis_reason,
+				proposed_regime: regimeClassification.proposed_regime,
+				regime_multiplier: regimeContext.pack.deploy.regime_multiplier,
+				performance_multiplier: performanceMultiplier,
+				risk_multiplier: riskMultiplier,
+				score_preload_limit: scorePreloadLimit,
+				blocked_summary: blockedSummary,
+				theses_generated: 1,
+				theses_blocked: decision.active.critic.pass ? 0 : 1,
+				critic_approved: decision.active.critic.pass ? 1 : 0,
+				critic_abstained: !decision.active.critic.pass && decision.active.critic.status !== "manual_review" ? 1 : 0,
+				critic_manual_reviews: decision.active.critic.status === "manual_review" ? 1 : 0,
+				shadow_evaluations: 1,
+				shadow_divergences: decision.comparison?.diverged ? 1 : 0,
+				shadow_matches: decision.comparison?.diverged ? 0 : 1,
+			},
+			candidates: candidateEvaluations,
+		};
+		appendReplayEnvelope({
+			cycle_id: cycleId,
+			cycle_type: "screening",
+			occupied_pools: screeningTopCandidates?.occupied_pools || [],
+			occupied_mints: screeningTopCandidates?.occupied_mints || [],
+			candidate_inputs: screeningTopCandidates?.candidate_inputs || [],
 			shortlist: shortlist.map((pool) => ({
 				pool: pool.pool,
 				name: pool.name,
 				ranking_score: pool.deterministic_score,
 			})),
 			total_eligible: totalEligible,
+			active_thesis: decision.active.summary,
+			shadow_thesis: decision.shadow.summary,
+			shadow_comparison: decision.comparison,
+			decision_result: decisionResult.blocked
+				? { status: "blocked", reason: decisionResult.reason }
+				: decisionResult.error
+					? { status: "error", reason: decisionResult.error }
+					: decisionResult.success
+						? { status: "success" }
+						: { status: "hold", reason: decisionResult.reason || null },
 			write_workflows: listActionJournalWorkflowsByCycle(cycleId),
 		});
     } catch (error) {

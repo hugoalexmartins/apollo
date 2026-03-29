@@ -4,6 +4,16 @@ This file documents the major additions and behavior changes present in this for
 
 ## Recent updates
 
+### 2026-03-30
+
+- Turned screening and model-managed management decisions into a read-only thesis flow: active decisions now produce structured theses with evidence, freshness, contradictions, confidence, and explicit invalidation conditions before any write is attempted.
+- Added a critic/abstention kill-pass for autonomous writes so weak, stale, inconsistent, memory-conflicted, or loss-clustered theses now route to `hold` or `manual_review` instead of falling through to the old write path.
+- Added a shared autonomy sidecar layer through `autonomy-engine.js`, `decision-thesis.js`, and `decision-critic.js`, while keeping deterministic runtime policy and the executor boundary as the real control plane.
+- Hardened the executor boundary so cycle-driven write tools now require an approved decision gate carrying thesis/critic metadata, and that metadata is preserved into lifecycle journaling, replay envelopes, and tool outcomes.
+- Split memory into active policy, observational, and shadow-policy lanes with persisted rollout state in `memory-rollout.js`; realized learning now feeds observational/shadow memory instead of mutating live prompt policy directly.
+- Added continuous shadow evaluation across screening and model-managed management decisions, including active-vs-shadow divergence, override-rate style metrics, candidate precision, stop-loss clustering, regret hints, and post-action outcome quality surfaced through replay/counterfactual review and `/evaluation` / `/review`.
+- Added regression coverage for thesis shaping, critic blocking, versioned memory behavior, gated executor writes, and the updated runner paths; `npm run test:hardening` passes with the new autonomy flow enabled.
+
 ### 2026-03-29
 
 - Ported Meridian agent-boundary hardening so malformed tool-call JSON is repaired before execution, assistant tool-call history is sanitized before replay, and polluted tool names are normalized before dispatch/safety checks/logging.

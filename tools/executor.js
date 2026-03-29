@@ -501,6 +501,16 @@ const WRITE_TOOLS = new Set([
 ]);
 const GENERAL_APPROVAL_REQUIRED_TOOLS = new Set([...WRITE_TOOLS, "update_config"]);
 
+function resolveDecisionGate(meta = {}, args = {}) {
+	if (meta?.decision_gate && typeof meta.decision_gate === "object") {
+		return meta.decision_gate;
+	}
+	if (args?.decision_context?.decision_gate && typeof args.decision_context.decision_gate === "object") {
+		return args.decision_context.decision_gate;
+	}
+	return null;
+}
+
 /**
  * Execute a tool call with safety checks and logging.
  */
@@ -619,6 +629,36 @@ export async function executeTool(name, args, meta = {}) {
 				...normalizedArgs,
 				journal_workflow_id: workflowId,
 			};
+		}
+
+		if (meta.cycle_id) {
+			const decisionGate = resolveDecisionGate(meta, normalizedArgs);
+			if (!decisionGate?.approved) {
+				const reason = decisionGate?.reason_code
+					? `decision gate blocked write: ${decisionGate.reason_code}`
+					: "decision gate missing for cycle-driven write";
+				appendManualReviewTerminal("write_intent_blocked_by_decision_gate");
+				recordWriteToolOutcome({
+					recordToolOutcome: recordToolOutcomeRuntime,
+					tool: toolName,
+					outcome: "blocked",
+					reason,
+					args: normalizedArgs,
+					meta: {
+						...meta,
+						thesis_id: meta.thesis_id || decisionGate?.thesis_id || null,
+						critic_status: meta.critic_status || decisionGate?.status || null,
+						critic_code: meta.critic_code || decisionGate?.reason_code || null,
+						memory_version: meta.memory_version || decisionGate?.memory_version || null,
+						shadow_memory_version: meta.shadow_memory_version || decisionGate?.shadow_memory_version || null,
+					},
+				});
+				return {
+					blocked: true,
+					reason,
+					manual_review: true,
+				};
+			}
 		}
 
 		const safetyCheck = await runSafetyChecks(toolName, normalizedArgs, meta);

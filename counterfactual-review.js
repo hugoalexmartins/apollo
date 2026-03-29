@@ -1,5 +1,5 @@
-import fs from "fs";
-import path from "path";
+import fs from "node:fs";
+import path from "node:path";
 
 const COUNTERFACTUAL_REVIEW_FILE = process.env.ZENITH_COUNTERFACTUAL_REVIEW_FILE || "./data/counterfactual-review.jsonl";
 
@@ -109,6 +109,14 @@ export function getCounterfactualReviewSummary(limit = 10) {
   const alternates = reviews.flatMap((review) => Array.isArray(review.alternates) ? review.alternates : []);
   const divergent = alternates.filter((row) => row.diverged_from_active).length;
   const resolved = reviews.filter((review) => review.realized_outcome).length;
+  const shadowReviews = reviews.filter((review) => review.shadow_decision);
+  const shadowDivergences = shadowReviews.filter((review) => review.shadow_decision?.comparison?.diverged).length;
+  const resolvedDeployReviews = reviews.filter((review) => review.realized_outcome && review.active_decision?.tool_name === "deploy_position");
+  const resolvedPositiveDeploys = resolvedDeployReviews.filter((review) => Number(review.realized_outcome?.pnl_pct) >= 0).length;
+  const avgOutcomeQuality = resolvedDeployReviews.length > 0
+    ? resolvedDeployReviews.reduce((sum, review) => sum + (Number(review.realized_outcome?.pnl_pct) || 0), 0) / resolvedDeployReviews.length
+    : null;
+  const stopLossClusterEvents = reviews.filter((review) => /stop loss|emergency/i.test(String(review.realized_outcome?.close_reason || ""))).length;
   const divergentResolvedLosses = reviews.filter((review) => {
     const divergentCount = (review.alternates || []).filter((row) => row.diverged_from_active).length;
     return divergentCount > 0 && Number(review.realized_outcome?.pnl_pct) < 0;
@@ -119,10 +127,26 @@ export function getCounterfactualReviewSummary(limit = 10) {
     divergent_alternates: divergent,
     resolved_reviews: resolved,
     divergent_resolved_losses: divergentResolvedLosses,
+    shadow_reviews: shadowReviews.length,
+    shadow_divergences: shadowDivergences,
+    shadow_matches: shadowReviews.length - shadowDivergences,
+    override_rate_pct: shadowReviews.length > 0 ? Math.round((shadowDivergences / shadowReviews.length) * 10000) / 100 : null,
+    candidate_precision_pct: resolvedDeployReviews.length > 0 ? Math.round((resolvedPositiveDeploys / resolvedDeployReviews.length) * 10000) / 100 : null,
+    regret_after_skipped_trades: divergentResolvedLosses,
+    stop_loss_clustering: {
+      events: stopLossClusterEvents,
+      cluster_active: stopLossClusterEvents >= 2,
+    },
+    post_action_outcome_quality: {
+      avg_pnl_pct: avgOutcomeQuality != null ? Math.round(avgOutcomeQuality * 100) / 100 : null,
+      resolved_deploy_reviews: resolvedDeployReviews.length,
+    },
     recent_reviews: reviews.map((review) => ({
       cycle_id: review.cycle_id,
       active_regime: review.active_regime,
       active_selected_pool: review.active_selected_pool,
+      active_decision: review.active_decision || null,
+      shadow_decision: review.shadow_decision || null,
       realized_outcome: review.realized_outcome || null,
       alternates: (review.alternates || []).map((row) => ({
         regime: row.regime,

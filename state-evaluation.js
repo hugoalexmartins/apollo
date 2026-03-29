@@ -16,6 +16,14 @@ function emptyEvaluation() {
 			tool_blocks: 0,
 			tool_errors: 0,
 			write_successes: 0,
+			theses_generated: 0,
+			theses_blocked: 0,
+			critic_approved: 0,
+			critic_abstained: 0,
+			critic_manual_reviews: 0,
+			shadow_evaluations: 0,
+			shadow_divergences: 0,
+			shadow_matches: 0,
 		},
 	};
 }
@@ -86,6 +94,14 @@ export function recordCycleEvaluationInState(state, {
 	if (summary.candidates_blocked) incrementCounter(state, "candidates_blocked", Number(summary.candidates_blocked) || 0);
 	if (summary.runtime_actions_handled) incrementCounter(state, "runtime_actions_handled", Number(summary.runtime_actions_handled) || 0);
 	if (summary.runtime_actions_attempted) incrementCounter(state, "runtime_actions_attempted", Number(summary.runtime_actions_attempted) || 0);
+	if (summary.theses_generated) incrementCounter(state, "theses_generated", Number(summary.theses_generated) || 0);
+	if (summary.theses_blocked) incrementCounter(state, "theses_blocked", Number(summary.theses_blocked) || 0);
+	if (summary.critic_approved) incrementCounter(state, "critic_approved", Number(summary.critic_approved) || 0);
+	if (summary.critic_abstained) incrementCounter(state, "critic_abstained", Number(summary.critic_abstained) || 0);
+	if (summary.critic_manual_reviews) incrementCounter(state, "critic_manual_reviews", Number(summary.critic_manual_reviews) || 0);
+	if (summary.shadow_evaluations) incrementCounter(state, "shadow_evaluations", Number(summary.shadow_evaluations) || 0);
+	if (summary.shadow_divergences) incrementCounter(state, "shadow_divergences", Number(summary.shadow_divergences) || 0);
+	if (summary.shadow_matches) incrementCounter(state, "shadow_matches", Number(summary.shadow_matches) || 0);
 }
 
 export function recordToolOutcomeInState(state, { tool, outcome, reason = null, metadata = null }) {

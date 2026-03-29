@@ -39,6 +39,7 @@ test("memory context excludes non-approved nuggets", async () => {
 	try {
 		process.env.ZENITH_MEMORY_DIR = tempDir;
 		const {
+			getMemoryVersionStatus,
 			getMemoryContext,
 			initMemory,
 			recallForScreening,
@@ -53,14 +54,15 @@ test("memory context excludes non-approved nuggets", async () => {
 			pool_address: "pool-1",
 			scored_wallets: [{ owner: "wallet-1", short_owner: "wallet-1", score_breakdown: { total_score: 10, base_score: 10 }, metrics: {} }],
 		});
+		const versions = getMemoryVersionStatus();
 
 		const context = getMemoryContext();
 		assert.ok(context.includes("strategy-bidask-tight"));
 		assert.ok(!context.includes("raw_fact"));
 		assert.ok(!context.includes("wallet-score-pool-1"));
-		const before = fs.readFileSync(path.join(tempDir, "strategies.json"), "utf8");
+		const before = fs.readFileSync(path.join(tempDir, "policy", versions.active_version, "strategies.json"), "utf8");
 		recallForScreening({ bin_step: 84 });
-		const after = fs.readFileSync(path.join(tempDir, "strategies.json"), "utf8");
+		const after = fs.readFileSync(path.join(tempDir, "policy", versions.active_version, "strategies.json"), "utf8");
 		assert.equal(after, before);
 	} finally {
 		if (originalDir) process.env.ZENITH_MEMORY_DIR = originalDir;
@@ -114,6 +116,35 @@ test("recallForScreening and recallForManagement respect role-tagged strategy me
 
 		const managerHits = recallForManagement({ strategy: "bid_ask", bin_step: 84 });
 		assert.equal(managerHits[0].answer, "manager strategy memory");
+	} finally {
+		if (originalDir) process.env.ZENITH_MEMORY_DIR = originalDir;
+		else delete process.env.ZENITH_MEMORY_DIR;
+		fs.rmSync(tempDir, { recursive: true, force: true });
+	}
+});
+
+test("observational memory updates shadow policy without mutating active policy", async () => {
+	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "zenith-memory-shadow-test-"));
+	const originalDir = process.env.ZENITH_MEMORY_DIR;
+
+	try {
+		process.env.ZENITH_MEMORY_DIR = tempDir;
+		const {
+			getMemoryContext,
+			initMemory,
+			rememberObservedStrategy,
+			rememberStrategy,
+		} = await import(`./memory.js?test=${Date.now()}`);
+		initMemory();
+		rememberStrategy({ strategy: "bid_ask", bin_step: 85, role: "SCREENER" }, "active policy memory");
+		rememberObservedStrategy({ strategy: "bid_ask", bin_step: 85, role: "SCREENER" }, "shadow observational update");
+
+		const activeContext = getMemoryContext("SCREENER", { mode: "active" });
+		const shadowContext = getMemoryContext("SCREENER", { mode: "shadow" });
+
+		assert.ok(activeContext.includes("active policy memory"));
+		assert.ok(!activeContext.includes("shadow observational update"));
+		assert.ok(shadowContext.includes("shadow observational update"));
 	} finally {
 		if (originalDir) process.env.ZENITH_MEMORY_DIR = originalDir;
 		else delete process.env.ZENITH_MEMORY_DIR;

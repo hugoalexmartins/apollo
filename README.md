@@ -2,7 +2,7 @@
 
 **Autonomous Meteora DLMM liquidity management agent for Solana, powered by LLM-guided runtime orchestration.**
 
-Implementation status updated: `2026-03-29`
+Implementation status updated: `2026-03-30`
 
 ---
 
@@ -10,10 +10,12 @@ Implementation status updated: `2026-03-29`
 
 - **Screens pools** — continuously filters Meteora DLMM opportunities by fee/active-TVL, TVL, volume, organic score, holder count, market cap, bin step, and token-fee quality signals
 - **Ranks candidates deterministically** — assigns auditable screening scores in code before the LLM reasons about the final deploy choice
+- **Builds structured decision theses** — screening and model-managed management now produce explicit evidence, freshness, contradictions, confidence, and invalidation conditions before any write can happen
 - **Plans deployments deterministically** — uses `choose_distribution_strategy` and `calculate_dynamic_bin_tiers` to shape each deployment or rebalance before capital is placed
 - **Scores LP wallets** — uses `score_top_lpers` to rank strong wallets for a pool, with optional enrichment when LP-agent scoring data is available
 - **Manages positions actively** — monitors open positions, claims fees when justified, and rebalances out-of-range positions immediately when no higher-priority hard exit applies
-- **Learns from memory** — stores wallet-score memory per pool plus distribution success-rate memory from closed positions so later cycles can reuse what worked
+- **Learns through versioned memory lanes** — keeps active policy memory separate from observational and shadow-policy memory so new learning does not quietly mutate live execution policy
+- **Runs a shadow policy lane** — evaluates active-vs-shadow decisions continuously and records where the alternate lane would have diverged without giving it write access
 - **Runs as an operator-facing agent** — supports REPL and Telegram workflows for autonomous cycles, manual actions, and live status checks
 - **Surfaces cached LP performance** — uses a cached LP Agent overview for briefings and operator reporting without feeding that data back into execution policy
 
@@ -21,7 +23,7 @@ Implementation status updated: `2026-03-29`
 
 ## How it works
 
-Zenith runs a ReAct-style agent loop on top of a deterministic runtime. The LLM still reasons about what to do next, but the runtime now owns more of the control plane: candidate ranking, hard screening gates, cycle evaluation records, tool-outcome tracking, and same-cycle write de-duplication.
+Zenith runs a ReAct-style agent loop on top of a deterministic runtime, but the model is no longer treated as the write engine. Screening and model-managed management now use a read-only hypothesis pass that produces a structured thesis, a critic pass that can abstain or require manual review, and a fail-closed executor boundary that only allows cycle-driven writes when the decision gate is explicitly approved.
 
 Two specialized agents run on independent schedules:
 
@@ -33,6 +35,11 @@ Two specialized agents run on independent schedules:
 A third health check runs hourly to summarize portfolio state.
 
 **Current runtime behavior:**
+- Screening and model-managed management now generate one structured thesis per actual decision, not a vague free-form explanation: each thesis carries evidence rows, signal freshness, contradictions, confidence, invalidation conditions, and a stable `thesis_id`
+- Autonomous writes now pass through a real critic/abstention layer before execution; weak, stale, inconsistent, memory-conflicted, or recent-loss-clustered decisions route to `hold` or `manual_review` instead of falling through to an ungated write
+- The executor boundary now requires an approved decision gate for cycle-driven write tools, and the resulting thesis / critic / memory-version metadata is preserved through journaling, replay envelopes, and tool-outcome records
+- Active policy memory is now isolated from observational memory and shadow-policy memory, so realized closes can teach the system without directly mutating the live prompt-conditioned policy lane
+- Shadow evaluation now runs continuously for screening and model-managed management: Zenith records active-vs-shadow divergence, replay-visible thesis comparisons, candidate precision, override-rate style metrics, regret hints, stop-loss clustering, and post-action outcome quality
 - Agent-side tool execution is more fault-tolerant: malformed tool-call JSON is repaired before execution, assistant tool-call history is sanitized before replay to the model, and polluted tool names are normalized before dispatch reaches the executor boundary
 - LP Agent consumers now share one bounded client across scoring and overview reads, with shared multi-key quota accounting, 429 retry/backoff, and a common anti-burst delay instead of separate ad hoc fetch paths
 - `tools/dlmm.js` is now narrower: pure DLMM planning, settlement observation, live position-context enrichment, and rebalance/compounding context helpers were split into dedicated modules while keeping the public tool surface stable
@@ -226,14 +233,14 @@ After startup, an interactive prompt is available. The prompt shows a live count
 | `/candidate <n>` | Inspect one ranked candidate with richer signals on demand |
 | `/health` | Show machine-readable heartbeat, provider health, suppression state, and guard status |
 | `/preflight [tool=<name>] [pool=<pool>] [position=<position>] [amount_sol=<n>]` | Run and persist a scoped risk-opening preflight for a manual write action |
-| `/evaluation` | Show recent cycle/tool evaluation summaries |
+| `/evaluation` | Show recent cycle/tool evaluation summaries, including thesis, critic, and shadow-eval counters |
 | `/failures` | Show recent persisted bad-cycle evidence bundles |
 | `/failure <id>` | Show one persisted evidence bundle in detail |
 | `/recovery` | Show recovery suppression state and unresolved/manual-review workflows |
 | `/journal` | Show recent write-workflow journal entries |
 | `/replay <cycle_id>` | Show one replay envelope |
 | `/reconcile <cycle_id>` | Re-run deterministic replay reconciliation for one cycle |
-| `/review` | Show replay-backed review stats across recent cycles |
+| `/review` | Show replay-backed review stats plus shadow divergence, candidate precision, regret hints, and outcome-quality metrics |
 | `/resume <why>` | Persist a bounded restart-aware override for the matching unresolved-workflow suppression incident |
 | `/arm <minutes> tool=<name>[,name] [pool=<pool>] [position=<position>] [max_sol=<n>] [once] [why]` | Temporarily arm scoped GENERAL write access |
 | `/disarm` | Remove GENERAL free-form write access |
@@ -281,6 +288,16 @@ Zenith stores structured knowledge in local memory files and reuses it in later 
 
 When `score_top_lpers` runs, the agent stores wallet-score memory keyed to the pool. That memory keeps the top scored wallets, score breakdowns, and whether optional enrichment was available, so later cycles can reuse the prior ranking instead of paying for repeated lookups. Wallet-score memory also carries freshness metadata so runtime can reuse it conservatively instead of treating old scores as evergreen truth.
 
+### Active, observational, and shadow policy memory
+
+Zenith now keeps three separate memory lanes:
+
+- **Active policy memory** — the only prompt-conditioned memory lane that can influence live screening and model-managed management
+- **Observational memory** — realized-close and operator-observed memory that records what happened without changing live execution policy directly
+- **Shadow policy memory** — an alternate prompt-conditioned lane that is populated in parallel and compared against active decisions, but has no write authority
+
+This split is persisted through `memory-rollout.js`, so promotion and rollback can stay explicit instead of letting fuzzy memory writes quietly become live policy.
+
 ### Distribution success-rate memory
 
 When positions close, Zenith records distribution success-rate memory by distribution key. This tracks win rate, average PnL, average fee yield, hold time, recent pools, and strategy-level outcomes so the agent can reason from prior distribution performance.
@@ -293,6 +310,13 @@ Strategy memory no longer depends only on exact `strategy + bin step` pairings. 
 
 `/learn` still supports deeper top-LPer study for qualitative lessons, while `/evolve` updates screening thresholds from closed-position history. Those lessons and evolved thresholds are fed back into future cycles without requiring a restart.
 
+Screening and model-managed management now also produce bounded autonomy telemetry rather than just tool outcomes:
+
+- theses generated / blocked
+- critic approvals / abstentions / manual-review outcomes
+- shadow evaluations, shadow divergences, and shadow matches
+- replay-backed candidate precision, regret-after-skipped-trades hints, stop-loss clustering, and post-action outcome quality
+
 Threshold evolution is now bounded as a rollout instead of a blind overwrite:
 
 - Zenith only mutates `minFeeActiveTvlRatio` and `minOrganic`
@@ -304,7 +328,7 @@ Threshold evolution is now bounded as a rollout instead of a blind overwrite:
 - every start / accept / rollback / blocked decision writes an evidence bundle with rollout id, old/new values, metrics, reason code, and runbook slug
 - this keeps evolution online and autonomous without letting one bad step permanently distort screening or outrun persisted state
 
-Zenith now also keeps bounded evaluation summaries in local state: recent management/screening cycles, recent tool outcomes, and compact counters such as candidates scored, candidates blocked, runtime actions handled, and write-tool blocks/errors. These are meant for operator visibility and auditability, not as a second hidden strategy engine.
+Zenith now also keeps bounded evaluation summaries in local state: recent management/screening cycles, recent tool outcomes, compact counters such as candidates scored, candidates blocked, runtime actions handled, write-tool blocks/errors, and the new thesis / critic / shadow-eval counters. These are meant for operator visibility and auditability, not as a second hidden strategy engine.
 
 Management runtime actions also expose explicit subreason codes (for example stop loss, take profit, low fee yield, fee threshold, or out-of-range rebalance) so operator-facing reports and tests can describe *why* runtime acted without widening prompt-owned policy.
 
@@ -349,6 +373,8 @@ Zenith now adds a thin elite-ops layer on top of runtime hardening:
 - `operator-controls.js` — bounded GENERAL write arming plus durable, restart-aware operator resume actions
 - `management-cycle-runner.js` / `screening-cycle-runner.js` — extracted autonomous cycle runners so `index.js` stays focused on boot and wiring
 - `interactive-interface.js` / `startup-interface.js` — extracted REPL, Telegram, and startup surfaces so operator flow is no longer embedded directly in `index.js`
+- `autonomy-engine.js` — shared sidecar for read-only thesis generation, shadow evaluation, and critic gating across screening and management
+- `decision-thesis.js` / `decision-critic.js` — normalized thesis shaping plus the kill-pass abstention layer that feeds the executor gate
 
 ### Phase 6 bounded adaptation surfaces
 
@@ -356,8 +382,9 @@ Zenith now adds a constrained adaptation layer rather than open-ended self-train
 
 - `regime-packs.js` — fixed regime classification and parameter-pack overlays for screening and sizing
 - `negative-regime-memory.js` — cross-pool cooldown memory for repeatedly bad regime/strategy combinations
-- `counterfactual-review.js` — observational-only records of what alternate regime packs would have selected, later linked to realized active outcomes for review usefulness
+- `counterfactual-review.js` — observational review store for alternate regime picks plus active-vs-shadow decision comparisons, later linked to realized outcomes for usefulness and quality scoring
 - `lessons.js` rollout state — threshold evolution with persisted accept/rollback metadata instead of one-way mutation
+- `memory-rollout.js` — persisted active/shadow memory-version state so learning can be promoted or rolled back explicitly instead of mutating live memory in place
 
 Closed-position performance summaries now expose a slightly more honest decomposition of outcomes: inventory contribution, fee contribution, and operational touch counts are stored alongside headline PnL so the operator can distinguish cleaner wins from high-touch wins.
 
@@ -402,6 +429,7 @@ Zenith now has focused provider-free checks for important deterministic control 
 - `state.test.js` — bounded state/evaluation summaries
 - `tools/screening.test.js` — deterministic ranking and hard gates
 - `memory.test.js` — broader strategy-memory buckets
+- `decision-thesis.test.js` — thesis shaping and critic blocking behavior
 - `prompt.test.js` — prompt/runtime contract expectations
 - `lessons.test.js` — threshold-evolution key alignment and attribution summaries
 - `runtime-policy.test.js` — runtime management policy decisions
@@ -433,6 +461,8 @@ Zenith now has focused provider-free checks for important deterministic control 
 - `negative-regime-memory.test.js` — cross-pool negative regime cooldown persistence
 - `counterfactual-review.test.js` — observational counterfactual review persistence
 - `tools/study.test.js` — bounded LPAgent-disabled study fallback behavior
+
+Not every focused test is wired into `npm run test:hardening`; some of the newer autonomy-focused suites, such as `decision-thesis.test.js` and the broader `memory.test.js`, are still targeted regression checks that should be run explicitly when working in those areas.
 
 Manual external smoke still exists for screening and the full agent path (`npm run test:screen`, `npm run test:agent`), but `npm run test:hardening` is the stronger reproducible signal for the deterministic control plane. The screening smoke now injects an empty-position view so it remains wallet-free while still exercising live discovery/detail reads.
 

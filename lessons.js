@@ -199,10 +199,10 @@ export async function recordPerformance(perf) {
 
 	// Mirror generalized strategy outcomes into fuzzy memory.
 	try {
-		const { rememberStrategy } = await import("./memory.js");
+		const { rememberObservedStrategy } = await import("./memory.js");
 		const outcome = pnl_pct >= 0 ? "profitable" : "unprofitable";
 		if (perf.strategy && perf.bin_step != null) {
-			rememberStrategy(
+			rememberObservedStrategy(
 				{ strategy: perf.strategy, bin_step: perf.bin_step, role: "MANAGER" },
 				`${outcome}, PnL ${pnl_pct.toFixed(1)}%, vol=${perf.volatility}, fee_tvl=${perf.fee_tvl_ratio}`,
 			);
@@ -212,8 +212,8 @@ export async function recordPerformance(perf) {
 	}
 
 	try {
-		const { rememberTokenTypeDistribution } = await import("./memory.js");
-		rememberTokenTypeDistribution({
+		const { rememberObservedTokenTypeDistribution } = await import("./memory.js");
+		rememberObservedTokenTypeDistribution({
 			distribution_key: tokenTypeDistribution.key,
 			strategy: perf.strategy || null,
 			pool_address: perf.pool || null,

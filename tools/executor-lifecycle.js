@@ -5,6 +5,12 @@ export function buildDecisionContext(meta = {}, workflowId) {
 		action_id: meta.action_id || workflowId,
 		workflow_id: workflowId,
 		regime_label: meta.regime_label || null,
+		thesis_id: meta.thesis_id || null,
+		decision_mode: meta.decision_mode || null,
+		critic_status: meta.critic_status || null,
+		critic_code: meta.critic_code || null,
+		memory_version: meta.memory_version || null,
+		shadow_memory_version: meta.shadow_memory_version || null,
 	};
 }
 
@@ -49,18 +55,22 @@ export function recordWriteToolOutcome({
 	meta = {},
 	result = null,
 }) {
-	recordToolOutcome({
-		tool,
-		outcome,
-		reason,
-		metadata: {
+		recordToolOutcome({
+			tool,
+			outcome,
+			reason,
+			metadata: {
 			pool_address:
 				args?.pool_address || result?.pool_address || result?.pool || null,
 			position_address: args?.position_address || result?.position || null,
-			cycle_id: meta.cycle_id || null,
-			action_id: meta.action_id || null,
-			blocked_by_recovery:
-				outcome === "blocked" && Boolean(meta.blocked_by_recovery),
-		},
-	});
+				cycle_id: meta.cycle_id || null,
+				action_id: meta.action_id || null,
+				thesis_id: meta.thesis_id || null,
+				critic_status: meta.critic_status || null,
+				memory_version: meta.memory_version || null,
+				shadow_memory_version: meta.shadow_memory_version || null,
+				blocked_by_recovery:
+					outcome === "blocked" && Boolean(meta.blocked_by_recovery),
+			},
+		});
 }

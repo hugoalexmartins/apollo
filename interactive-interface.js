@@ -557,11 +557,19 @@ export async function runInteractiveInterface({
         console.log(`  screening_cycles:  ${evaluation.counters.screening_cycles}`);
         console.log(`  candidates_scored: ${evaluation.counters.candidates_scored}`);
         console.log(`  candidates_blocked:${evaluation.counters.candidates_blocked}`);
-        console.log(`  runtime_handled:   ${evaluation.counters.runtime_actions_handled}`);
-        console.log(`  runtime_attempted: ${evaluation.counters.runtime_actions_attempted}`);
-        console.log(`  tool_blocks:       ${evaluation.counters.tool_blocks}`);
-        console.log(`  tool_errors:       ${evaluation.counters.tool_errors}`);
-        console.log(`  write_successes:   ${evaluation.counters.write_successes}`);
+			console.log(`  runtime_handled:   ${evaluation.counters.runtime_actions_handled}`);
+			console.log(`  runtime_attempted: ${evaluation.counters.runtime_actions_attempted}`);
+			console.log(`  tool_blocks:       ${evaluation.counters.tool_blocks}`);
+			console.log(`  tool_errors:       ${evaluation.counters.tool_errors}`);
+			console.log(`  write_successes:   ${evaluation.counters.write_successes}`);
+			console.log(`  theses_generated:  ${evaluation.counters.theses_generated}`);
+			console.log(`  theses_blocked:    ${evaluation.counters.theses_blocked}`);
+			console.log(`  critic_approved:   ${evaluation.counters.critic_approved}`);
+			console.log(`  critic_abstained:  ${evaluation.counters.critic_abstained}`);
+			console.log(`  critic_review:     ${evaluation.counters.critic_manual_reviews}`);
+			console.log(`  shadow_evals:      ${evaluation.counters.shadow_evaluations}`);
+			console.log(`  shadow_diverged:   ${evaluation.counters.shadow_divergences}`);
+			console.log(`  shadow_matched:    ${evaluation.counters.shadow_matches}`);
         if (evaluation.recent_cycles.length > 0) {
           console.log("\n  Recent cycles:");
           for (const cycle of evaluation.recent_cycles) {
@@ -645,24 +653,36 @@ export async function runInteractiveInterface({
         console.log(`  fail_closed: ${stats.fail_closed}`);
         console.log(`  matches: ${stats.matches}`);
         console.log(`  mismatches: ${stats.mismatches}`);
-        if (stats.counterfactual) {
-          console.log(`  counterfactual_reviews: ${stats.counterfactual.total_reviews}`);
-          console.log(`  divergent_alternates: ${stats.counterfactual.divergent_alternates}`);
-          console.log(`  resolved_counterfactuals: ${stats.counterfactual.resolved_reviews}`);
-          console.log(`  divergent_losses_to_review: ${stats.counterfactual.divergent_resolved_losses}`);
-          if (stats.counterfactual.recent_reviews.length > 0) {
-            console.log("\n  Recent counterfactuals:");
-            for (const review of stats.counterfactual.recent_reviews.slice(0, 5)) {
-              const alternateSummary = review.alternates
-                .map((row) => `${row.regime}:${row.selected_pool || "none"}${row.diverged_from_active ? "*" : ""}`)
-                .join(", ");
-              const realized = review.realized_outcome
-                ? ` | realized=${review.realized_outcome.pnl_pct ?? "n/a"}% (${review.realized_outcome.usefulness_hint})`
-                : "";
-              console.log(`    - ${review.cycle_id}: active=${review.active_regime}:${review.active_selected_pool || "none"} | alternates=${alternateSummary}${realized}`);
-            }
-          }
-        }
+			if (stats.counterfactual) {
+				console.log(`  counterfactual_reviews: ${stats.counterfactual.total_reviews}`);
+				console.log(`  divergent_alternates: ${stats.counterfactual.divergent_alternates}`);
+				console.log(`  resolved_counterfactuals: ${stats.counterfactual.resolved_reviews}`);
+				console.log(`  divergent_losses_to_review: ${stats.counterfactual.divergent_resolved_losses}`);
+				console.log(`  shadow_reviews: ${stats.counterfactual.shadow_reviews}`);
+				console.log(`  shadow_divergences: ${stats.counterfactual.shadow_divergences}`);
+				console.log(`  override_rate_pct: ${stats.counterfactual.override_rate_pct ?? "n/a"}`);
+				console.log(`  candidate_precision_pct: ${stats.counterfactual.candidate_precision_pct ?? "n/a"}`);
+				console.log(`  regret_after_skipped_trades: ${stats.counterfactual.regret_after_skipped_trades}`);
+				console.log(`  stop_loss_cluster_events: ${stats.counterfactual.stop_loss_clustering?.events ?? 0}`);
+				console.log(`  outcome_quality_avg_pnl_pct: ${stats.counterfactual.post_action_outcome_quality?.avg_pnl_pct ?? "n/a"}`);
+				if (stats.counterfactual.recent_reviews.length > 0) {
+					console.log("\n  Recent counterfactuals:");
+					for (const review of stats.counterfactual.recent_reviews.slice(0, 5)) {
+						const alternateSummary = review.alternates
+							.map((row) => `${row.regime}:${row.selected_pool || "none"}${row.diverged_from_active ? "*" : ""}`)
+							.join(", ");
+						const realized = review.realized_outcome
+							? ` | realized=${review.realized_outcome.pnl_pct ?? "n/a"}% (${review.realized_outcome.usefulness_hint})`
+							: "";
+						const shadow = review.shadow_decision?.comparison?.diverged
+							? ` | shadow=${review.shadow_decision?.tool_name || review.shadow_decision?.action || "hold"}:${review.shadow_decision?.target_id || "none"}*`
+							: review.shadow_decision
+								? ` | shadow=${review.shadow_decision?.tool_name || review.shadow_decision?.action || "hold"}:${review.shadow_decision?.target_id || "none"}`
+								: "";
+						console.log(`    - ${review.cycle_id}: active=${review.active_regime}:${review.active_selected_pool || "none"} | alternates=${alternateSummary}${shadow}${realized}`);
+					}
+				}
+			}
         if (stats.recent_cycles.length > 0) {
           console.log("\n  Recent cycles:");
           for (const row of stats.recent_cycles) {

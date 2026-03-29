@@ -67,6 +67,13 @@ export async function handleSuccessfulToolSideEffects({
 					cycle_type: meta.cycle_type || null,
 					regime_label: meta.regime_label || null,
 					action_id: workflowId ? `${workflowId}:auto_swap_close` : undefined,
+					decision_gate: meta.decision_gate || null,
+					thesis_id: meta.thesis_id || null,
+					decision_mode: meta.decision_mode || null,
+					critic_status: meta.critic_status || null,
+					critic_code: meta.critic_code || null,
+					memory_version: meta.memory_version || null,
+					shadow_memory_version: meta.shadow_memory_version || null,
 				},
 			);
 			if (autoSwapResult?.error || autoSwapResult?.blocked) {
@@ -102,6 +109,13 @@ export async function handleSuccessfulToolSideEffects({
 					cycle_type: meta.cycle_type || null,
 					regime_label: meta.regime_label || null,
 					action_id: workflowId ? `${workflowId}:auto_swap_claim` : undefined,
+					decision_gate: meta.decision_gate || null,
+					thesis_id: meta.thesis_id || null,
+					decision_mode: meta.decision_mode || null,
+					critic_status: meta.critic_status || null,
+					critic_code: meta.critic_code || null,
+					memory_version: meta.memory_version || null,
+					shadow_memory_version: meta.shadow_memory_version || null,
 				},
 			);
 			if (autoSwapResult?.error || autoSwapResult?.blocked) {

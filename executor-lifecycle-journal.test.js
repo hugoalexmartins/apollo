@@ -12,6 +12,28 @@ import {
   setExecutorTestOverrides,
 } from "./tools/executor.js";
 
+function buildApprovedMeta(cycleId, actionId) {
+	return {
+		cycle_id: cycleId,
+		action_id: actionId,
+		decision_gate: {
+			required: true,
+			approved: true,
+			status: "approved",
+			reason_code: null,
+			thesis_id: `${actionId}:thesis`,
+			critic_version: "v1",
+			memory_version: "policy-v1",
+			shadow_memory_version: "policy-shadow-v1",
+		},
+		thesis_id: `${actionId}:thesis`,
+		decision_mode: "model",
+		critic_status: "approved",
+		memory_version: "policy-v1",
+		shadow_memory_version: "policy-shadow-v1",
+	};
+}
+
 test("executor journals intent and completion for write tools", async () => {
   const originalCwd = process.cwd();
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "zenith-executor-lifecycle-test-"));
@@ -37,11 +59,11 @@ test("executor journals intent and completion for write tools", async () => {
       recordToolOutcome: () => {},
     });
 
-    const result = await executeTool(
-      "deploy_position",
-      { pool_address: "pool-1", amount_y: 0.5, base_mint: "mint-1", bin_step: 100, initial_value_usd: 1 },
-      { cycle_id: "cycle-1", action_id: "cycle-1:deploy_position:1" }
-    );
+		const result = await executeTool(
+			"deploy_position",
+			{ pool_address: "pool-1", amount_y: 0.5, base_mint: "mint-1", bin_step: 100, initial_value_usd: 1 },
+			buildApprovedMeta("cycle-1", "cycle-1:deploy_position:1")
+		);
 
     assert.equal(result.success, true);
 
@@ -90,11 +112,11 @@ test("executor writes terminal manual_review for blocked write attempts", async 
 			recordToolOutcome: () => {},
 		});
 
-    const result = await executeTool(
-      "deploy_position",
-      { pool_address: "pool-block", amount_y: 0.5, base_mint: "mint-b", bin_step: 100 },
-      { cycle_id: "cycle-b", action_id: "cycle-b:deploy_position:1" }
-    );
+		const result = await executeTool(
+			"deploy_position",
+			{ pool_address: "pool-block", amount_y: 0.5, base_mint: "mint-b", bin_step: 100 },
+			buildApprovedMeta("cycle-b", "cycle-b:deploy_position:1")
+		);
 
     assert.equal(result.blocked, true);
 
@@ -138,11 +160,11 @@ test("executor writes terminal manual_review for errored write attempts", async 
       recordToolOutcome: () => {},
     });
 
-    const result = await executeTool(
-      "deploy_position",
-      { pool_address: "pool-err", amount_y: 0.5, base_mint: "mint-err", bin_step: 100 },
-      { cycle_id: "cycle-e", action_id: "cycle-e:deploy_position:1" }
-    );
+		const result = await executeTool(
+			"deploy_position",
+			{ pool_address: "pool-err", amount_y: 0.5, base_mint: "mint-err", bin_step: 100 },
+			buildApprovedMeta("cycle-e", "cycle-e:deploy_position:1")
+		);
 
     assert.match(result.error || "", /simulated deploy failure/i);
 
@@ -197,7 +219,7 @@ test("executor auto-swap uses observed recovered amount and journals the swap wo
 		const result = await executeTool(
 			"close_position",
 			{ position_address: "pos-close-1" },
-			{ cycle_id: "cycle-close", action_id: "cycle-close:close_position:1" },
+			buildApprovedMeta("cycle-close", "cycle-close:close_position:1"),
 		);
 
 		assert.equal(result.success, true);

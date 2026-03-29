@@ -43,6 +43,7 @@ test("runManagementRuntimeActions only executes deterministic runtime actions", 
       calls.push({ name, args, meta });
       return { success: true, tool: name };
     },
+		getMemoryVersionStatus: () => ({ active_version: "policy-v1", shadow_version: "policy-shadow-v1" }),
   });
 
   assert.equal(calls.length, 1);
@@ -76,6 +77,7 @@ test("runManagementRuntimeActions suppresses stale-pnl exits but keeps out-of-ra
       calls.push({ name, args, meta });
       return { success: true, tool: name };
     },
+		getMemoryVersionStatus: () => ({ active_version: "policy-v1", shadow_version: "policy-shadow-v1" }),
   });
 
   assert.equal(calls.length, 1);
@@ -109,6 +111,7 @@ test("runManagementRuntimeActions closes parsed instruction thresholds without e
       calls.push({ name, args, meta });
       return { success: true, tool: name };
     },
+		getMemoryVersionStatus: () => ({ active_version: "policy-v1", shadow_version: "policy-shadow-v1" }),
   });
 
   assert.equal(calls.length, 1);
@@ -144,6 +147,7 @@ test("runManagementRuntimeActions keeps fee and low-yield reviews in the slow pa
 			calls.push({ name, args, meta });
 			return { success: true, tool: name };
 		},
+		getMemoryVersionStatus: () => ({ active_version: "policy-v1", shadow_version: "policy-shadow-v1" }),
 	});
 
 	assert.equal(calls.length, 2);
@@ -171,6 +175,7 @@ test("runManagementRuntimeActions skips slow review actions until the interval e
 			calls.push({ name, args, meta });
 			return { success: true, tool: name };
 		},
+		getMemoryVersionStatus: () => ({ active_version: "policy-v1", shadow_version: "policy-shadow-v1" }),
 	});
 	await runManagementRuntimeActions([
 		{
@@ -189,6 +194,7 @@ test("runManagementRuntimeActions skips slow review actions until the interval e
 			calls.push({ name, args, meta });
 			return { success: true, tool: name };
 		},
+		getMemoryVersionStatus: () => ({ active_version: "policy-v1", shadow_version: "policy-shadow-v1" }),
 	});
 
 	assert.equal(calls.length, 1);

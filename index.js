@@ -20,7 +20,7 @@ import { generateBriefing } from "./briefing.js";
 import { getEvaluationSummary, getLastBriefingDate, getTrackedPositions, recordCycleEvaluation, setLastBriefingDate, updatePnlAndCheckExits } from "./state.js";
 import { getActiveStrategy } from "./strategy-library.js";
 import { getNegativeRegimeCooldown, recordPositionSnapshot, recallForPool } from "./pool-memory.js";
-import { initMemory, recallForManagement } from "./memory.js";
+import { getMemoryContext, getMemoryVersionStatus, initMemory, recallForManagement } from "./memory.js";
 import { classifyManagementModelGate, deriveExpectedVolumeProfile, isPnlSignalStale, resolveTargetManagementInterval } from "./runtime-policy.js";
 import { evaluateScreeningCycleAdmission } from "./runtime-policy.js";
 import { getLpOverview } from "./tools/lp-overview.js";
@@ -269,10 +269,13 @@ export function startCronJobs() {
     didRuntimeHandleManagementAction,
     classifyManagementModelGate,
     summarizeRuntimeActionResult,
-    roundMetric,
-    agentLoop,
-    shouldTriggerFollowOnScreening,
-    runTriggeredScreening: async () => {
+		roundMetric,
+		agentLoop,
+		getPerformanceHistory,
+		getMemoryContext,
+		getMemoryVersionStatus,
+		shouldTriggerFollowOnScreening,
+		runTriggeredScreening: async () => {
       const triggeredCycleId = createCycleId("screening");
       await runScreeningCycle({ cycleId: triggeredCycleId });
     },
@@ -313,9 +316,12 @@ export function startCronJobs() {
     roundMetric,
     agentLoop,
     evaluatePortfolioGuard,
-    evaluateScreeningCycleAdmission,
-    getPerformanceSummary,
-    classifyRuntimeRegime,
+		evaluateScreeningCycleAdmission,
+		getPerformanceSummary,
+		getPerformanceHistory,
+		getMemoryContext,
+		getMemoryVersionStatus,
+		classifyRuntimeRegime,
     applyRegimeHysteresis,
     resolveRegimePackContext,
     listCounterfactualRegimes,
