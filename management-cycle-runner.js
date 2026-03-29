@@ -1,5 +1,46 @@
 import { finalizeCycleRun } from "./cycle-harness.js";
 
+function buildManagementPnlSnapshot(position = {}) {
+  const observedAtMs = Number.isFinite(Number(position.observed_at_ms ?? position.as_of_ms))
+    ? Number(position.observed_at_ms ?? position.as_of_ms)
+    : Number.isFinite(Date.parse(position.observed_at ?? position.as_of ?? ""))
+      ? Date.parse(position.observed_at ?? position.as_of)
+      : null;
+
+  if (position.pnl_missing || position.status === "missing") {
+    return {
+      error: position.pnl_error || "Position not found in pre-loaded PnL snapshot",
+      stale: true,
+      status: "stale",
+      observed_at_ms: observedAtMs,
+      max_age_ms: position.max_age_ms ?? 60_000,
+    };
+  }
+
+  const stale = position.stale === true || position.status === "stale" || observedAtMs == null;
+  const unclaimedFeeUsd = Number(position.unclaimed_fees_usd ?? 0);
+  const collectedFeesUsd = Number(position.collected_fees_usd ?? 0);
+
+  return {
+    pnl_pct: position.pnl_pct ?? null,
+    pnl_usd: position.pnl_usd ?? null,
+    current_value_usd: position.total_value_usd ?? null,
+    unclaimed_fee_usd: Number.isFinite(unclaimedFeeUsd) ? unclaimedFeeUsd : null,
+    all_time_fees_usd: (Number.isFinite(collectedFeesUsd) ? collectedFeesUsd : 0) + (Number.isFinite(unclaimedFeeUsd) ? unclaimedFeeUsd : 0),
+    fee_active_tvl_ratio: position.fee_tvl_ratio ?? null,
+    fee_per_tvl_24h: position.fee_tvl_ratio ?? null,
+    in_range: position.in_range ?? null,
+    lower_bin: position.lower_bin ?? null,
+    upper_bin: position.upper_bin ?? null,
+    active_bin: position.active_bin ?? null,
+    age_minutes: position.age_minutes ?? null,
+    observed_at_ms: observedAtMs,
+    max_age_ms: position.max_age_ms ?? 60_000,
+    stale,
+    status: stale ? "stale" : (position.status || "ok"),
+  };
+}
+
 export function createManagementCycleRunner(deps) {
   return async function runManagementCycle({ cycleId, screeningCooldownMs } = {}) {
     const {
@@ -13,7 +54,6 @@ export function createManagementCycleRunner(deps) {
       writeEvidenceBundle,
       enforceManagementIntervalFromPositions,
       recordPositionSnapshot,
-      getPositionPnl,
       recallForPool,
       recallForManagement,
       isPnlSignalStale,
@@ -37,6 +77,7 @@ export function createManagementCycleRunner(deps) {
       getManagementBusy,
       getScreeningBusy,
       getScreeningLastTriggered,
+      setScreeningLastTriggered,
       setManagementBusy,
       setManagementLastRun,
     } = deps;
@@ -72,39 +113,39 @@ export function createManagementCycleRunner(deps) {
 
     try {
       const [livePositionsResult, walletSnapshotResult] = await Promise.all([
-        getMyPositions().catch((error) => ({ error: error.message })),
-        getWalletBalances().catch(() => null),
+        getMyPositions({ force: true }).catch((error) => ({ error: error.message })),
+        getWalletBalances().catch((error) => ({ error: error.message })),
       ]);
       const livePositions = livePositionsResult;
       walletSnapshot = walletSnapshotResult;
-      if (!livePositions || livePositions.error || !Array.isArray(livePositions.positions)) {
-        const failure = validateStartupSnapshot({
-          wallet: { sol: 0 },
+      const startupFailure = validateStartupSnapshot({
+          wallet: walletSnapshot,
           positions: livePositions,
           candidates: { candidates: [] },
-        }) || classifyRuntimeFailure(new Error(livePositions?.error || "positions unavailable"), { invalidState: !livePositions || !Array.isArray(livePositions?.positions) });
+        });
+      if (startupFailure) {
         managementEvaluation = {
           cycle_id: cycleId,
           cycle_type: "management",
           status: "failed_precheck",
           summary: {
-            reason_code: failure.reason_code,
-            error: failure.message,
+            reason_code: startupFailure.reason_code,
+            error: startupFailure.message,
           },
           positions: [],
         };
         appendReplayEnvelope({
           cycle_id: cycleId,
           cycle_type: "management",
-          reason_code: failure.reason_code,
-          error: failure.message,
+          reason_code: startupFailure.reason_code,
+          error: startupFailure.message,
         });
         writeEvidenceBundle({
           cycle_id: cycleId,
           cycle_type: "management",
           status: "failed_precheck",
-          reason_code: failure.reason_code,
-          error: failure.message,
+          reason_code: startupFailure.reason_code,
+          error: startupFailure.message,
           written_at: new Date().toISOString(),
         });
         return;
@@ -141,7 +182,7 @@ export function createManagementCycleRunner(deps) {
 
       positionData = await Promise.all(positions.map(async (p) => {
         recordPositionSnapshot(p.pool, p);
-        const pnl = await getPositionPnl({ pool_address: p.pool, position_address: p.position }).catch((error) => ({ error: error.message, stale: true, status: "stale" }));
+        const pnl = buildManagementPnlSnapshot(p);
         const recall = recallForPool(p.pool);
         const pnlStale = !pnl || pnl.error || isPnlSignalStale({ pnl });
         const enriched = {
@@ -289,6 +330,11 @@ REPORT FORMAT (one per position):
 **[PAIR]** | Age: [X]m | Unclaimed: $[X] | Claimed: $[X] | PnL: [X]%
 **Instruction:** [met / not met] | **Decision:** STAY/CLOSE | **Reason:** [1 sentence]
       `, config.llm.maxSteps, [], "MANAGER", config.llm.managementModel, 4096, {
+        disableLiveStateTools: true,
+        stateSnapshot: {
+          portfolio: walletSnapshot,
+          positions: livePositions,
+        },
         toolContext: {
           cycle_id: cycleId,
           cycle_type: "management",
@@ -354,6 +400,7 @@ REPORT FORMAT (one per position):
     } finally {
       setManagementBusy(false);
       if (triggerFollowOnScreening) {
+        setScreeningLastTriggered?.(Date.now());
         runTriggeredScreening().catch((e) => log("cron_error", `Triggered screening failed: ${e.message}`));
       }
 			finalizeCycleRun({

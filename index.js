@@ -201,6 +201,7 @@ function buildPrompt() {
 let _cronTasks = [];
 let _managementBusy = false; // prevents overlapping management cycles
 let _screeningBusy = false;  // prevents overlapping screening cycles
+let _healthBusy = false;
 let _screeningLastTriggered = 0;
 
 async function runBriefing() {
@@ -283,6 +284,7 @@ export function startCronJobs() {
     getManagementBusy: () => _managementBusy,
     getScreeningBusy: () => _screeningBusy,
     getScreeningLastTriggered: () => _screeningLastTriggered,
+    setScreeningLastTriggered: (value) => { _screeningLastTriggered = value; },
     setManagementBusy: (value) => { _managementBusy = value; },
     setManagementLastRun: (value) => { timers.managementLastRun = value; },
   });
@@ -392,8 +394,8 @@ export function startCronJobs() {
   const screenTask = cron.schedule(`*/${Math.max(1, config.schedule.screeningIntervalMin)} * * * *`, runScreeningScheduled);
 
   const healthTask = cron.schedule(`0 * * * *`, async () => {
-    if (_managementBusy) return;
-    _managementBusy = true;
+    if (_healthBusy || _managementBusy || _screeningBusy) return;
+    _healthBusy = true;
     log("cron", "Starting health check");
     try {
       await agentLoop(`
@@ -422,7 +424,7 @@ HEALTH CHECK
         },
       });
     } finally {
-      _managementBusy = false;
+      _healthBusy = false;
     }
   });
 
