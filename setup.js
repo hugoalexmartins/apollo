@@ -9,10 +9,12 @@ import fs from "node:fs";
 import path from "node:path";
 import readline from "node:readline";
 import { fileURLToPath } from "node:url";
+import { getMutableConfigEntry } from "./config-registry.js";
 import { getEffectiveMinSolToOpen } from "./runtime-helpers.js";
+import { buildIntervalCron } from "./schedule-runtime.js";
+import { readUserConfigSnapshot, writeUserConfigSnapshot } from "./user-config-store.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const CONFIG_PATH = path.join(__dirname, "user-config.json");
 const ENV_PATH = path.join(__dirname, ".env");
 
 const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
@@ -80,6 +82,30 @@ function askChoice(question, choices) {
   })();
 }
 
+function askEnum(question, defaultVal, values) {
+	return (async () => {
+		while (true) {
+			const raw = await ask(question, defaultVal);
+			if (values.includes(raw)) return raw;
+			console.log(`  ⚠ Allowed values: ${values.join(", ")}`);
+		}
+	})();
+}
+
+function askScheduleInterval(question, defaultVal) {
+	return (async () => {
+		while (true) {
+			const raw = await askNum(question, defaultVal, { min: 1, max: 1440 });
+			try {
+				buildIntervalCron(raw);
+				return raw;
+			} catch (error) {
+				console.log(`  ⚠ ${error.message}`);
+			}
+		}
+	})();
+}
+
 function upsertEnvValue(key, value) {
   const safeValue = String(value || "").trim();
   const existing = fs.existsSync(ENV_PATH) ? fs.readFileSync(ENV_PATH, "utf8") : "";
@@ -100,8 +126,6 @@ const PRESETS = {
   degen: {
     label:                 "🔥 Degen",
     timeframe:             "30m",
-    maxVolatility:         12.0,   // pumping meme coins welcome
-    maxPriceChangePct:     1000,   // don't filter pumps — high fee/TVL is the gate
     minOrganic:            60,
     minHolders:            200,
     maxMcap:               5_000_000,
@@ -114,8 +138,6 @@ const PRESETS = {
   moderate: {
     label:                 "⚖️  Moderate",
     timeframe:             "4h",
-    maxVolatility:         8.0,    // allow active meme coins
-    maxPriceChangePct:     300,    // allow up to 3x pump if fee/TVL justifies it
     minOrganic:            65,
     minHolders:            500,
     maxMcap:               10_000_000,
@@ -128,8 +150,6 @@ const PRESETS = {
   safe: {
     label:                 "🛡️  Safe",
     timeframe:             "24h",
-    maxVolatility:         2.5,
-    maxPriceChangePct:     80,     // avoid pumped coins
     minOrganic:            75,
     minHolders:            1000,
     maxMcap:               10_000_000,
@@ -142,9 +162,11 @@ const PRESETS = {
 };
 
 // Load existing config
-const existing = fs.existsSync(CONFIG_PATH)
-  ? JSON.parse(fs.readFileSync(CONFIG_PATH, "utf8"))
-  : {};
+const existingSnapshot = readUserConfigSnapshot();
+if (!existingSnapshot.ok) {
+	throw new Error(existingSnapshot.error);
+}
+const existing = existingSnapshot.value;
 
 const e = (key, fallback) => existing[key] ?? fallback;
 
@@ -210,24 +232,19 @@ const maxDeployAmount = await askNum(
   { min: deployAmountSol }
 );
 
+const gasReserve = await askNum(
+	"SOL gas reserve to keep free",
+	e("gasReserve", 0.2),
+	{ min: 0 }
+);
+
 // ─── Risk ─────────────────────────────────────────────────────────────────────
 console.log("\n── Risk & Filters ────────────────────────────");
 
-const timeframe = await ask(
-  "Pool discovery timeframe (30m / 1h / 4h / 12h / 24h)",
-  p("timeframe", "4h")
-);
-
-const maxVolatility = await askNum(
-  "Max pool volatility",
-  p("maxVolatility", 8.0),
-  { min: 0.5, max: 20 }
-);
-
-const maxPriceChangePct = await askNum(
-  "Max price change % allowed (e.g. 300 = allow 3x pumps)",
-  p("maxPriceChangePct", 300),
-  { min: 10 }
+const timeframe = await askEnum(
+	"Pool discovery timeframe",
+	p("timeframe", "4h"),
+	getMutableConfigEntry("timeframe").values,
 );
 
 const minOrganic = await askNum(
@@ -266,24 +283,27 @@ const outOfRangeWaitMinutes = await askNum(
 // ─── Scheduling ───────────────────────────────────────────────────────────────
 console.log("\n── Scheduling ────────────────────────────────");
 
-const managementIntervalMin = await askNum(
+const managementIntervalMin = await askScheduleInterval(
   "Management cycle interval (minutes)",
   p("managementIntervalMin", 10),
-  { min: 1 }
 );
 
-const screeningIntervalMin = await askNum(
+const screeningIntervalMin = await askScheduleInterval(
   "Screening cycle interval (minutes)",
   p("screeningIntervalMin", 30),
-  { min: 5 }
+);
+
+const healthCheckIntervalMin = await askScheduleInterval(
+	"Health check interval (minutes)",
+	e("healthCheckIntervalMin", 60),
 );
 
 // ─── LLM ──────────────────────────────────────────────────────────────────────
 console.log("\n── LLM ───────────────────────────────────────");
 
-const llmModel = await ask(
-  "LLM model (OpenRouter model ID)",
-  e("llmModel", process.env.LLM_MODEL || "nousresearch/hermes-3-llama-3.1-405b")
+const defaultModel = await ask(
+	"Default LLM model for management/screening/general",
+	e("managementModel", e("screeningModel", e("generalModel", e("llmModel", process.env.LLM_MODEL || "nousresearch/hermes-3-llama-3.1-405b")))),
 );
 
 const dryRun = await ask(
@@ -295,15 +315,13 @@ rl.close();
 
 // ─── Save ──────────────────────────────────────────────────────────────────────
 const userConfig = {
-  preset: presetChoice.key,
   rpcUrl,
   deployAmountSol,
   maxPositions,
-  minSolToOpen,
   maxDeployAmount,
+  gasReserve,
+  minSolToOpen: getEffectiveMinSolToOpen({ minSolToOpen, deployAmountSol, gasReserve }),
   timeframe,
-  maxVolatility,
-  maxPriceChangePct,
   minOrganic,
   minHolders,
   maxMcap,
@@ -311,11 +329,14 @@ const userConfig = {
   outOfRangeWaitMinutes,
   managementIntervalMin,
   screeningIntervalMin,
-  llmModel,
+  healthCheckIntervalMin,
+		managementModel: defaultModel,
+		screeningModel: defaultModel,
+		generalModel: defaultModel,
   dryRun: dryRun === "true",
 };
 
-fs.writeFileSync(CONFIG_PATH, JSON.stringify(userConfig, null, 2));
+writeUserConfigSnapshot(userConfig);
 if (finalWalletPrivateKey) {
   upsertEnvValue("WALLET_PRIVATE_KEY", finalWalletPrivateKey);
 }
@@ -333,16 +354,17 @@ Timeframe:    ${timeframe}
   Deploy:     ${deployAmountSol} SOL/position  |  Max: ${maxPositions} positions
   Min balance: ${minSolToOpen} SOL to open
   Take profit: fees >= ${takeProfitFeePct}%
-  Volatility:  max ${maxVolatility}
   Organic:     min ${minOrganic}
   Holders:     min ${minHolders}
 
 Wallet private key saved to .env (not user-config.json)
   Max mcap:    $${maxMcap.toLocaleString()}
+  Gas reserve: ${gasReserve} SOL
   OOR close:   after ${outOfRangeWaitMinutes} min
   Mgmt:        every ${managementIntervalMin} min
   Screening:   every ${screeningIntervalMin} min
-  Model:       ${llmModel}
+  Health:      every ${healthCheckIntervalMin} min
+		Model:       ${defaultModel}
   Dry run:     ${dryRun}
 
 Run "npm start" to launch the agent.

@@ -1,10 +1,5 @@
-import fs from "fs";
-import path from "path";
-import { fileURLToPath } from "url";
 import { log } from "./logger.js";
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const USER_CONFIG_PATH = process.env.ZENITH_USER_CONFIG_PATH || path.join(__dirname, "user-config.json");
+import { readUserConfigSnapshot } from "./user-config-store.js";
 
 const TOKEN = process.env.TELEGRAM_BOT_TOKEN || null;
 const BASE  = TOKEN ? `https://api.telegram.org/bot${TOKEN}` : null;
@@ -15,12 +10,9 @@ let _polling = false;
 
 // ─── chatId persistence ──────────────────────────────────────────
 function loadChatId() {
-  try {
-    if (fs.existsSync(USER_CONFIG_PATH)) {
-      const cfg = JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8"));
-      if (cfg.telegramChatId) chatId = cfg.telegramChatId;
-    }
-  } catch { /**/ }
+  const snapshot = readUserConfigSnapshot();
+  if (!snapshot.ok) return;
+  if (snapshot.value.telegramChatId) chatId = snapshot.value.telegramChatId;
 }
 
 loadChatId();

@@ -28,6 +28,11 @@ function matchesRole(fact, role = null) {
 
 let shelfCache = new Map();
 
+function buildInvalidMemoryMessage(errors = []) {
+	const details = (Array.isArray(errors) ? errors : [errors]).filter(Boolean).join(" | ");
+	return `[INVALID MEMORY STATE] ${details || "unknown memory corruption"}`;
+}
+
 function ensureDir(dirPath) {
   fs.mkdirSync(dirPath, { recursive: true });
 }
@@ -63,15 +68,22 @@ function nuggetPath(baseDir, name) {
 
 function loadNugget(baseDir, name) {
   const file = nuggetPath(baseDir, name);
-  if (!fs.existsSync(file)) return { name, facts: [] };
+  if (!fs.existsSync(file)) return { name, facts: [], invalid_state: false, error: null };
   try {
     const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
     return {
       name,
       facts: Array.isArray(parsed.facts) ? parsed.facts.map(normalizeFact).filter(Boolean) : [],
+			invalid_state: false,
+			error: null,
     };
-  } catch {
-    return { name, facts: [] };
+  } catch (error) {
+    return {
+			name,
+			facts: [],
+			invalid_state: true,
+			error: `${name}.json: ${error.message}`,
+		};
   }
 }
 
@@ -98,15 +110,26 @@ function normalizeFact(fact) {
   };
 }
 
-function createShelf(baseDir) {
+function createShelf(baseDir, initialErrors = []) {
 	const nuggets = new Map();
-	for (const name of DEFAULT_NUGGETS) nuggets.set(name, loadNugget(baseDir, name));
+	const errors = [...initialErrors];
+	for (const name of DEFAULT_NUGGETS) {
+		const nugget = loadNugget(baseDir, name);
+		if (nugget.invalid_state && nugget.error) errors.push(nugget.error);
+		nuggets.set(name, nugget);
+	}
 	return {
 		baseDir,
 		nuggets,
+		invalid_state: errors.length > 0,
+		errors,
 		getOrCreate(name) {
 			if (!this.nuggets.has(name)) {
 				const nugget = loadNugget(baseDir, name);
+				if (nugget.invalid_state && nugget.error && !this.errors.includes(nugget.error)) {
+					this.invalid_state = true;
+					this.errors.push(nugget.error);
+				}
 				this.nuggets.set(name, nugget);
 				saveNugget(baseDir, nugget);
 			}
@@ -119,6 +142,9 @@ function createShelf(baseDir) {
 			return [...this.nuggets.keys()].map((name) => ({ name }));
 		},
 		persist(nugget) {
+			if (this.invalid_state) {
+				throw new Error(buildInvalidMemoryMessage(this.errors));
+			}
 			saveNugget(baseDir, nugget);
 		},
 		get size() {
@@ -162,6 +188,9 @@ function maybeMigrateLegacyMemory() {
 
 function upsertFact(nuggetName, key, value, options = {}, storeOptions = {}) {
 	const store = getShelf(storeOptions);
+	if (store.invalid_state) {
+		throw new Error(buildInvalidMemoryMessage(store.errors));
+	}
 	const nugget = store.getOrCreate(nuggetName);
   const safeKey = sanitizeKey(key);
   const factValue = String(value || "").slice(0, 400);
@@ -194,6 +223,15 @@ function upsertFact(nuggetName, key, value, options = {}, storeOptions = {}) {
 
 function getFactByKey(nuggetName, key, storeOptions = {}) {
 	const store = getShelf(storeOptions);
+	if (store.invalid_state) {
+		return {
+			store,
+			nugget: { name: nuggetName, facts: [] },
+			fact: null,
+			error: buildInvalidMemoryMessage(store.errors),
+			invalid_state: true,
+		};
+	}
 	const nugget = store.getOrCreate(nuggetName);
   const safeKey = sanitizeKey(key);
   return {
@@ -248,6 +286,15 @@ function scoreFact(fact, query) {
 
 function recallBest(query, nuggetName = null, role = null, storeOptions = {}) {
 	const store = getShelf(storeOptions);
+	if (store.invalid_state) {
+		return {
+			found: false,
+			query,
+			nugget: nuggetName || null,
+			invalid_state: true,
+			error: buildInvalidMemoryMessage(store.errors),
+		};
+	}
   const nuggets = nuggetName
     ? [store.getOrCreate(nuggetName)]
     : [...store.list()].map(({ name }) => store.get(name));
@@ -303,11 +350,16 @@ export function getShelf(storeOptions = {}) {
 		maybeMigrateLegacyMemory();
 	}
 	const mode = storeOptions.mode || "active";
+	const versions = getMemoryVersionStatus();
+	const initialErrors = [];
+	if (mode !== "observational" && versions.invalid_state) {
+		initialErrors.push(`memory-rollout: ${versions.error || "invalid rollout state"}`);
+	}
 	const dir = resolveStoreDir(storeOptions);
 	const cacheKey = `${mode}:${dir}`;
 	if (!shelfCache.has(cacheKey)) {
 		ensureDir(dir);
-		shelfCache.set(cacheKey, createShelf(dir));
+		shelfCache.set(cacheKey, createShelf(dir, initialErrors));
 	}
 	return shelfCache.get(cacheKey);
 }
@@ -340,6 +392,16 @@ export function rememberObservedStrategy(pattern, result) {
 }
 
 export function recallForScreening(poolData, storeOptions = { mode: "active" }) {
+	const store = getShelf(storeOptions);
+	if (store.invalid_state) {
+		return [{
+			source: "memory_invalid",
+			key: "invalid_memory_state",
+			answer: buildInvalidMemoryMessage(store.errors),
+			confidence: 0,
+			invalid_state: true,
+		}];
+	}
   const results = [];
 
   if (poolData?.bin_step) {
@@ -364,6 +426,16 @@ export function recallForScreening(poolData, storeOptions = { mode: "active" }) 
 }
 
 export function recallForManagement(position, storeOptions = { mode: "active" }) {
+	const store = getShelf(storeOptions);
+	if (store.invalid_state) {
+		return [{
+			source: "memory_invalid",
+			key: "invalid_memory_state",
+			answer: buildInvalidMemoryMessage(store.errors),
+			confidence: 0,
+			invalid_state: true,
+		}];
+	}
   const results = [];
 
   if (position?.strategy && position?.bin_step != null) {
@@ -389,6 +461,9 @@ export function recallForManagement(position, storeOptions = { mode: "active" })
 
 export function getMemoryContext(agentType = "GENERAL", storeOptions = { mode: "active" }) {
 	const store = getShelf(storeOptions);
+	if (store.invalid_state) {
+		return buildInvalidMemoryMessage(store.errors);
+	}
   const facts = [];
 	const normalizedRole = String(agentType || "GENERAL").toLowerCase();
 
@@ -503,7 +578,10 @@ export function rememberWalletScores({ pool_address, pool_name = null, scored_wa
 export function getWalletScoreMemory(poolAddress) {
   if (!poolAddress) return { found: false, error: "poolAddress required" };
 
-	const { store, nugget, fact } = getFactByKey("wallet_scores", `wallet-score-${poolAddress}`, { mode: "observational" });
+	const { store, nugget, fact, error, invalid_state } = getFactByKey("wallet_scores", `wallet-score-${poolAddress}`, { mode: "observational" });
+	if (invalid_state) {
+		return { found: false, pool_address: poolAddress, invalid_state: true, error };
+	}
   if (!fact) {
     return { found: false, pool_address: poolAddress };
   }
@@ -654,7 +732,16 @@ export function rememberObservedTokenTypeDistribution(payload) {
 }
 
 export function getTokenTypeDistributionMemory(distributionKey = null, storeOptions = { mode: "active" }) {
-	const nugget = getShelf(storeOptions).getOrCreate("distribution_stats");
+	const store = getShelf(storeOptions);
+	if (store.invalid_state) {
+		return {
+			total: 0,
+			distributions: [],
+			invalid_state: true,
+			error: buildInvalidMemoryMessage(store.errors),
+		};
+	}
+	const nugget = store.getOrCreate("distribution_stats");
   const facts = distributionKey
     ? nugget.facts.filter((fact) => fact.data?.distribution_key === distributionKey)
     : nugget.facts;

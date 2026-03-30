@@ -1,24 +1,14 @@
-import path from "node:path";
-import { fileURLToPath } from "node:url";
-
 import {
 	readJsonSnapshotWithBackupSync,
 	writeJsonSnapshotAtomicSync,
 } from "./durable-store.js";
+import { applyMutableConfigValues, normalizeMutableConfigChanges } from "./config-registry.js";
 import { writeEvidenceBundle } from "./evidence-bundles.js";
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
+import { readUserConfigSnapshot, writeUserConfigSnapshot } from "./user-config-store.js";
 const MIN_EVOLVE_POSITIONS = 5;
 const MAX_CHANGE_PER_STEP = 0.2;
 const MIN_ROLLOUT_CLOSES = 5;
 const ROLLOUT_MAX_HISTORY = 25;
-
-function getUserConfigPath() {
-	return (
-		process.env.ZENITH_USER_CONFIG_PATH ||
-		path.join(__dirname, "user-config.json")
-	);
-}
 
 function getLessonsFile() {
 	return process.env.ZENITH_LESSONS_FILE || "./lessons.json";
@@ -141,31 +131,43 @@ function getPerformanceSnapshot(perfRows) {
 	};
 }
 
-function writeScreeningKeysToUserConfig(values) {
-	const userConfigPath = getUserConfigPath();
-	const snapshot = readJsonSnapshotWithBackupSync(userConfigPath);
-	if (!snapshot.value && snapshot.error) {
+function normalizeScreeningValues(values, config) {
+	const { normalized, errors } = normalizeMutableConfigChanges(values, config);
+	if (errors.length > 0) {
+		return { pass: false, error: errors.join("; ") };
+	}
+	return {
+		pass: true,
+		values: Object.fromEntries(
+			Object.entries(normalized).filter(([key]) => ["minFeeActiveTvlRatio", "minOrganic"].includes(key)),
+		),
+	};
+}
+
+function writeScreeningKeysToUserConfig(values, config) {
+	const snapshot = readUserConfigSnapshot();
+	if (!snapshot.ok) {
 		return { pass: false, error: snapshot.error };
 	}
+	const normalized = normalizeScreeningValues(values, config);
+	if (!normalized.pass) return normalized;
 	const userConfig = snapshot.value || {};
-	Object.assign(userConfig, values);
+	Object.assign(userConfig, normalized.values);
 	userConfig._lastEvolved = new Date().toISOString();
-	writeJsonSnapshotAtomicSync(userConfigPath, userConfig);
+	writeUserConfigSnapshot(userConfig);
 	return { pass: true };
 }
 
 function applyScreeningChangesToConfig(config, values) {
-	const s = config.screening;
-	if (values.minFeeActiveTvlRatio != null)
-		s.minFeeActiveTvlRatio = values.minFeeActiveTvlRatio;
-	if (values.minOrganic != null) s.minOrganic = values.minOrganic;
+	const normalized = normalizeScreeningValues(values, config);
+	if (!normalized.pass) throw new Error(normalized.error);
+	applyMutableConfigValues(config, normalized.values, ["Screening"]);
 }
 
 function revertScreeningChangesInConfig(config, previousValues = {}) {
-	const s = config.screening;
-	if (previousValues.minFeeActiveTvlRatio != null)
-		s.minFeeActiveTvlRatio = previousValues.minFeeActiveTvlRatio;
-	if (previousValues.minOrganic != null) s.minOrganic = previousValues.minOrganic;
+	const normalized = normalizeScreeningValues(previousValues, config);
+	if (!normalized.pass) throw new Error(normalized.error);
+	applyMutableConfigValues(config, normalized.values, ["Screening"]);
 }
 
 function buildActiveRollout({
@@ -222,7 +224,7 @@ export function recoverThresholdRolloutState(config, { trigger = "recovery" } = 
 		const configWrite = writeScreeningKeysToUserConfig({
 			...(active.new_values || {}),
 			_positionsAtEvolution: active.start_positions_count,
-		});
+		}, config);
 		if (!configWrite.pass) {
 			return invalidState("EVOLVE_CONFIG_STATE_INVALID", configWrite.error, trigger);
 		}
@@ -242,7 +244,7 @@ export function recoverThresholdRolloutState(config, { trigger = "recovery" } = 
 	}
 
 	if (active.phase === "rollback_pending") {
-		const rollbackWrite = writeScreeningKeysToUserConfig(active.previous_values || {});
+		const rollbackWrite = writeScreeningKeysToUserConfig(active.previous_values || {}, config);
 		if (!rollbackWrite.pass) {
 			return invalidState("EVOLVE_CONFIG_STATE_INVALID", rollbackWrite.error, trigger);
 		}
@@ -341,7 +343,7 @@ function evaluatePendingThresholdRollout(perfData, config, { trigger = "auto", l
 		} catch (error) {
 			return invalidState("EVOLVE_ROLLOUT_STATE_INVALID", error.message, trigger);
 		}
-		const rollbackWrite = writeScreeningKeysToUserConfig(active.previous_values || {});
+		const rollbackWrite = writeScreeningKeysToUserConfig(active.previous_values || {}, config);
 		if (!rollbackWrite.pass) {
 			return invalidState("EVOLVE_CONFIG_STATE_INVALID", rollbackWrite.error, trigger);
 		}
@@ -602,7 +604,7 @@ export function evolveThresholds(perfData, config, { trigger = "auto" } = {}) {
 			history: rolloutState.history || [],
 		});
 	} catch (error) {
-		const rollbackWrite = writeScreeningKeysToUserConfig(previousValues);
+		const rollbackWrite = writeScreeningKeysToUserConfig(previousValues, config);
 		revertScreeningChangesInConfig(config, previousValues);
 		writeEvolutionEvidence({
 			status: "blocked_invalid_state",
@@ -644,7 +646,7 @@ export function evolveThresholds(perfData, config, { trigger = "auto" } = {}) {
 	const configWrite = writeScreeningKeysToUserConfig({
 		...changes,
 		_positionsAtEvolution: effectivePerfData.length,
-	});
+	}, config);
 	if (!configWrite.pass) {
 		return invalidState("EVOLVE_CONFIG_STATE_INVALID", configWrite.error, trigger);
 	}

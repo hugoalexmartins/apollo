@@ -9,6 +9,7 @@ import bs58 from "bs58";
 import { log } from "../logger.js";
 import { config } from "../config.js";
 import { fetchWithTimeout } from "./fetch-utils.js";
+import { buildSafeSendOptions } from "./solana-send-options.js";
 
 let _connection = null;
 let _wallet = null;
@@ -261,7 +262,7 @@ async function swapViaQuoteApi({ wallet, connection, input_mint, output_mint, am
   // ─── Sign and send ─────────────────────────────────────────
   const tx = VersionedTransaction.deserialize(Buffer.from(swapTransaction, "base64"));
   tx.sign([wallet]);
-  const txHash = await connection.sendRawTransaction(tx.serialize(), { skipPreflight: true });
+	const txHash = await connection.sendRawTransaction(tx.serialize(), buildSafeSendOptions());
   await connection.confirmTransaction(txHash, "confirmed");
 
   log("swap", `SUCCESS (fallback) tx: ${txHash}`);

@@ -239,7 +239,14 @@ export async function recordPerformance(perf) {
 			result?.requires_reload ||
 			(result?.changes && Object.keys(result.changes).length > 0)
 		) {
-			reloadScreeningThresholds();
+			const reload = reloadScreeningThresholds();
+			if (reload?.success === false) {
+				log(
+					"evolve",
+					`Auto-evolved thresholds persisted but runtime reload failed: ${reload.error}`,
+				);
+				return;
+			}
 			if (result?.changes && Object.keys(result.changes).length > 0) {
 				log(
 					"evolve",

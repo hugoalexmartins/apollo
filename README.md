@@ -33,7 +33,7 @@ Two specialized agents run on independent schedules:
 | **Hunter Alpha** | Every 30 min | Screening and deployment into the best current candidate |
 | **Healer Alpha** | Every 3 min | Position management, fee handling, and rebalance/exit decisions |
 
-A third health check runs hourly to summarize portfolio state.
+A third health check runs on `healthCheckIntervalMin` (default `60`) to summarize portfolio state.
 
 **Current runtime behavior:**
 - Screening and model-managed management now generate one structured thesis per actual decision, not a vague free-form explanation: each thesis carries evidence rows, signal freshness, contradictions, confidence, invalidation conditions, and a stable `thesis_id`
@@ -55,6 +55,9 @@ A third health check runs hourly to summarize portfolio state.
 - Operator state and evidence reads now use backup-aware tolerance, bringing `operator-controls.js` and `evidence-bundles.js` closer to the durability standard already used by `state.js` and `runtime-health.js`
 - Threshold evolution now runs through one safe live engine for both automatic and manual `/evolve`: only `minFeeActiveTvlRatio` and `minOrganic`, only realized-close data, one active rollout at a time, bounded step size, automatic rollback on degradation, fail-closed invalid-state handling, and evidence on every mutation decision
 - Threshold-rollout startup recovery now handles `apply_pending` and `rollback_pending` phases explicitly so config mutation cannot outrun persisted rollout intent/state after a crash
+- Mutable runtime config now has one actual source of truth: `config-registry.js` governs key discovery, help text, normalization, semantic validation, and cross-field checks for startup hydration, `update_config`, threshold evolution, and shared config readers
+- Startup now fails closed on invalid persisted mutable config instead of silently booting with semantically bad `user-config.json` values, and `reloadScreeningThresholds()` now validates screening keys through the same registry path instead of doing a looser snapshot replay
+- `setup.js` now persists split model keys (`managementModel`, `screeningModel`, `generalModel`) plus `healthCheckIntervalMin`, and shared config readers like Hive Mind now honor `ZENITH_USER_CONFIG_PATH` through `user-config-store.js`
 - Live governance now routes through shared runtime policy helpers: screening skip logic, deploy admission, exposure checks, and tracked-position exit rules no longer each own separate decision math
 - Deploy and close actions now preserve `cycle_id`, `action_id`, and `workflow_id` through executor dispatch, tracked-position state, realized performance rows, replay envelopes, and counterfactual resolution
 - Screening and management success paths now persist replay envelopes as well as failure paths, so deterministic review no longer depends only on degraded-cycle evidence
@@ -157,7 +160,7 @@ Use the interactive setup:
 npm run setup
 ```
 
-Or copy `user-config.example.json` to `user-config.json` and edit it manually.
+Or copy `user-config.example.json` to `user-config.json` and edit it manually. Invalid mutable runtime values now fail closed at boot and on reload, so hand-edited config needs to respect the same schedule and bounds rules enforced by `update_config`.
 
 `user-config.json` is for runtime settings only. Keep wallet secrets in `.env`; setup now writes `WALLET_PRIVATE_KEY` there instead of persisting it in `user-config.json`.
 
@@ -189,7 +192,7 @@ Edit `user-config.json`. The example file is a starting point; the runtime defau
 | `minSolToOpen` | `0.55` | Minimum SOL balance before opening a new position |
 | `managementIntervalMin` | `3` | Default management cadence |
 | `screeningIntervalMin` | `30` | Default screening cadence |
-| `healthCheckIntervalMin` | `60` | Default health-summary cadence |
+| `healthCheckIntervalMin` | `60` | Health-summary cadence; must be `<60`, exactly `60`, an hourly multiple under `1440`, or exactly `1440` |
 | `managementModel` | `openrouter/healer-alpha` | LLM model for position management |
 | `screeningModel` | `openrouter/hunter-alpha` | LLM model for pool screening |
 | `generalModel` | `openrouter/healer-alpha` | LLM model for REPL chat and general prompts |
@@ -479,7 +482,7 @@ Zenith now has focused provider-free checks for important deterministic control 
 - `counterfactual-review.test.js` — observational counterfactual review persistence
 - `tools/study.test.js` — bounded LPAgent-disabled study fallback behavior
 
-Not every focused test is wired into `npm run test:hardening`; the main remaining targeted regression suite outside the hardening gate is the broader `memory.test.js`, which should still be run explicitly when working in that area.
+Most focused runtime-hardening suites are now wired into `npm run test:hardening`, including the config-registry, config boot/reload, schedule-runtime, Hive Mind config-path, and update-config tests. The broader `memory.test.js` is also part of the hardening gate now.
 
 Manual external smoke still exists for screening and the full agent path (`npm run test:screen`, `npm run test:agent`), but `npm run test:hardening` is the stronger reproducible signal for the deterministic control plane. The screening smoke now injects an empty-position view so it remains wallet-free while still exercising live discovery/detail reads.
 

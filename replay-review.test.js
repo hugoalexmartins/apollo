@@ -95,3 +95,34 @@ test("replay review surfaces parse errors while keeping valid envelopes readable
 		fs.rmSync(tempDir, { recursive: true, force: true });
 	}
 });
+
+test("replay review uses envelope management_config instead of live config drift", () => {
+	const originalCwd = process.cwd();
+	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "zenith-replay-review-config-test-"));
+
+	try {
+		process.chdir(tempDir);
+		fs.mkdirSync("logs", { recursive: true });
+
+		appendReplayEnvelope({
+			cycle_id: "management-review-config-1",
+			cycle_type: "management",
+			management_config: {
+				emergencyPriceDropPct: -50,
+				takeProfitFeePct: 5,
+				minFeePerTvl24h: 7,
+				minClaimAmount: 5,
+			},
+			position_inputs: [{ position: "pos-1", in_range: false, minutes_out_of_range: 12, pnl: { volatility: 6 } }],
+			runtime_actions: [{ position: "pos-1", tool: "rebalance_on_exit", rule: "out_of_range_rebalance", thesis: null, critic: null, result: { status: "success", reason: null } }],
+			write_workflows: [{ tool: "rebalance_on_exit" }],
+		});
+
+		const review = getReplayReview("management-review-config-1");
+		assert.equal(review.found, true);
+		assert.equal(review.reconciliation.status, "match");
+	} finally {
+		process.chdir(originalCwd);
+		fs.rmSync(tempDir, { recursive: true, force: true });
+	}
+});

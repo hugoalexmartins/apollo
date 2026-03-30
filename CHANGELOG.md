@@ -6,6 +6,10 @@ This file documents the major additions and behavior changes present in this for
 
 ### 2026-03-30
 
+- Closed the remaining config-truth and edge-entry semantics gaps: boot config hydration now validates persisted mutable config through the shared registry, `reloadScreeningThresholds()` now validates screening keys through the same registry path, threshold-rollout screening writes now normalize before write/apply/revert, and `healthCheckIntervalMin` is now a real scheduled runtime setting instead of a dead config field.
+- Centralized mutable config truth in `config-registry.js` across runtime mutation, startup hydration, tool help text, and semantic validation; added stricter bounds and cross-field checks for schedule cadence, deploy sizing, TVL/MCAP ranges, and other mutable runtime knobs.
+- Moved remaining config readers/writers onto `user-config-store.js`, including `hive-mind.js` and `setup.js`, and updated setup to persist split model keys plus health-check cadence instead of the old umbrella `llmModel` path.
+- Added and wired hardening coverage for the last config/schedule semantics edge cases, including `config.test.js`, `schedule-runtime.test.js`, `hive-mind.test.js`, and `tools/update-config.test.js`; `npm run test:hardening` now passes with the final config-truth closure in place.
 - Made the shadow lane best-effort instead of a hard dependency, so active screening and management theses still run when shadow inference fails or times out.
 - Fixed misleading workflow-state reporting across screening and management: discovery-provider failures now surface as `failed_candidates`, errored approved writes surface as `failed_write`, and blocked runtime actions can escalate into model review instead of quietly dying in runtime-only handling.
 - Tightened finalist selection so enriched hard-blocked candidates no longer poison the top-finalist window; screening now backfills replacement finalists from the shortlist before thesis generation.

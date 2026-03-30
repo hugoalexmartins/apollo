@@ -60,7 +60,24 @@ export async function runThresholdEvolutionCommand({
 	}
 
 	if (result.requires_reload || (result.changes && Object.keys(result.changes).length > 0)) {
-		reloadScreeningThresholds();
+		const reload = reloadScreeningThresholds();
+		if (reload?.success === false) {
+			recordAction({
+				type: "evolve_thresholds_reload_failed",
+				error: reload.error,
+				reason_code: reload.reason_code,
+				rollout_status: result.rollout?.status || null,
+				rollout_id: result.rollout?.rollout_id || null,
+			});
+			return {
+				status: "blocked",
+				message: `Threshold evolution persisted, but runtime reload failed: ${reload.error}`,
+				result: {
+					...result,
+					reload,
+				},
+			};
+		}
 	}
 	recordAction({
 		type: "evolve_thresholds_applied",

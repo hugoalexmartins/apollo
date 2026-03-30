@@ -516,6 +516,7 @@ export function createScreeningCycleRunner(deps) {
 				status: "skipped_no_candidates",
 				summary: screeningEvaluation.summary,
 				total_screened: screeningTopCandidates?.total_screened ?? 0,
+				screening_config: regimeContext.effectiveScreeningConfig,
 				candidate_inputs: screeningTopCandidates?.candidate_inputs || [],
 				occupied_pools: screeningTopCandidates?.occupied_pools || [],
 				occupied_mints: screeningTopCandidates?.occupied_mints || [],
@@ -768,6 +769,7 @@ export function createScreeningCycleRunner(deps) {
 			occupied_pools: screeningTopCandidates?.occupied_pools || [],
 			occupied_mints: screeningTopCandidates?.occupied_mints || [],
 			candidate_inputs: screeningTopCandidates?.candidate_inputs || [],
+			screening_config: regimeContext.effectiveScreeningConfig,
 			shortlist: shortlist.map((pool) => ({
 				pool: pool.pool,
 				name: pool.name,

@@ -81,3 +81,26 @@ test("runManagementDecisionEngine keeps active decision when shadow thesis fails
 	assert.equal(result.shadow.available, false);
 	assert.equal(result.comparison.shadow_available, false);
 });
+
+test("runScreeningDecisionEngine fails closed when active memory context is invalid", async () => {
+	const result = await runScreeningDecisionEngine({
+		agentLoop: async () => {
+			throw new Error("should not call model when active memory is invalid");
+		},
+		cycle_id: "screening-invalid-memory",
+		config: { llm: { screeningModel: "test-model" } },
+		strategyBlock: "ACTIVE STRATEGY: demo",
+		regimeContext: { regime: "neutral", reason: "manual" },
+		deployAmount: 0.5,
+		candidateContext: "candidate context",
+		finalists: [{ pool: "pool-1", name: "Alpha-SOL", deterministic_score: 91, hard_blocked: false }],
+		strategy: "spot",
+		recentPerformance: [],
+		getMemoryContextRuntime: (_role, options) => options?.mode === "active" ? "[INVALID MEMORY STATE] strategies.json: bad json" : null,
+		getMemoryVersionStatusRuntime: () => ({ active_version: "policy-v1", shadow_version: "policy-shadow-v1" }),
+	});
+
+	assert.equal(result.active.critic.pass, false);
+	assert.equal(result.active.thesis.action, "hold");
+	assert.match(result.active.thesis.summary, /invalid memory state/i);
+});

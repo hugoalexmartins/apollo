@@ -1,14 +1,13 @@
-import fs from "fs";
-import path from "path";
-import { fileURLToPath } from "url";
 import { computeAdaptiveDeployAmount, getEffectiveMinSolToOpen, normalizeOptionalNonNegativeNumber } from "./runtime-helpers.js";
+import { applyMutableConfigValues, getMutableConfigEntry, normalizeMutableConfigChanges } from "./config-registry.js";
+import { readUserConfigSnapshot } from "./user-config-store.js";
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const USER_CONFIG_PATH = process.env.ZENITH_USER_CONFIG_PATH || path.join(__dirname, "user-config.json");
-
-const u = fs.existsSync(USER_CONFIG_PATH)
-  ? JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8"))
-  : {};
+const initialUserConfig = readUserConfigSnapshot();
+if (!initialUserConfig.ok) {
+	throw new Error(initialUserConfig.error);
+}
+const u = initialUserConfig.value;
+const legacyModel = u.llmModel ?? process.env.LLM_MODEL;
 
 export const secretHealth = {
   wallet_key_source: process.env.WALLET_PRIVATE_KEY ? "env" : "missing",
@@ -16,7 +15,6 @@ export const secretHealth = {
 
 // Apply wallet/RPC from user-config if not already in env
 if (u.rpcUrl)    process.env.RPC_URL            ||= u.rpcUrl;
-if (u.llmModel)  process.env.LLM_MODEL          ||= u.llmModel;
 if (u.dryRun !== undefined) process.env.DRY_RUN ||= String(u.dryRun);
 
 export const config = {
@@ -103,9 +101,9 @@ export const config = {
     temperature: u.temperature ?? 0.373,
     maxTokens:   u.maxTokens   ?? 4096,
     maxSteps:    u.maxSteps    ?? 20,
-    managementModel: u.managementModel ?? process.env.LLM_MODEL ?? "openrouter/healer-alpha",
-    screeningModel:  u.screeningModel  ?? process.env.LLM_MODEL ?? "openrouter/hunter-alpha",
-    generalModel:    u.generalModel    ?? process.env.LLM_MODEL ?? "openrouter/healer-alpha",
+		managementModel: u.managementModel ?? legacyModel ?? "openrouter/healer-alpha",
+		screeningModel:  u.screeningModel  ?? legacyModel ?? "openrouter/hunter-alpha",
+		generalModel:    u.generalModel    ?? legacyModel ?? "openrouter/healer-alpha",
   },
 
   // ─── Common Token Mints ────────────────
@@ -115,6 +113,17 @@ export const config = {
     USDT: "Es9vMFrzaCERmJfrF4H2FYD4KCoNkY11McCe8BenwNYB",
   },
 };
+
+const bootNormalized = normalizeMutableConfigChanges(u, config);
+if (bootNormalized.errors.length > 0) {
+	throw new Error(`Invalid mutable user config: ${bootNormalized.errors.join("; ")}`);
+}
+applyMutableConfigValues(config, bootNormalized.normalized);
+recomputeManagementDerivedValues({
+	minSolToOpen: Object.hasOwn(u, "minSolToOpen") ? u.minSolToOpen : config.management.minSolToOpen,
+	deployAmountSol: Object.hasOwn(u, "deployAmountSol") ? u.deployAmountSol : config.management.deployAmountSol,
+	gasReserve: Object.hasOwn(u, "gasReserve") ? u.gasReserve : config.management.gasReserve,
+});
 
 /**
  * Compute the optimal deploy amount for a given wallet balance.
@@ -155,33 +164,48 @@ export function computeDeployAmount(walletSol, {
   });
 }
 
+export function recomputeManagementDerivedValues(overrides = {}) {
+	config.management.minSolToOpen = getEffectiveMinSolToOpen({
+		minSolToOpen: overrides.minSolToOpen ?? config.management.minSolToOpen,
+		deployAmountSol: overrides.deployAmountSol ?? config.management.deployAmountSol,
+		gasReserve: overrides.gasReserve ?? config.management.gasReserve,
+	});
+	return {
+		minSolToOpen: config.management.minSolToOpen,
+	};
+}
+
 /**
  * Reload user-config.json and apply updated screening thresholds to the
  * in-memory config object. Called after threshold evolution so the next
  * agent cycle uses the evolved values without a restart.
  */
 export function reloadScreeningThresholds() {
-  if (!fs.existsSync(USER_CONFIG_PATH)) return;
-  try {
-    const fresh = JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8"));
-    const s = config.screening;
-    const hasOwn = (key) => Object.hasOwn(fresh, key);
-    if (fresh.minFeeActiveTvlRatio != null) s.minFeeActiveTvlRatio = fresh.minFeeActiveTvlRatio;
-    if (fresh.minOrganic     != null) s.minOrganic     = fresh.minOrganic;
-    if (fresh.minHolders     != null) s.minHolders     = fresh.minHolders;
-    if (fresh.minMcap        != null) s.minMcap        = fresh.minMcap;
-    if (fresh.maxMcap        != null) s.maxMcap        = fresh.maxMcap;
-    if (fresh.minTvl         != null) s.minTvl         = fresh.minTvl;
-    if (fresh.maxTvl         != null) s.maxTvl         = fresh.maxTvl;
-    if (fresh.minVolume      != null) s.minVolume      = fresh.minVolume;
-    if (fresh.minBinStep     != null) s.minBinStep     = fresh.minBinStep;
-    if (fresh.maxBinStep     != null) s.maxBinStep     = fresh.maxBinStep;
-    if (fresh.maxBundlersPct != null) s.maxBundlersPct = fresh.maxBundlersPct;
-    if (fresh.maxTop10Pct    != null) s.maxTop10Pct    = fresh.maxTop10Pct;
-    if (fresh.maxBundlePct   != null) s.maxBundlePct   = fresh.maxBundlePct;
-    if (hasOwn("minTokenAgeHours")) s.minTokenAgeHours = normalizeOptionalNonNegativeNumber(fresh.minTokenAgeHours, s.minTokenAgeHours);
-    if (hasOwn("maxTokenAgeHours")) s.maxTokenAgeHours = normalizeOptionalNonNegativeNumber(fresh.maxTokenAgeHours, s.maxTokenAgeHours);
-    if (fresh.timeframe      != null) s.timeframe      = fresh.timeframe;
-    if (fresh.category       != null) s.category       = fresh.category;
-  } catch { /* ignore */ }
+  const snapshot = readUserConfigSnapshot();
+  if (!snapshot.ok) {
+		return {
+			success: false,
+			reason_code: "USER_CONFIG_INVALID",
+			error: snapshot.error,
+		};
+	}
+
+	const screeningOnly = Object.fromEntries(
+		Object.entries(snapshot.value).filter(([key]) => getMutableConfigEntry(key)?.group === "Screening"),
+	);
+	const normalized = normalizeMutableConfigChanges(screeningOnly, config);
+	if (normalized.errors.length > 0) {
+		return {
+			success: false,
+			reason_code: "USER_CONFIG_INVALID",
+			error: `Invalid screening config during reload: ${normalized.errors.join("; ")}`,
+		};
+	}
+	applyMutableConfigValues(config, normalized.normalized, ["Screening"]);
+
+	return {
+		success: true,
+		reason_code: null,
+		error: null,
+	};
 }

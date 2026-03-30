@@ -26,6 +26,10 @@ function buildReadOnlyOptions(memoryContextOverride, stateSnapshot = null) {
 	};
 }
 
+function isInvalidMemoryContext(memoryContext) {
+	return typeof memoryContext === "string" && memoryContext.startsWith("[INVALID MEMORY STATE]");
+}
+
 function buildSettledThesis(result, {
 	parser,
 	fallback,
@@ -187,9 +191,15 @@ export async function runScreeningDecisionEngine({
 }) {
 	const versions = getMemoryVersionStatusRuntime();
 	const prompt = buildScreeningPrompt({ strategyBlock, regimeContext, deployAmount, candidateContext, finalists });
+	const activeMemoryContext = getMemoryContextRuntime("SCREENER", { mode: "active" });
+	const shadowMemoryContext = getMemoryContextRuntime("SCREENER", { mode: "shadow" });
 	const [activeResponse, shadowResponse] = await Promise.allSettled([
-		agentLoop(prompt, 1, [], "SCREENER", config.llm.screeningModel, 2048, buildReadOnlyOptions(getMemoryContextRuntime("SCREENER", { mode: "active" }), stateSnapshot)),
-		agentLoop(prompt, 1, [], "SCREENER", config.llm.screeningModel, 2048, buildReadOnlyOptions(getMemoryContextRuntime("SCREENER", { mode: "shadow" }), stateSnapshot)),
+		isInvalidMemoryContext(activeMemoryContext)
+			? Promise.reject(new Error(activeMemoryContext))
+			: agentLoop(prompt, 1, [], "SCREENER", config.llm.screeningModel, 2048, buildReadOnlyOptions(activeMemoryContext, stateSnapshot)),
+		isInvalidMemoryContext(shadowMemoryContext)
+			? Promise.reject(new Error(shadowMemoryContext))
+			: agentLoop(prompt, 1, [], "SCREENER", config.llm.screeningModel, 2048, buildReadOnlyOptions(shadowMemoryContext, stateSnapshot)),
 	]);
 
 	const activeContext = {
@@ -284,9 +294,15 @@ export async function runManagementDecisionEngine({
 }) {
 	const versions = getMemoryVersionStatusRuntime();
 	const prompt = buildManagementPrompt(positionBlock);
+	const activeMemoryContext = getMemoryContextRuntime("MANAGER", { mode: "active" });
+	const shadowMemoryContext = getMemoryContextRuntime("MANAGER", { mode: "shadow" });
 	const [activeResponse, shadowResponse] = await Promise.allSettled([
-		agentLoop(prompt, 1, [], "MANAGER", config.llm.managementModel, 2048, buildReadOnlyOptions(getMemoryContextRuntime("MANAGER", { mode: "active" }), stateSnapshot)),
-		agentLoop(prompt, 1, [], "MANAGER", config.llm.managementModel, 2048, buildReadOnlyOptions(getMemoryContextRuntime("MANAGER", { mode: "shadow" }), stateSnapshot)),
+		isInvalidMemoryContext(activeMemoryContext)
+			? Promise.reject(new Error(activeMemoryContext))
+			: agentLoop(prompt, 1, [], "MANAGER", config.llm.managementModel, 2048, buildReadOnlyOptions(activeMemoryContext, stateSnapshot)),
+		isInvalidMemoryContext(shadowMemoryContext)
+			? Promise.reject(new Error(shadowMemoryContext))
+			: agentLoop(prompt, 1, [], "MANAGER", config.llm.managementModel, 2048, buildReadOnlyOptions(shadowMemoryContext, stateSnapshot)),
 	]);
 
 	const activeContext = {

@@ -21,6 +21,8 @@ function replayScreeningSkipEnvelope(envelope) {
 			performanceMultiplier: sizingInputs.performance_multiplier,
 			riskMultiplier: sizingInputs.risk_multiplier,
 			skipBelowFloor: true,
+			floorOverride: sizingInputs.deploy_floor_sol,
+			reserveOverride: sizingInputs.reserve_sol,
 		});
 		return {
 			cycle_id: envelope?.cycle_id || null,
@@ -40,6 +42,7 @@ function replayScreeningSkipEnvelope(envelope) {
 			occupiedPools: new Set(envelope?.occupied_pools || []),
 			occupiedMints: new Set(envelope?.occupied_mints || []),
 			limit: envelope?.shortlist_limit || (envelope?.candidate_inputs || []).length,
+			screeningConfig: envelope?.screening_config,
 		});
 		return {
 			cycle_id: envelope?.cycle_id || null,
@@ -79,6 +82,7 @@ export function replayScreeningEnvelope(envelope) {
     occupiedPools,
     occupiedMints,
     limit,
+		screeningConfig: envelope?.screening_config,
   });
 
   return {
@@ -107,12 +111,15 @@ export function replayManagementEnvelope(envelope, config) {
 	}
 
 	const positions = envelope?.position_inputs || [];
+	const effectiveConfig = {
+		management: envelope?.management_config || config.management,
+	};
 
   return {
     cycle_id: envelope?.cycle_id || null,
     actions: positions
       .map((position) => {
-        const planned = planManagementRuntimeAction(position, config);
+        const planned = planManagementRuntimeAction(position, effectiveConfig);
         if (!planned) return null;
         return {
           position: position.position,

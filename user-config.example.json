@@ -1,5 +1,4 @@
 {
-  "preset": "custom",
   "rpcUrl": "https://pump.helius-rpc.com",
   "deployAmountSol": 1,
   "maxPositions": 3,
@@ -52,9 +51,6 @@
   "generalModel": "minimax/minimax-m2.7",
   "dryRun": false,
   "telegramChatId": "",
-  "_lastEvolved": "",
-  "_positionsAtEvolution": 25,
-  "_lastAgentTune": "",
   "hiveMindUrl": "",
   "hiveMindApiKey": ""
 }

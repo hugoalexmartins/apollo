@@ -1,7 +1,4 @@
 import { execSync, spawn } from "node:child_process";
-import fs from "node:fs";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
 
 import { appendActionLifecycle } from "../action-journal.js";
 import { config } from "../config.js";
@@ -83,10 +80,8 @@ import { handleSuccessfulToolSideEffects } from "./executor-side-effects.js";
 import { discoverPools, getPoolDetail, getTopCandidates } from "./screening.js";
 import { getPoolInfo, scoreTopLPers, studyTopLPers } from "./study.js";
 import { getTokenHolders, getTokenInfo, getTokenNarrative } from "./token.js";
+import { runUpdateConfig } from "./update-config.js";
 import { getWalletBalances, swapToken } from "./wallet.js";
-
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const USER_CONFIG_PATH = path.join(__dirname, "../user-config.json");
 
 const executorTestOverrides = {
 	getMyPositions: null,
@@ -334,160 +329,11 @@ const toolMap = {
 		}
 		return { error: "invalid mode" };
 	},
-	update_config: ({ changes, reason = "" }) => {
-		// Flat key → config section mapping (covers everything in config.js)
-		const CONFIG_MAP = {
-			// screening
-			minFeeActiveTvlRatio: ["screening", "minFeeActiveTvlRatio"],
-			minTvl: ["screening", "minTvl"],
-			maxTvl: ["screening", "maxTvl"],
-			minVolume: ["screening", "minVolume"],
-			minOrganic: ["screening", "minOrganic"],
-			minHolders: ["screening", "minHolders"],
-			minMcap: ["screening", "minMcap"],
-			maxMcap: ["screening", "maxMcap"],
-			minBinStep: ["screening", "minBinStep"],
-			maxBinStep: ["screening", "maxBinStep"],
-			timeframe: ["screening", "timeframe"],
-			category: ["screening", "category"],
-			minTokenFeesSol: ["screening", "minTokenFeesSol"],
-			maxBundlersPct: ["screening", "maxBundlersPct"],
-			maxTop10Pct: ["screening", "maxTop10Pct"],
-			// protections
-			protectionsEnabled: ["protections", "enabled"],
-			maxRecentRealizedLossUsd: ["protections", "maxRecentRealizedLossUsd"],
-			maxDrawdownPct: ["protections", "maxDrawdownPct"],
-			maxOpenUnrealizedLossUsd: ["protections", "maxOpenUnrealizedLossUsd"],
-			recentLossWindowHours: ["protections", "recentLossWindowHours"],
-			stopLossStreakLimit: ["protections", "stopLossStreakLimit"],
-			portfolioPauseMinutes: ["protections", "pauseMinutes"],
-			maxReviewedCloses: ["protections", "maxReviewedCloses"],
-			recoveryResumeOverrideMinutes: [
-				"protections",
-				"recoveryResumeOverrideMinutes",
-			],
-			// management
-			minClaimAmount: ["management", "minClaimAmount"],
-			autoSwapAfterClaim: ["management", "autoSwapAfterClaim"],
-			outOfRangeBinsToClose: ["management", "outOfRangeBinsToClose"],
-			outOfRangeWaitMinutes: ["management", "outOfRangeWaitMinutes"],
-			minVolumeToRebalance: ["management", "minVolumeToRebalance"],
-			emergencyPriceDropPct: ["management", "emergencyPriceDropPct"],
-			stopLossPct: ["management", "stopLossPct"],
-			takeProfitFeePct: ["management", "takeProfitFeePct"],
-			trailingTakeProfit: ["management", "trailingTakeProfit"],
-			trailingTriggerPct: ["management", "trailingTriggerPct"],
-			trailingDropPct: ["management", "trailingDropPct"],
-			minSolToOpen: ["management", "minSolToOpen"],
-			deployAmountSol: ["management", "deployAmountSol"],
-			gasReserve: ["management", "gasReserve"],
-			positionSizePct: ["management", "positionSizePct"],
-			// risk
-			maxPositions: ["risk", "maxPositions"],
-			maxDeployAmount: ["risk", "maxDeployAmount"],
-			// schedule
-			managementIntervalMin: ["schedule", "managementIntervalMin"],
-			screeningIntervalMin: ["schedule", "screeningIntervalMin"],
-			// models
-			managementModel: ["llm", "managementModel"],
-			screeningModel: ["llm", "screeningModel"],
-			generalModel: ["llm", "generalModel"],
-			// strategy
-			binsBelow: ["strategy", "binsBelow"],
-		};
-
-		const applied = {};
-		const unknown = [];
-
-		// Build case-insensitive lookup
-		const CONFIG_MAP_LOWER = Object.fromEntries(
-			Object.entries(CONFIG_MAP).map(([k, v]) => [k.toLowerCase(), [k, v]]),
-		);
-
-		for (const [key, val] of Object.entries(changes)) {
-			const match = CONFIG_MAP[key]
-				? [key, CONFIG_MAP[key]]
-				: CONFIG_MAP_LOWER[key.toLowerCase()];
-			if (!match) {
-				unknown.push(key);
-				continue;
-			}
-			applied[match[0]] = val;
-		}
-
-		if (Object.keys(applied).length === 0) {
-			log(
-				"config",
-				`update_config failed — unknown keys: ${JSON.stringify(unknown)}, raw changes: ${JSON.stringify(changes)}`,
-			);
-			return { success: false, unknown, reason };
-		}
-
-		// Apply to live config immediately
-		const effectiveApplied = {};
-		for (const [key, val] of Object.entries(applied)) {
-			const [section, field] = CONFIG_MAP[key];
-			const before = config[section][field];
-			if (Object.is(before, val)) continue;
-			effectiveApplied[key] = val;
-			config[section][field] = val;
-			log(
-				"config",
-				`update_config: config.${section}.${field} ${before} → ${val} (verify: ${config[section][field]})`,
-			);
-		}
-
-		if (Object.keys(effectiveApplied).length === 0) {
-			return { success: true, applied: {}, unknown, reason, noop: true };
-		}
-
-		// Persist to user-config.json
-		let userConfig = {};
-		if (fs.existsSync(USER_CONFIG_PATH)) {
-			try {
-				userConfig = JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8"));
-			} catch {
-				/**/
-			}
-		}
-		Object.assign(userConfig, effectiveApplied);
-		userConfig._lastAgentTune = new Date().toISOString();
-		fs.writeFileSync(USER_CONFIG_PATH, JSON.stringify(userConfig, null, 2));
-
-		// Restart cron jobs if intervals changed
-		const intervalChanged =
-			effectiveApplied.managementIntervalMin != null ||
-			effectiveApplied.screeningIntervalMin != null;
-		if (intervalChanged && _cronRestarter) {
-			_cronRestarter();
-			log(
-				"config",
-				`Cron restarted — management: ${config.schedule.managementIntervalMin}m, screening: ${config.schedule.screeningIntervalMin}m`,
-			);
-		}
-
-		// Save as a lesson — but skip ephemeral per-deploy interval changes
-		// (managementIntervalMin / screeningIntervalMin change every deploy based on volatility;
-		//  the rule is already in the system prompt, storing it 75+ times is pure noise)
-		const lessonsKeys = Object.keys(effectiveApplied).filter(
-			(k) => k !== "managementIntervalMin" && k !== "screeningIntervalMin",
-		);
-		if (lessonsKeys.length > 0) {
-			const summary = lessonsKeys
-				.map((k) => `${k}=${effectiveApplied[k]}`)
-				.join(", ");
-			addLesson(`[SELF-TUNED] Changed ${summary} — ${reason}`, [
-				"self_tune",
-				"config_change",
-			]);
-		}
-
-		log(
-			"config",
-			`Agent self-tuned: ${JSON.stringify(effectiveApplied)} — ${reason}`,
-		);
-		return { success: true, applied: effectiveApplied, unknown, reason };
-	},
+	update_config: ({ changes, reason = "" }) => runUpdateConfig({
+		changes,
+		reason,
+		cronRestarter: _cronRestarter,
+	}),
 };
 
 // Tools that modify on-chain state (need extra safety checks)

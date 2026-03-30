@@ -151,3 +151,29 @@ test("observational memory updates shadow policy without mutating active policy"
 		fs.rmSync(tempDir, { recursive: true, force: true });
 	}
 });
+
+test("memory surfaces invalid prompt-memory nuggets instead of failing open", async () => {
+	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "zenith-memory-invalid-state-test-"));
+	const originalDir = process.env.ZENITH_MEMORY_DIR;
+
+	try {
+		process.env.ZENITH_MEMORY_DIR = tempDir;
+		fs.mkdirSync(path.join(tempDir, "policy", "policy-v1"), { recursive: true });
+		fs.mkdirSync(path.join(tempDir, "policy", "policy-shadow-v1"), { recursive: true });
+		fs.writeFileSync(path.join(tempDir, "policy", "policy-v1", "strategies.json"), "{bad json");
+		const memory = await import(`./memory.js?test=${Date.now()}`);
+		memory.initMemory();
+
+		const context = memory.getMemoryContext("SCREENER", { mode: "active" });
+		assert.match(context, /INVALID MEMORY STATE/i);
+		assert.match(context, /strategies\.json/i);
+		assert.throws(
+			() => memory.rememberStrategy({ strategy: "bid_ask", bin_step: 85 }, "should fail"),
+			/INVALID MEMORY STATE/i,
+		);
+	} finally {
+		if (originalDir) process.env.ZENITH_MEMORY_DIR = originalDir;
+		else delete process.env.ZENITH_MEMORY_DIR;
+		fs.rmSync(tempDir, { recursive: true, force: true });
+	}
+});

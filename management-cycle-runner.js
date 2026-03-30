@@ -48,6 +48,15 @@ function classifyManagementWorkflowStatus(results = []) {
 	return "completed";
 }
 
+function summarizeReplayResult(result = {}) {
+	if (result?.blocked) return { status: "blocked", reason: result.reason || null };
+	if (result?.error || result?.success === false) return { status: "error", reason: result.error || result.reason || null };
+	if (result?.skipped) return { status: "skipped", reason: result.reason || null };
+	if (result?.rebalanced) return { status: "rebalanced", reason: result.new_position || null };
+	if (result?.success) return { status: "success", reason: result.message || null };
+	return { status: "completed", reason: result?.reason || null };
+}
+
 export function createManagementCycleRunner(deps) {
   return async function runManagementCycle({ cycleId, screeningCooldownMs } = {}) {
     const {
@@ -109,6 +118,14 @@ export function createManagementCycleRunner(deps) {
 			appendReplayEnvelope({
 				cycle_id: cycleId,
 				cycle_type: "management",
+				management_config: {
+					emergencyPriceDropPct: config.management.emergencyPriceDropPct,
+					takeProfitFeePct: config.management.takeProfitFeePct,
+					minFeePerTvl24h: config.management.minFeePerTvl24h,
+					minClaimAmount: config.management.minClaimAmount,
+					outOfRangeWaitMinutes: config.management.outOfRangeWaitMinutes,
+					slowReviewIntervalMin: config.management.slowReviewIntervalMin,
+				},
         position_inputs: inputs,
 				runtime_actions: actions.map((action) => ({
 					position: action.position,
@@ -117,6 +134,7 @@ export function createManagementCycleRunner(deps) {
 					reason: action.reason,
 					action_id: action.actionId,
 					thesis: action.thesis || null,
+					result: summarizeReplayResult(action.result),
 					critic: action.critic
 						? {
 							status: action.critic.status,
@@ -442,6 +460,14 @@ export function createManagementCycleRunner(deps) {
 			appendReplayEnvelope({
 				cycle_id: cycleId,
 				cycle_type: "management",
+				management_config: {
+				emergencyPriceDropPct: config.management.emergencyPriceDropPct,
+				takeProfitFeePct: config.management.takeProfitFeePct,
+				minFeePerTvl24h: config.management.minFeePerTvl24h,
+				minClaimAmount: config.management.minClaimAmount,
+				outOfRangeWaitMinutes: config.management.outOfRangeWaitMinutes,
+				slowReviewIntervalMin: config.management.slowReviewIntervalMin,
+			},
 				position_inputs: positionData,
 				runtime_actions: runtimeActions.map((action) => ({
 					position: action.position,
@@ -450,6 +476,7 @@ export function createManagementCycleRunner(deps) {
 					reason: action.reason,
 					action_id: action.actionId,
 					thesis: action.thesis || null,
+					result: summarizeReplayResult(action.result),
 					critic: action.critic
 						? { status: action.critic.status, reason_code: action.critic.reason_code }
 						: null,
@@ -463,7 +490,7 @@ export function createManagementCycleRunner(deps) {
 						: null,
 					shadow: decision.shadow || null,
 					comparison: decision.comparison || null,
-					result: summarizeRuntimeActionResult(decision.result),
+					result: summarizeReplayResult(decision.result),
 				})),
 				write_workflows: listActionJournalWorkflowsByCycle(cycleId),
 			});

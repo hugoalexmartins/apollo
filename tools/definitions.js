@@ -1,3 +1,5 @@
+import { formatMutableConfigKeyHelp } from "../config-registry.js";
+
 export const tools = [
   // ═══════════════════════════════════════════
   //  SCREENING TOOLS
@@ -500,13 +502,7 @@ WARNING: This executes a real on-chain transaction.`,
 Changes persist to user-config.json and take effect immediately — no restart needed.
 
 VALID KEYS (use EXACTLY these key names, nothing else):
-Screening: minFeeActiveTvlRatio, minTvl, maxTvl, minVolume, minOrganic, minHolders, minMcap, maxMcap, minBinStep, maxBinStep, timeframe, category, minTokenFeesSol, maxBundlersPct, maxTop10Pct
-Protections: protectionsEnabled, maxRecentRealizedLossUsd, maxDrawdownPct, maxOpenUnrealizedLossUsd, recentLossWindowHours, stopLossStreakLimit, portfolioPauseMinutes, maxReviewedCloses, recoveryResumeOverrideMinutes
-Management: minClaimAmount, outOfRangeBinsToClose, outOfRangeWaitMinutes, minVolumeToRebalance, emergencyPriceDropPct, stopLossPct, takeProfitFeePct, trailingTakeProfit, trailingTriggerPct, trailingDropPct, minSolToOpen, deployAmountSol, gasReserve, positionSizePct
-Risk: maxPositions, maxDeployAmount
-Schedule: managementIntervalMin, screeningIntervalMin
-Models: managementModel, screeningModel, generalModel
-Strategy: binsBelow
+${formatMutableConfigKeyHelp()}
 
 Examples:
 - { takeProfitFeePct: 8 }        — raise the fixed take-profit target

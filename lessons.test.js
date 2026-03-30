@@ -256,7 +256,7 @@ test("evolveThresholds does not falsely block after config mutation when later l
 		fs.writeFileSync(lessonsPath, JSON.stringify({ lessons: [], performance: [] }, null, 2));
 
 		const { config } = await import(`./config.js?test=${Date.now()}`);
-		const { evolveThresholds, recoverThresholdRolloutState, getThresholdRolloutState } = await import(`./lessons.js?test=${Date.now()}`);
+		const { evolveThresholds } = await import(`./lessons.js?test=${Date.now()}`);
 
 		const perfData = [
 			{ pnl_pct: 8, fee_tvl_ratio: 0.30, organic_score: 84 },
@@ -291,6 +291,42 @@ test("evolveThresholds does not falsely block after config mutation when later l
 		else delete process.env.ZENITH_USER_CONFIG_PATH;
 		if (originalLessonsFile) process.env.ZENITH_LESSONS_FILE = originalLessonsFile;
 		else delete process.env.ZENITH_LESSONS_FILE;
+		if (originalRolloutFile) process.env.ZENITH_THRESHOLD_ROLLOUT_FILE = originalRolloutFile;
+		else delete process.env.ZENITH_THRESHOLD_ROLLOUT_FILE;
+		fs.rmSync(tempDir, { recursive: true, force: true });
+	}
+});
+
+test("recoverThresholdRolloutState blocks invalid screening values in pending rollout state", async () => {
+	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "zenith-rollout-invalid-values-test-"));
+	const originalUserConfigPath = process.env.ZENITH_USER_CONFIG_PATH;
+	const originalRolloutFile = process.env.ZENITH_THRESHOLD_ROLLOUT_FILE;
+	const userConfigPath = path.join(tempDir, "user-config.json");
+	const rolloutPath = path.join(tempDir, "threshold-rollout.json");
+
+	try {
+		process.env.ZENITH_USER_CONFIG_PATH = userConfigPath;
+		process.env.ZENITH_THRESHOLD_ROLLOUT_FILE = rolloutPath;
+		fs.writeFileSync(userConfigPath, JSON.stringify({ minFeeActiveTvlRatio: 0.05, minOrganic: 60 }, null, 2));
+		fs.writeFileSync(rolloutPath, JSON.stringify({
+			active: {
+				phase: "apply_pending",
+				rollout_id: "rollout-invalid",
+				new_values: { minOrganic: 101 },
+				previous_values: { minOrganic: 60 },
+				start_positions_count: 10,
+			},
+			history: [],
+		}, null, 2));
+
+		const { config } = await import(`./config.js?test=${Date.now()}`);
+		const { recoverThresholdRolloutState } = await import(`./lessons.js?test=${Date.now()}`);
+		const result = recoverThresholdRolloutState(config, { trigger: "recovery" });
+		assert.equal(result.rollout.status, "blocked_invalid_state");
+		assert.equal(result.rollout.reason_code, "EVOLVE_CONFIG_STATE_INVALID");
+	} finally {
+		if (originalUserConfigPath) process.env.ZENITH_USER_CONFIG_PATH = originalUserConfigPath;
+		else delete process.env.ZENITH_USER_CONFIG_PATH;
 		if (originalRolloutFile) process.env.ZENITH_THRESHOLD_ROLLOUT_FILE = originalRolloutFile;
 		else delete process.env.ZENITH_THRESHOLD_ROLLOUT_FILE;
 		fs.rmSync(tempDir, { recursive: true, force: true });

@@ -1,4 +1,7 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 import { armGeneralWriteTools, disarmGeneralWriteTools } from "../operator-controls.js";
 import { updateRuntimeHealth } from "../runtime-health.js";
@@ -161,6 +164,24 @@ async function main() {
 	});
 	assert.equal(result.blocked, true);
 	assert.equal(updateConfigCalled, false);
+	setExecutorTestOverrides({ tools: { update_config: null } });
+
+	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "zenith-update-config-invalid-test-"));
+	const originalUserConfigPath = process.env.ZENITH_USER_CONFIG_PATH;
+	try {
+		process.env.ZENITH_USER_CONFIG_PATH = path.join(tempDir, "user-config.json");
+		fs.writeFileSync(process.env.ZENITH_USER_CONFIG_PATH, "{bad json");
+		result = await executeTool("update_config", {
+			changes: { minOrganic: 77 },
+			reason: "test invalid config",
+		}, buildApprovedMeta("config-test", "config-test:update_config:1"));
+		assert.equal(result.success, false);
+		assert.equal(result.reason_code, "USER_CONFIG_INVALID");
+	} finally {
+		if (originalUserConfigPath) process.env.ZENITH_USER_CONFIG_PATH = originalUserConfigPath;
+		else delete process.env.ZENITH_USER_CONFIG_PATH;
+		fs.rmSync(tempDir, { recursive: true, force: true });
+	}
 
 	result = await executeTool("remember_fact", {
 		nugget: "facts",

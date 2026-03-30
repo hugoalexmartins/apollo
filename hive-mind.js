@@ -20,12 +20,12 @@
  * Zero dependencies — uses only Node.js stdlib + native fetch().
  */
 
-import fs from "fs";
-import path from "path";
-import { fileURLToPath } from "url";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { readUserConfigSnapshot, writeUserConfigSnapshot } from "./user-config-store.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const USER_CONFIG_PATH = path.join(__dirname, "user-config.json");
 const LESSONS_FILE = path.join(__dirname, "lessons.json");
 const POOL_MEMORY_FILE = path.join(__dirname, "pool-memory.json");
 
@@ -40,25 +40,22 @@ let _lastSyncTime = 0;
 // ─── Helpers ────────────────────────────────────────────────────
 
 function readConfig() {
-  try {
-    return JSON.parse(fs.readFileSync(USER_CONFIG_PATH, "utf8"));
-  } catch {
-    return {};
-  }
+	const snapshot = readUserConfigSnapshot();
+	return snapshot.ok ? snapshot.value : {};
 }
 
 function writeConfig(patch) {
-  const current = readConfig();
-  const merged = { ...current, ...patch };
-  fs.writeFileSync(USER_CONFIG_PATH, JSON.stringify(merged, null, 2));
+	const current = readConfig();
+	const merged = { ...current, ...patch };
+	writeUserConfigSnapshot(merged);
 }
 
 function readJsonFile(filePath) {
-  try {
-    return JSON.parse(fs.readFileSync(filePath, "utf8"));
-  } catch {
-    return null;
-  }
+	try {
+		return JSON.parse(fs.readFileSync(filePath, "utf8"));
+	} catch {
+		return null;
+	}
 }
 
 async function fetchWithTimeout(url, options = {}, timeoutMs = GET_TIMEOUT_MS) {
@@ -335,37 +332,35 @@ export async function formatPoolConsensusForPrompt(poolAddresses) {
     return "";
   }
 
-  try {
-    const results = await Promise.all(
+	try {
+		const results = await Promise.all(
       poolAddresses.map(async (addr) => {
         const data = await queryPoolConsensus(addr);
         return { addr, data };
       }),
     );
 
-    const lines = [];
-    let poolsWithData = 0;
+		const lines = [];
 
-    for (const { addr, data } of results) {
-      if (data && data.unique_agents >= MIN_AGENTS_FOR_CONSENSUS) {
-        poolsWithData++;
-        const name = data.pool_name || addr.slice(0, 8);
-        const winPct = data.weighted_win_rate ?? 0;
-        const avgPnl = data.weighted_avg_pnl != null
-          ? (data.weighted_avg_pnl >= 0 ? "+" : "") + data.weighted_avg_pnl.toFixed(1) + "%"
-          : "N/A";
-        lines.push(`[HIVE] ${name}: ${data.unique_agents} agents, ${winPct}% win, ${avgPnl} avg PnL`);
+		for (const { addr, data } of results) {
+			if (data && data.unique_agents >= MIN_AGENTS_FOR_CONSENSUS) {
+				const name = data.pool_name || addr.slice(0, 8);
+				const winPct = data.weighted_win_rate ?? 0;
+				const avgPnl = data.weighted_avg_pnl != null
+					? `${data.weighted_avg_pnl >= 0 ? "+" : ""}${data.weighted_avg_pnl.toFixed(1)}%`
+					: "N/A";
+				lines.push(`[HIVE] ${name}: ${data.unique_agents} agents, ${winPct}% win, ${avgPnl} avg PnL`);
       }
     }
 
     if (lines.length === 0) return "";
 
     const header = `HIVE MIND CONSENSUS (supplementary — your own analysis takes priority):`;
-    let output = [header, ...lines].join("\n");
+		let output = [header, ...lines].join("\n");
 
-    if (output.length > MAX_CONSENSUS_CHARS) {
-      output = output.slice(0, MAX_CONSENSUS_CHARS - 3) + "...";
-    }
+		if (output.length > MAX_CONSENSUS_CHARS) {
+			output = `${output.slice(0, MAX_CONSENSUS_CHARS - 3)}...`;
+		}
 
     return output;
   } catch (e) {

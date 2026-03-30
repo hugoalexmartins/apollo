@@ -14,6 +14,7 @@ import {
 	recoverThresholdRolloutState,
 } from "./lessons.js";
 import { getScreeningThresholdSummary } from "./runtime-helpers.js";
+import { buildIntervalCron } from "./schedule-runtime.js";
 import { executeTool, getAutonomousWriteSuppression, registerCronRestarter, setAutonomousWriteSuppression } from "./tools/executor.js";
 import { startPolling, stopPolling, sendMessage, sendHTML, notifyOutOfRange, isEnabled as telegramEnabled } from "./telegram.js";
 import { generateBriefing } from "./briefing.js";
@@ -341,7 +342,7 @@ export function startCronJobs() {
     setScreeningLastRun: (value) => { timers.screeningLastRun = value; },
   });
 
-  const mgmtTask = cron.schedule(`*/${Math.max(1, config.schedule.managementIntervalMin)} * * * *`, async () => {
+  const mgmtTask = cron.schedule(buildIntervalCron(config.schedule.managementIntervalMin), async () => {
     const overlapWith = getOverlappingCycleType({
       cycleType: "management",
       managementBusy: _managementBusy,
@@ -397,9 +398,9 @@ export function startCronJobs() {
     await runScreeningCycle({ cycleId });
   };
 
-  const screenTask = cron.schedule(`*/${Math.max(1, config.schedule.screeningIntervalMin)} * * * *`, runScreeningScheduled);
+  const screenTask = cron.schedule(buildIntervalCron(config.schedule.screeningIntervalMin), runScreeningScheduled);
 
-  const healthTask = cron.schedule(`0 * * * *`, async () => {
+  const healthTask = cron.schedule(buildIntervalCron(config.schedule.healthCheckIntervalMin), async () => {
     if (_healthBusy || _managementBusy || _screeningBusy) return;
     _healthBusy = true;
     log("cron", "Starting health check");
@@ -445,7 +446,7 @@ HEALTH CHECK
   }, { timezone: 'UTC' });
 
   _cronTasks = [mgmtTask, screenTask, healthTask, briefingTask, briefingWatchdog];
-  log("cron", `Cycles started — management every ${config.schedule.managementIntervalMin}m, screening every ${config.schedule.screeningIntervalMin}m`);
+  log("cron", `Cycles started — management every ${config.schedule.managementIntervalMin}m, screening every ${config.schedule.screeningIntervalMin}m, health every ${config.schedule.healthCheckIntervalMin}m`);
 }
 
 // ═══════════════════════════════════════════

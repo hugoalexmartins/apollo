@@ -57,6 +57,7 @@ test("threshold evolution uses the safe live engine and records operator evidenc
 		evolveThresholds: () => ({ changes: { minOrganic: 75 }, rationale: { minOrganic: "raised" }, rollout: { status: "started", rollout_id: "rollout-1" }, requires_reload: true }),
 		reloadScreeningThresholds: () => {
 			reloaded = true;
+			return { success: true };
 		},
 		config: {},
 		recordAction: (entry) => actions.push(entry),
@@ -64,6 +65,17 @@ test("threshold evolution uses the safe live engine and records operator evidenc
 	assert.equal(applied.status, "applied");
 	assert.equal(reloaded, true);
 	assert.equal(actions[actions.length - 1].type, "evolve_thresholds_applied");
+
+	const reloadFailed = await runThresholdEvolutionCommand({
+		getPerformanceSummary: () => ({ total_positions_closed: 10 }),
+		evolveThresholds: () => ({ changes: { minOrganic: 76 }, rationale: { minOrganic: "raised" }, rollout: { status: "started", rollout_id: "rollout-2" }, requires_reload: true }),
+		reloadScreeningThresholds: () => ({ success: false, reason_code: "USER_CONFIG_INVALID", error: "bad config" }),
+		config: {},
+		recordAction: (entry) => actions.push(entry),
+	});
+	assert.equal(reloadFailed.status, "blocked");
+	assert.match(reloadFailed.message, /runtime reload failed/i);
+	assert.equal(actions[actions.length - 1].type, "evolve_thresholds_reload_failed");
 });
 
 test("preflight command builds and persists a report through the shared shell helper", async () => {

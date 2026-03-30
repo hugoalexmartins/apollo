@@ -52,6 +52,7 @@ import {
 	waitForPostClaimSettlement,
 	waitForPostCloseSettlement,
 } from "./dlmm-settlement.js";
+import { buildSafeSendOptions } from "./solana-send-options.js";
 
 // ─── Lazy SDK loader ───────────────────────────────────────────
 // @meteora-ag/dlmm → @coral-xyz/anchor uses CJS directory imports
@@ -321,7 +322,7 @@ export async function deployPosition({
       const createTxArray = Array.isArray(createTxs) ? createTxs : [createTxs];
       for (let i = 0; i < createTxArray.length; i++) {
         const signers = i === 0 ? [wallet, newPosition] : [wallet];
-        const txHash = await sendAndConfirmTransaction(getConnection(), createTxArray[i], signers, { skipPreflight: true });
+			const txHash = await sendAndConfirmTransaction(getConnection(), createTxArray[i], signers, buildSafeSendOptions());
         txHashes.push(txHash);
         log("deploy", `Create tx ${i + 1}/${createTxArray.length}: ${txHash}`);
       }
@@ -337,7 +338,7 @@ export async function deployPosition({
       });
       const addTxArray = Array.isArray(addTxs) ? addTxs : [addTxs];
       for (let i = 0; i < addTxArray.length; i++) {
-        const txHash = await sendAndConfirmTransaction(getConnection(), addTxArray[i], [wallet], { skipPreflight: true });
+			const txHash = await sendAndConfirmTransaction(getConnection(), addTxArray[i], [wallet], buildSafeSendOptions());
         txHashes.push(txHash);
         log("deploy", `Add liquidity tx ${i + 1}/${addTxArray.length}: ${txHash}`);
       }
@@ -351,7 +352,7 @@ export async function deployPosition({
         strategy: { maxBinId, minBinId, strategyType },
         slippage: 1000, // 10% in bps
       });
-      const txHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet, newPosition], { skipPreflight: true });
+		const txHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet, newPosition], buildSafeSendOptions());
       txHashes.push(txHash);
     }
 
@@ -1330,7 +1331,7 @@ export async function claimFees({ position_address }) {
 
     const txHashes = [];
 		for (const tx of txs) {
-			const txHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet], { skipPreflight: true });
+			const txHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet], buildSafeSendOptions());
 			txHashes.push(txHash);
 		}
 		log("claim", `SUCCESS txs: ${txHashes.join(", ")}`);
@@ -1416,7 +1417,7 @@ export async function closePosition({ position_address, reason = "agent decision
       });
       if (claimTxs && claimTxs.length > 0) {
         for (const tx of claimTxs) {
-          const claimHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet], { skipPreflight: true });
+				const claimHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet], buildSafeSendOptions());
           txHashes.push(claimHash);
         }
         log("close", `Step 1 OK: ${txHashes.join(", ")}`);
@@ -1437,7 +1438,7 @@ export async function closePosition({ position_address, reason = "agent decision
     });
 
     for (const tx of Array.isArray(closeTx) ? closeTx : [closeTx]) {
-      const txHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet], { skipPreflight: true });
+			const txHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet], buildSafeSendOptions());
       txHashes.push(txHash);
     }
     log("close", `SUCCESS txs: ${txHashes.join(", ")}`);
