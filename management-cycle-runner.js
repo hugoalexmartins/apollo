@@ -9,15 +9,14 @@ function buildManagementPnlSnapshot(position = {}) {
       : null;
 
   if (position.pnl_missing || position.status === "missing") {
-    return {
+	return {
       error: position.pnl_error || "Position not found in pre-loaded PnL snapshot",
       stale: true,
       status: "stale",
       observed_at_ms: observedAtMs,
       max_age_ms: position.max_age_ms ?? 60_000,
-    };
-  }
-
+	};
+}
   const stale = position.stale === true || position.status === "stale" || observedAtMs == null;
   const unclaimedFeeUsd = Number(position.unclaimed_fees_usd ?? 0);
   const collectedFeesUsd = Number(position.collected_fees_usd ?? 0);
@@ -40,6 +39,13 @@ function buildManagementPnlSnapshot(position = {}) {
     stale,
     status: stale ? "stale" : (position.status || "ok"),
   };
+}
+
+function classifyManagementWorkflowStatus(results = []) {
+	if (results.some((result) => result?.manual_review)) return "manual_review";
+	if (results.some((result) => result?.error || result?.success === false)) return "failed_write";
+	if (results.some((result) => result?.blocked)) return "held";
+	return "completed";
 }
 
 export function createManagementCycleRunner(deps) {
@@ -232,7 +238,7 @@ export function createManagementCycleRunner(deps) {
       const handledRuntimeActionMap = new Map(handledRuntimeActions.map((action) => [action.position, action]));
       const attemptedRuntimeActionMap = new Map(attemptedRuntimeActions.map((action) => [action.position, action]));
       const pendingPositionData = positionData.filter((p) => !handledRuntimeActionMap.has(p.position));
-      const modelManagedPositions = pendingPositionData.filter((p) => classifyManagementModelGate(p).route === "model");
+      const modelManagedPositions = pendingPositionData.filter((p) => attemptedRuntimeActionMap.has(p.position) || classifyManagementModelGate(p).route === "model");
       const pendingExitAlerts = pendingPositionData.filter((p) => p.exitAlert).map((p) => `- ${p.pair}: ${p.exitAlert}`);
 
       const handledRuntimeActionBlock = handledRuntimeActions.length > 0
@@ -290,11 +296,14 @@ export function createManagementCycleRunner(deps) {
       }
 
       if (modelManagedPositions.length === 0) {
+        const runtimeDeterminationStatus = attemptedRuntimeActions.length === 0
+          ? "runtime_determined"
+          : classifyManagementWorkflowStatus(attemptedRuntimeActions.map((action) => action.result));
         mgmtReport = `RUNTIME ACTIONS ALREADY EXECUTED\n${handledRuntimeActionBlock}\n\nRUNTIME WRITE ATTEMPTS NOT COMPLETED\n${attemptedRuntimeActionBlock}\n\nNo remaining positions required model evaluation this cycle.`;
         managementEvaluation = {
           cycle_id: cycleId,
           cycle_type: "management",
-          status: "runtime_determined",
+          status: runtimeDeterminationStatus,
           summary: {
             positions_total: positions.length,
             pending_positions: pendingPositionData.length,
@@ -382,14 +391,21 @@ export function createManagementCycleRunner(deps) {
 		const decisionBlock = modelDecisions.length > 0
 			? modelDecisions.map((decision) => `- ${decision.pair} (${decision.position}): ${decision.thesis?.action || "hold"}${decision.comparison?.diverged ? ` / shadow=${decision.comparison.shadow_tool || decision.shadow?.action || "hold"}` : ""} -> ${summarizeRuntimeActionResult(decision.result)}`).join("\n")
 			: "- none";
+		const unresolvedRuntimeAttempts = attemptedRuntimeActions.filter(
+			(action) => !modelDecisions.some((decision) => decision.position === action.position),
+		);
+		const workflowStatus = classifyManagementWorkflowStatus([
+			...unresolvedRuntimeAttempts.map((action) => action.result),
+			...modelDecisions.map((decision) => decision.result),
+		]);
 		mgmtReport = runtimeActions.length > 0
 			? `RUNTIME ACTIONS ALREADY EXECUTED\n${handledRuntimeActionBlock}\n\nRUNTIME WRITE ATTEMPTS NOT COMPLETED\n${attemptedRuntimeActionBlock}\n\nMODEL THESES\n${decisionBlock}`
 			: `MODEL THESES\n${decisionBlock}`;
 		managementEvaluation = {
 			cycle_id: cycleId,
 			cycle_type: "management",
-        status: "completed",
-        summary: {
+	        status: workflowStatus,
+	        summary: {
           positions_total: positions.length,
           pending_positions: pendingPositionData.length,
           model_positions: modelManagedPositions.length,

@@ -25,7 +25,7 @@ function detectMemoryConflict(thesis = {}) {
 	return asArray(thesis.evidence).some((row) => {
 		if (row?.source !== "memory") return false;
 		const summary = String(row.summary || "").toLowerCase();
-		return /avoid|failed|unprofitable|loss|cooldown|do not/i.test(summary);
+		return /\bdo not\b|avoid deploy|avoid this pool|blocked creator|blocked address|honeypot|scam|rug|cooldown active|negative_regime/i.test(summary);
 	});
 }
 

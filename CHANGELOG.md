@@ -6,6 +6,14 @@ This file documents the major additions and behavior changes present in this for
 
 ### 2026-03-30
 
+- Made the shadow lane best-effort instead of a hard dependency, so active screening and management theses still run when shadow inference fails or times out.
+- Fixed misleading workflow-state reporting across screening and management: discovery-provider failures now surface as `failed_candidates`, errored approved writes surface as `failed_write`, and blocked runtime actions can escalate into model review instead of quietly dying in runtime-only handling.
+- Tightened finalist selection so enriched hard-blocked candidates no longer poison the top-finalist window; screening now backfills replacement finalists from the shortlist before thesis generation.
+- Hardened finalist screening to fail closed when critical holder intel or OKX advanced intel is unavailable, instead of silently downgrading those protections for the cycle.
+- Added creator/deployer denylist enforcement through both discovery-time `pool.dev` filtering and finalist-time OKX `creatorAddress` blocking, alongside the earlier holder/funding-address blacklist checks.
+- Ported a narrow OKX market-intel layer from Meridian experimental: bounded shortlist-only public OKX enrichment now contributes creator, bundle/sniper/suspicious concentration, smart-money tags, KOL cluster hints, and multi-timeframe market fields without expanding OKX into the wide deterministic pre-ranker.
+- Tightened `claim_fees` settlement verification so claims now wait for bounded post-claim observation, accept either claimed-token delta or unclaimed-fee drop as evidence, delay `recordClaim(...)` until observation succeeds, and auto-swap the actually observed claimed mint/amount instead of assuming the base leg.
+- Expanded the hardening gate to cover the newer autonomy and settlement regressions, including `autonomy-engine.test.js`, `decision-thesis.test.js`, `tools/okx.test.js`, and `dlmm-settlement.test.js`.
 - Turned screening and model-managed management decisions into a read-only thesis flow: active decisions now produce structured theses with evidence, freshness, contradictions, confidence, and explicit invalidation conditions before any write is attempted.
 - Added a critic/abstention kill-pass for autonomous writes so weak, stale, inconsistent, memory-conflicted, or loss-clustered theses now route to `hold` or `manual_review` instead of falling through to the old write path.
 - Added a shared autonomy sidecar layer through `autonomy-engine.js`, `decision-thesis.js`, and `decision-critic.js`, while keeping deterministic runtime policy and the executor boundary as the real control plane.

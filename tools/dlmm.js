@@ -48,8 +48,8 @@ import {
 } from "./dlmm-position-context.js";
 import {
 	buildClosePerformancePayload,
-	evaluatePostCloseSettlementObservation,
 	getWalletTokenBalance,
+	waitForPostClaimSettlement,
 	waitForPostCloseSettlement,
 } from "./dlmm-settlement.js";
 
@@ -1294,19 +1294,29 @@ export async function claimFees({ position_address }) {
     return { dry_run: true, would_claim: position_address, message: "DRY RUN — no transaction sent" };
   }
 
-  try {
-    log("claim", `Claiming fees for position: ${position_address}`);
-    const wallet = getWallet();
-    const poolAddress = await lookupPoolForPosition(position_address, wallet.publicKey.toString());
-    // Clear cached pool so SDK loads fresh position fee state
-    poolCache.delete(poolAddress.toString());
-    const pool = await getPool(poolAddress);
-    const baseMint = pool.lbPair.tokenXMint.toString();
-    const baseBalanceBeforeClaim = await getWalletTokenBalance({
-			walletPubkey: wallet.publicKey,
-			mint: baseMint,
-			getConnection,
-		}).catch(() => null);
+	try {
+		log("claim", `Claiming fees for position: ${position_address}`);
+		const wallet = getWallet();
+		const poolAddress = await lookupPoolForPosition(position_address, wallet.publicKey.toString());
+		// Clear cached pool so SDK loads fresh position fee state
+		poolCache.delete(poolAddress.toString());
+		const pool = await getPool(poolAddress);
+		const baseMint = pool.lbPair.tokenXMint.toString();
+		const quoteMint = pool.lbPair.tokenYMint.toString();
+		const claimMints = [...new Set([baseMint, quoteMint].filter(Boolean))];
+		const previousBalancesByMint = {};
+		for (const mint of claimMints) {
+			previousBalancesByMint[mint] = await getWalletTokenBalance({
+				walletPubkey: wallet.publicKey,
+				mint,
+				getConnection,
+			}).catch(() => null);
+		}
+		const positionsBeforeClaim = await getMyPositions({ force: true }).catch(() => null);
+		const previousOpenPosition = !positionsBeforeClaim?.error && Array.isArray(positionsBeforeClaim?.positions)
+			? positionsBeforeClaim.positions.find((position) => position.position === position_address)
+			: null;
+		const previousUnclaimedFeeUsd = Number(previousOpenPosition?.unclaimed_fees_usd ?? previousOpenPosition?.unclaimed_fee_usd ?? null);
 
     const positionData = await pool.getPosition(new PublicKey(position_address));
     const txs = await pool.claimSwapFee({
@@ -1319,31 +1329,49 @@ export async function claimFees({ position_address }) {
     }
 
     const txHashes = [];
-    for (const tx of txs) {
-      const txHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet], { skipPreflight: true });
-      txHashes.push(txHash);
-    }
-    log("claim", `SUCCESS txs: ${txHashes.join(", ")}`);
-    _positionsCacheAt = 0; // invalidate cache after claim
-    recordClaim(position_address);
-    const baseBalanceAfterClaim = await getWalletTokenBalance({
+		for (const tx of txs) {
+			const txHash = await sendAndConfirmTransaction(getConnection(), tx, [wallet], { skipPreflight: true });
+			txHashes.push(txHash);
+		}
+		log("claim", `SUCCESS txs: ${txHashes.join(", ")}`);
+		_positionsCacheAt = 0; // invalidate cache after claim
+		const settlement = await waitForPostClaimSettlement({
 			walletPubkey: wallet.publicKey,
-			mint: baseMint,
+			observedMints: claimMints,
+			positionAddress: position_address,
+			previousBalancesByMint,
+			previousUnclaimedFeeUsd: Number.isFinite(previousUnclaimedFeeUsd) ? previousUnclaimedFeeUsd : null,
 			getConnection,
-		}).catch(() => null);
-    const baseAmountReceived = computeObservedTokenDelta({
-      previousBalance: baseBalanceBeforeClaim,
-      observedBalance: baseBalanceAfterClaim,
-    });
+			getMyPositions,
+			log,
+		});
+		if (!settlement.settled) {
+			log("claim_warn", `Post-claim settlement not observed before timeout (${settlement.reason})`);
+			return {
+				success: false,
+				error: `Claim settlement not observed before timeout (${settlement.reason})`,
+				position: position_address,
+				txs: txHashes,
+				claim_mints: claimMints,
+				settlement,
+			};
+		}
+		recordClaim(position_address, settlement.observed_unclaimed_fee_delta ?? undefined);
 
-    return {
-      success: true,
-      position: position_address,
-      txs: txHashes,
-      base_mint: baseMint,
-      base_amount_received: baseAmountReceived,
-    };
-  } catch (error) {
+		return {
+			success: true,
+			position: position_address,
+			txs: txHashes,
+			base_mint: baseMint,
+			base_amount_received: settlement.observed_mint === baseMint ? settlement.observed_amount_received ?? 0 : 0,
+			claimed_mint: settlement.observed_mint ?? null,
+			claimed_amount_received: settlement.observed_amount_received ?? 0,
+			claim_mints: claimMints,
+			settlement_signal: settlement.signal,
+			settlement_attempts: settlement.attempts,
+			observed_unclaimed_fee_delta: settlement.observed_unclaimed_fee_delta ?? null,
+		};
+	} catch (error) {
     log("claim_error", error.message);
     return { success: false, error: error.message };
   }
@@ -1508,5 +1536,3 @@ async function lookupPoolForPosition(position_address, walletAddress) {
 
   throw new Error(`Position ${position_address} not found in open positions`);
 }
-
-export { evaluatePostCloseSettlementObservation };

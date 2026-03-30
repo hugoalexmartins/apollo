@@ -5,6 +5,16 @@ import {
 	shouldRunSlowManagementReview,
 } from "./management-review-window.js";
 
+function didHandleRuntimeAction(result) {
+	return Boolean(
+		result
+		&& !result.blocked
+		&& !result.error
+		&& !result.skipped
+		&& result.success !== false,
+	);
+}
+
 export async function runManagementRuntimeActions(positionData, { cycleId, config, executeTool, recentPerformance = [], getMemoryVersionStatus = undefined, nowMs = Date.now() }) {
   const runtimeActions = [];
 	const handledPositions = new Set();
@@ -28,6 +38,7 @@ export async function runManagementRuntimeActions(positionData, { cycleId, confi
 		const result = decision.active.critic.pass
 			? await executeTool(plannedAction.toolName, plannedAction.args, {
 				cycle_id: cycleId,
+				cycle_type: "management",
 				action_id: actionId,
 				...decision.active.execution_meta,
 			})
@@ -48,7 +59,7 @@ export async function runManagementRuntimeActions(positionData, { cycleId, confi
 			critic: decision.active.critic,
 			result,
 		});
-		handledPositions.add(position.position);
+		if (didHandleRuntimeAction(result)) handledPositions.add(position.position);
   }
 
 	if (slowReviewDue) {
@@ -68,6 +79,7 @@ export async function runManagementRuntimeActions(positionData, { cycleId, confi
 			const result = decision.active.critic.pass
 				? await executeTool(plannedAction.toolName, plannedAction.args, {
 					cycle_id: cycleId,
+					cycle_type: "management",
 					action_id: actionId,
 					...decision.active.execution_meta,
 				})
@@ -88,6 +100,7 @@ export async function runManagementRuntimeActions(positionData, { cycleId, confi
 				critic: decision.active.critic,
 				result,
 			});
+			if (didHandleRuntimeAction(result)) handledPositions.add(position.position);
 		}
 		markSlowManagementReview({ nowMs });
 	}

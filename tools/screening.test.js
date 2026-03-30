@@ -1,10 +1,14 @@
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import test from "node:test";
 
 import { fetchWithTimeout } from "./fetch-utils.js";
 import { getTokenHolders } from "./token.js";
 import { discoverPools, evaluateCandidateSnapshot, getTopCandidates, rankCandidateSnapshots, resetDiscoveryCache } from "./screening.js";
 import { config } from "../config.js";
+import { evaluateCandidateIntel } from "../screening-intel.js";
 
 function buildPool(overrides = {}) {
   return {
@@ -185,6 +189,97 @@ test("fetchWithTimeout aborts hung screening fetches", async () => {
 	}
 });
 
+test("discoverPools filters pools whose creator is denylisted", async () => {
+	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "zenith-creator-blacklist-test-"));
+	const blacklistPath = path.join(tempDir, "creator-blacklist.json");
+	const originalEnv = process.env.ZENITH_CREATOR_BLACKLIST_FILE;
+	const originalFetch = global.fetch;
+
+	fs.writeFileSync(blacklistPath, JSON.stringify({
+		creatorblocked1111111111111111111111111111111: {
+			reason: "known blocked deployer",
+			added_by: "operator",
+		},
+	}, null, 2));
+	process.env.ZENITH_CREATOR_BLACKLIST_FILE = blacklistPath;
+
+	global.fetch = async () => ({
+		ok: true,
+		json: async () => ({
+			total: 2,
+			data: [
+				{
+					pool_address: "pool-blocked",
+					name: "Blocked-SOL",
+					token_x: { address: "mint-blocked", symbol: "BLK", organic_score: 80, warnings: [], created_at: Date.now() - (6 * 60 * 60 * 1000), dev: "creatorblocked1111111111111111111111111111111" },
+					token_y: { address: "So11111111111111111111111111111111111111112", symbol: "SOL" },
+					pool_type: "dlmm",
+					dlmm_params: { bin_step: 80 },
+					fee_pct: 1,
+					active_tvl: 15000,
+					fee: 200,
+					volume: 50000,
+					fee_active_tvl_ratio: 1.33,
+					volatility: 3,
+					base_token_holders: 1200,
+					active_positions: 15,
+					active_positions_pct: 60,
+					open_positions: 10,
+					pool_price: 1,
+					pool_price_change_pct: 2,
+					price_trend: [],
+					min_price: 0.8,
+					max_price: 1.2,
+					volume_change_pct: 5,
+					fee_change_pct: 2,
+					swap_count: 10,
+					unique_traders: 7,
+				},
+				{
+					pool_address: "pool-ok",
+					name: "Allowed-SOL",
+					token_x: { address: "mint-ok", symbol: "OK", organic_score: 80, warnings: [], created_at: Date.now() - (6 * 60 * 60 * 1000), dev: "creator-ok" },
+					token_y: { address: "So11111111111111111111111111111111111111112", symbol: "SOL" },
+					pool_type: "dlmm",
+					dlmm_params: { bin_step: 80 },
+					fee_pct: 1,
+					active_tvl: 15000,
+					fee: 200,
+					volume: 50000,
+					fee_active_tvl_ratio: 1.33,
+					volatility: 3,
+					base_token_holders: 1200,
+					active_positions: 15,
+					active_positions_pct: 60,
+					open_positions: 10,
+					pool_price: 1,
+					pool_price_change_pct: 2,
+					price_trend: [],
+					min_price: 0.8,
+					max_price: 1.2,
+					volume_change_pct: 5,
+					fee_change_pct: 2,
+					swap_count: 10,
+					unique_traders: 7,
+				},
+			],
+		}),
+	});
+
+	try {
+		resetDiscoveryCache();
+		const result = await discoverPools({ page_size: 5, timeframe: "5m", category: "trending", force: true });
+		assert.equal(result.pools.length, 1);
+		assert.equal(result.pools[0].pool, "pool-ok");
+	} finally {
+		resetDiscoveryCache();
+		global.fetch = originalFetch;
+		if (originalEnv) process.env.ZENITH_CREATOR_BLACKLIST_FILE = originalEnv;
+		else delete process.env.ZENITH_CREATOR_BLACKLIST_FILE;
+		fs.rmSync(tempDir, { recursive: true, force: true });
+	}
+});
+
 test("getTokenHolders keeps holder intel when optional supply lookup times out", async () => {
 	const originalFetch = global.fetch;
 
@@ -211,6 +306,197 @@ test("getTokenHolders keeps holder intel when optional supply lookup times out",
 		assert.equal(result.top_10_real_holders_pct, "12.50");
 	} finally {
 		global.fetch = originalFetch;
+	}
+});
+
+test("getTokenHolders surfaces blacklisted holder and funding addresses", async () => {
+	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "zenith-address-blacklist-test-"));
+	const blacklistPath = path.join(tempDir, "address-blacklist.json");
+	const originalEnv = process.env.ZENITH_ADDRESS_BLACKLIST_FILE;
+	const originalFetch = global.fetch;
+
+	fs.writeFileSync(blacklistPath, JSON.stringify({
+		bwamJzztZsepfkteWRChggmXuiiCQvpLqPietdNfSXa: { reason: "known scammer / rug-puller address" },
+		D9gQ6RhKEpnobPBUdWY5bPQt2p3zGk3iVz6ChpUi2ArA: { reason: "known scammer / rug-puller address" },
+	}, null, 2));
+	process.env.ZENITH_ADDRESS_BLACKLIST_FILE = blacklistPath;
+
+	global.fetch = async (url) => {
+		if (String(url).includes("/holders/") && String(url).includes("addresses=")) {
+			return { ok: true, json: async () => [] };
+		}
+		if (String(url).includes("/holders/")) {
+			return {
+				ok: true,
+				json: async () => ([
+					{
+						address: "bwamJzztZsepfkteWRChggmXuiiCQvpLqPietdNfSXa",
+						amount: 50,
+						percentage: 12.5,
+						tags: [],
+					},
+					{
+						address: "safe-holder-address-1",
+						amount: 25,
+						percentage: 6.25,
+						tags: [],
+						addressInfo: {
+							fundingAddress: "D9gQ6RhKEpnobPBUdWY5bPQt2p3zGk3iVz6ChpUi2ArA",
+							fundingAmount: 1,
+							fundingSlot: 100,
+						},
+					},
+				]),
+			};
+		}
+		if (String(url).includes("/assets/search")) {
+			return {
+				ok: true,
+				json: async () => ([{ totalSupply: 400 }]),
+			};
+		}
+		throw new Error(`Unexpected URL: ${url}`);
+	};
+
+	try {
+		const tokenModule = await import(`./token.js?test=${Date.now()}`);
+		const result = await tokenModule.getTokenHolders({ mint: "mint-1", limit: 5 });
+		assert.equal(result.blacklisted_addresses.length, 2);
+		assert.deepEqual(
+			result.blacklisted_addresses.map((entry) => entry.match_type).sort(),
+			["funding", "holder"],
+		);
+	} finally {
+		global.fetch = originalFetch;
+		if (originalEnv) process.env.ZENITH_ADDRESS_BLACKLIST_FILE = originalEnv;
+		else delete process.env.ZENITH_ADDRESS_BLACKLIST_FILE;
+		fs.rmSync(tempDir, { recursive: true, force: true });
+	}
+});
+
+test("evaluateCandidateIntel hard-blocks blacklisted scam addresses", () => {
+	const intel = evaluateCandidateIntel(buildPool(), {
+		smartWallets: { in_pool: [] },
+		holders: {
+			top_10_real_holders_pct: "15.00",
+			bundlers_pct_in_top_100: "1.00",
+			global_fees_sol: 90,
+			blacklisted_addresses: [
+				{ address: "bwamJzztZsepfkteWRChggmXuiiCQvpLqPietdNfSXa", match_type: "holder" },
+			],
+		},
+		narrative: { narrative: "Real narrative that would otherwise pass screening." },
+		scoredLpers: { candidates: [] },
+	});
+
+	assert.equal(intel.hard_blocked, true);
+	assert.match(intel.hard_blocks[0], /blacklisted_scam_addresses/i);
+	assert.equal(intel.holder_metrics.blacklisted_address_hits, 1);
+});
+
+test("evaluateCandidateIntel hard-blocks when critical holder or OKX intel is unavailable", () => {
+	const intel = evaluateCandidateIntel(buildPool(), {
+		smartWallets: { in_pool: [] },
+		holders: null,
+		narrative: { narrative: "Real narrative that would otherwise pass screening." },
+		scoredLpers: { candidates: [] },
+		okx: null,
+		availability: {
+			holders: "unavailable",
+			okx_advanced: "unavailable",
+		},
+	});
+
+	assert.equal(intel.hard_blocked, true);
+	assert.ok(intel.hard_blocks.includes("holder_intel_unavailable"));
+	assert.ok(intel.hard_blocks.includes("okx_advanced_unavailable"));
+});
+
+test("evaluateCandidateIntel hard-blocks honeypot and excessive OKX bundle concentration", () => {
+	const intel = evaluateCandidateIntel(buildPool(), {
+		smartWallets: { in_pool: [{ name: "wallet-1" }] },
+		holders: {
+			top_10_real_holders_pct: "15.00",
+			bundlers_pct_in_top_100: "1.00",
+			global_fees_sol: 90,
+			blacklisted_addresses: [],
+		},
+		narrative: { narrative: "Real narrative that would otherwise pass screening." },
+		scoredLpers: { candidates: [{ score_breakdown: { total_score: 40 } }] },
+		okx: {
+			advanced: {
+				is_honeypot: true,
+				bundle_pct: config.screening.maxBundlePct + 5,
+				risk_level: 4,
+				sniper_pct: 9.5,
+				suspicious_pct: 4.1,
+				smart_money_buy: true,
+				dev_sold_all: true,
+				dex_boost: false,
+				dex_screener_paid: true,
+			},
+			clusters: [{ trend: "buy", has_kol: true }],
+			price: { price_vs_ath_pct: 62.5, price_change_5m: 1.1, price_change_1h: 6.2, volume_5m: 1000, volume_1h: 12000, market_cap: 500000, liquidity: 100000, holders: 3000 },
+		},
+	});
+
+	assert.equal(intel.hard_blocked, true);
+	assert.ok(intel.hard_blocks.includes("okx_honeypot_tag"));
+	assert.ok(intel.hard_blocks.some((entry) => entry.startsWith("okx_bundle_pct")));
+	assert.equal(intel.okx.smart_money_buy, true);
+	assert.equal(intel.okx.cluster_has_kol, true);
+	assert.ok(intel.score.context_score > intel.score.ranking_score);
+});
+
+test("evaluateCandidateIntel hard-blocks denylisted creator from OKX enrichment", () => {
+	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "zenith-okx-creator-test-"));
+	const blacklistPath = path.join(tempDir, "creator-blacklist.json");
+	const originalEnv = process.env.ZENITH_CREATOR_BLACKLIST_FILE;
+
+	fs.writeFileSync(blacklistPath, JSON.stringify({
+		creatorblocked1111111111111111111111111111111: {
+			reason: "known blocked deployer",
+		},
+	}, null, 2));
+	process.env.ZENITH_CREATOR_BLACKLIST_FILE = blacklistPath;
+
+	try {
+		const intel = evaluateCandidateIntel({
+			...buildPool(),
+			dev: null,
+		}, {
+			smartWallets: { in_pool: [] },
+			holders: {
+				top_10_real_holders_pct: "15.00",
+				bundlers_pct_in_top_100: "1.00",
+				global_fees_sol: 90,
+				blacklisted_addresses: [],
+			},
+			narrative: { narrative: "Real narrative that would otherwise pass screening." },
+			scoredLpers: { candidates: [] },
+			okx: {
+				advanced: {
+					creator: "creatorblocked1111111111111111111111111111111",
+					bundle_pct: 5,
+					is_honeypot: false,
+					smart_money_buy: false,
+					dev_sold_all: false,
+					dex_boost: false,
+					dex_screener_paid: false,
+				},
+				clusters: [],
+				price: null,
+			},
+		});
+
+		assert.equal(intel.hard_blocked, true);
+		assert.ok(intel.hard_blocks.some((entry) => entry.startsWith("blocked_creator")));
+		assert.equal(intel.okx.creator_blocked, true);
+		assert.equal(intel.okx.creator, "creatorblocked1111111111111111111111111111111");
+	} finally {
+		if (originalEnv) process.env.ZENITH_CREATOR_BLACKLIST_FILE = originalEnv;
+		else delete process.env.ZENITH_CREATOR_BLACKLIST_FILE;
+		fs.rmSync(tempDir, { recursive: true, force: true });
 	}
 });
 

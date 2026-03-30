@@ -89,18 +89,19 @@ export async function handleSuccessfulToolSideEffects({
 	if (
 		name === "claim_fees" &&
 		config.management.autoSwapAfterClaim &&
-		result.base_mint
+		(result.claimed_mint || result.base_mint)
 	) {
-		const swapAmount = Number(result.base_amount_received ?? 0);
+		const claimedMint = result.claimed_mint || result.base_mint;
+		const swapAmount = Number(result.claimed_amount_received ?? result.base_amount_received ?? 0);
 		if (Number.isFinite(swapAmount) && swapAmount > 0) {
 			log(
 				"executor",
-				`Auto-swapping observed claimed proceeds ${swapAmount} of ${result.base_mint.slice(0, 8)} back to SOL`,
+				`Auto-swapping observed claimed proceeds ${swapAmount} of ${claimedMint.slice(0, 8)} back to SOL`,
 			);
 			const autoSwapResult = await executeTool(
 				"swap_token",
 				{
-					input_mint: result.base_mint,
+					input_mint: claimedMint,
 					output_mint: "SOL",
 					amount: swapAmount,
 				},

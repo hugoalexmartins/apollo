@@ -26,6 +26,16 @@ function buildReadOnlyOptions(memoryContextOverride, stateSnapshot = null) {
 	};
 }
 
+function buildSettledThesis(result, {
+	parser,
+	fallback,
+}) {
+	if (result.status === "fulfilled") {
+		return parser(result.value?.content || "");
+	}
+	return fallback(result.reason);
+}
+
 function buildScreeningPrompt({
 	strategyBlock,
 	regimeContext,
@@ -170,36 +180,63 @@ export async function runScreeningDecisionEngine({
 	candidateContext,
 	finalists,
 	recentPerformance = [],
+	strategy = null,
 	getMemoryContextRuntime = getMemoryContext,
 	getMemoryVersionStatusRuntime = getMemoryVersionStatus,
 	stateSnapshot = null,
 }) {
 	const versions = getMemoryVersionStatusRuntime();
 	const prompt = buildScreeningPrompt({ strategyBlock, regimeContext, deployAmount, candidateContext, finalists });
-	const [activeResponse, shadowResponse] = await Promise.all([
+	const [activeResponse, shadowResponse] = await Promise.allSettled([
 		agentLoop(prompt, 1, [], "SCREENER", config.llm.screeningModel, 2048, buildReadOnlyOptions(getMemoryContextRuntime("SCREENER", { mode: "active" }), stateSnapshot)),
 		agentLoop(prompt, 1, [], "SCREENER", config.llm.screeningModel, 2048, buildReadOnlyOptions(getMemoryContextRuntime("SCREENER", { mode: "shadow" }), stateSnapshot)),
 	]);
 
-	const activeThesis = parseScreeningThesis(activeResponse.content, {
+	const activeContext = {
 		cycle_id,
 		cycle_type: "screening",
 		decision_mode: "model",
 		regime_label: regimeContext.regime,
 		deploy_amount: deployAmount,
 		finalists,
+		strategy,
 		memory_version: versions.active_version,
 		shadow_memory_version: versions.shadow_version,
-	});
-	const shadowThesis = parseScreeningThesis(shadowResponse.content, {
+	};
+	const shadowContext = {
 		cycle_id,
 		cycle_type: "screening",
 		decision_mode: "shadow",
 		regime_label: regimeContext.regime,
 		deploy_amount: deployAmount,
 		finalists,
+		strategy,
 		memory_version: versions.shadow_version,
 		shadow_memory_version: versions.shadow_version,
+	};
+	const activeThesis = buildSettledThesis(activeResponse, {
+		parser: (content) => parseScreeningThesis(content, activeContext),
+		fallback: (error) => buildFallbackThesis({
+			cycle_id,
+			cycle_type: "screening",
+			decision_mode: "model",
+			agent_role: "SCREENER",
+			memory_version: versions.active_version,
+			shadow_memory_version: versions.shadow_version,
+			reason: `screening thesis unavailable: ${error?.message || String(error)}`,
+		}),
+	});
+	const shadowThesis = buildSettledThesis(shadowResponse, {
+		parser: (content) => parseScreeningThesis(content, shadowContext),
+		fallback: (error) => buildFallbackThesis({
+			cycle_id,
+			cycle_type: "screening",
+			decision_mode: "shadow",
+			agent_role: "SCREENER",
+			memory_version: versions.shadow_version,
+			shadow_memory_version: versions.shadow_version,
+			reason: `shadow thesis unavailable: ${error?.message || String(error)}`,
+		}),
 	});
 
 	const assessment = evaluateDecisionThesis(activeThesis);
@@ -222,11 +259,15 @@ export async function runScreeningDecisionEngine({
 			summary: summarizeDecisionThesis(activeThesis, assessment, critic),
 		},
 		shadow: {
+			available: shadowResponse.status === "fulfilled",
 			thesis: shadowThesis,
 			assessment: evaluateDecisionThesis(shadowThesis),
 			summary: summarizeDecisionThesis(shadowThesis),
 		},
-		comparison: compareShadowDecision(activeThesis, shadowThesis),
+		comparison: {
+			...compareShadowDecision(activeThesis, shadowThesis),
+			shadow_available: shadowResponse.status === "fulfilled",
+		},
 	};
 }
 
@@ -243,24 +284,50 @@ export async function runManagementDecisionEngine({
 }) {
 	const versions = getMemoryVersionStatusRuntime();
 	const prompt = buildManagementPrompt(positionBlock);
-	const [activeResponse, shadowResponse] = await Promise.all([
+	const [activeResponse, shadowResponse] = await Promise.allSettled([
 		agentLoop(prompt, 1, [], "MANAGER", config.llm.managementModel, 2048, buildReadOnlyOptions(getMemoryContextRuntime("MANAGER", { mode: "active" }), stateSnapshot)),
 		agentLoop(prompt, 1, [], "MANAGER", config.llm.managementModel, 2048, buildReadOnlyOptions(getMemoryContextRuntime("MANAGER", { mode: "shadow" }), stateSnapshot)),
 	]);
 
-	const activeThesis = parseManagementThesis(activeResponse.content, {
+	const activeContext = {
 		cycle_id,
 		position,
 		decision_mode: "model",
 		memory_version: versions.active_version,
 		shadow_memory_version: versions.shadow_version,
-	});
-	const shadowThesis = parseManagementThesis(shadowResponse.content, {
+	};
+	const shadowContext = {
 		cycle_id,
 		position,
 		decision_mode: "shadow",
 		memory_version: versions.shadow_version,
 		shadow_memory_version: versions.shadow_version,
+	};
+	const activeThesis = buildSettledThesis(activeResponse, {
+		parser: (content) => parseManagementThesis(content, activeContext),
+		fallback: (error) => buildFallbackThesis({
+			cycle_id,
+			cycle_type: "management",
+			decision_mode: "model",
+			agent_role: "MANAGER",
+			target_id: position?.position || null,
+			memory_version: versions.active_version,
+			shadow_memory_version: versions.shadow_version,
+			reason: `management thesis unavailable: ${error?.message || String(error)}`,
+		}),
+	});
+	const shadowThesis = buildSettledThesis(shadowResponse, {
+		parser: (content) => parseManagementThesis(content, shadowContext),
+		fallback: (error) => buildFallbackThesis({
+			cycle_id,
+			cycle_type: "management",
+			decision_mode: "shadow",
+			agent_role: "MANAGER",
+			target_id: position?.position || null,
+			memory_version: versions.shadow_version,
+			shadow_memory_version: versions.shadow_version,
+			reason: `shadow thesis unavailable: ${error?.message || String(error)}`,
+		}),
 	});
 
 	const assessment = evaluateDecisionThesis(activeThesis);
@@ -282,11 +349,15 @@ export async function runManagementDecisionEngine({
 			summary: summarizeDecisionThesis(activeThesis, assessment, critic),
 		},
 		shadow: {
+			available: shadowResponse.status === "fulfilled",
 			thesis: shadowThesis,
 			assessment: evaluateDecisionThesis(shadowThesis),
 			summary: summarizeDecisionThesis(shadowThesis),
 		},
-		comparison: compareShadowDecision(activeThesis, shadowThesis),
+		comparison: {
+			...compareShadowDecision(activeThesis, shadowThesis),
+			shadow_available: shadowResponse.status === "fulfilled",
+		},
 	};
 }
 

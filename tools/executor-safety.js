@@ -159,6 +159,18 @@ export async function runSafetyChecksWithDeps(name, args, meta = {}, deps = {}) 
 			}
 
 			const positions = await getMyPositionsRuntime({ force: true });
+			if (positions?.error) {
+				return {
+					pass: false,
+					reason: `Unable to verify open positions: ${positions.error}`,
+				};
+			}
+			if (!Array.isArray(positions?.positions)) {
+				return {
+					pass: false,
+					reason: "Unable to verify open positions: positions payload missing positions array.",
+				};
+			}
 			const openPosition = positions.positions?.find(
 				(position) => position.position === args.position_address,
 			);

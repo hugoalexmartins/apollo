@@ -11,6 +11,7 @@ Implementation status updated: `2026-03-30`
 - **Screens pools** — continuously filters Meteora DLMM opportunities by fee/active-TVL, TVL, volume, organic score, holder count, market cap, bin step, and token-fee quality signals
 - **Ranks candidates deterministically** — assigns auditable screening scores in code before the LLM reasons about the final deploy choice
 - **Builds structured decision theses** — screening and model-managed management now produce explicit evidence, freshness, contradictions, confidence, and invalidation conditions before any write can happen
+- **Enriches the top shortlist with public OKX market intel** — uses bounded shortlist-only OKX enrichment for creator, concentration, cluster, and multi-timeframe market signals without turning OKX into the wide pre-ranker
 - **Plans deployments deterministically** — uses `choose_distribution_strategy` and `calculate_dynamic_bin_tiers` to shape each deployment or rebalance before capital is placed
 - **Scores LP wallets** — uses `score_top_lpers` to rank strong wallets for a pool, with optional enrichment when LP-agent scoring data is available
 - **Manages positions actively** — monitors open positions, claims fees when justified, and rebalances out-of-range positions immediately when no higher-priority hard exit applies
@@ -37,9 +38,15 @@ A third health check runs hourly to summarize portfolio state.
 **Current runtime behavior:**
 - Screening and model-managed management now generate one structured thesis per actual decision, not a vague free-form explanation: each thesis carries evidence rows, signal freshness, contradictions, confidence, invalidation conditions, and a stable `thesis_id`
 - Autonomous writes now pass through a real critic/abstention layer before execution; weak, stale, inconsistent, memory-conflicted, or recent-loss-clustered decisions route to `hold` or `manual_review` instead of falling through to an ungated write
+- Shadow inference is now best-effort instead of a hard dependency, so active screening and management decisions continue even when the shadow lane times out or fails
 - The executor boundary now requires an approved decision gate for cycle-driven write tools, and the resulting thesis / critic / memory-version metadata is preserved through journaling, replay envelopes, and tool-outcome records
 - Active policy memory is now isolated from observational memory and shadow-policy memory, so realized closes can teach the system without directly mutating the live prompt-conditioned policy lane
 - Shadow evaluation now runs continuously for screening and model-managed management: Zenith records active-vs-shadow divergence, replay-visible thesis comparisons, candidate precision, override-rate style metrics, regret hints, stop-loss clustering, and post-action outcome quality
+- Screening now fails closed on critical finalist-intel loss: if holder intel or OKX advanced intel is unavailable for a finalist, the candidate hard-blocks instead of silently losing those protections for the cycle
+- Screening now uses both holder/funding-address blacklists and creator/deployer denylists: `address-blacklist.json` trips finalist holder/funder hard blocks, while `creator-blacklist.json` blocks known bad deployers from either discovery `pool.dev` data or OKX `creatorAddress`
+- Screening finalist selection now backfills around enriched hard blocks, so one blocked top candidate no longer poisons the entire finalist window before thesis generation
+- Screening and management cycle statuses are now more truthful: provider/discovery failures surface as `failed_candidates`, approved-write execution errors surface as `failed_write`, and blocked runtime actions can escalate into model review instead of disappearing behind runtime-only handling
+- `claim_fees` now uses bounded post-claim settlement observation instead of a single immediate balance diff, and claim auto-swap follows the actually observed claimed mint/amount rather than assuming the base leg
 - Agent-side tool execution is more fault-tolerant: malformed tool-call JSON is repaired before execution, assistant tool-call history is sanitized before replay to the model, and polluted tool names are normalized before dispatch reaches the executor boundary
 - LP Agent consumers now share one bounded client across scoring and overview reads, with shared multi-key quota accounting, 429 retry/backoff, and a common anti-burst delay instead of separate ad hoc fetch paths
 - `tools/dlmm.js` is now narrower: pure DLMM planning, settlement observation, live position-context enrichment, and rebalance/compounding context helpers were split into dedicated modules while keeping the public tool surface stable
@@ -212,6 +219,7 @@ Edit `user-config.json`. The example file is a starting point; the runtime defau
 | `minVolumeToRebalance` | `1000` | Minimum pool volume needed for rebalance logic |
 | `maxBundlersPct` | `30` | Maximum allowed bundler concentration across top-100 holders |
 | `maxTop10Pct` | `60` | Maximum allowed top-10 real-holder concentration |
+| `maxBundlePct` | `30` | Maximum allowed OKX bundle concentration before finalist hard-blocking |
 
 ---
 
@@ -400,6 +408,13 @@ Zenith now includes a cached LP Agent overview helper for operator-facing visibi
 
 Holder-quality checks now rely on stronger signals such as `common_funder` and `funded_same_window`. The older `similar_amount` heuristic was removed because it over-flagged legitimate small holders at top-100 scale.
 
+Finalist quality gates are now stricter than the wide deterministic ranker:
+
+- finalists hard-block on blacklisted holder or funding addresses from `address-blacklist.json`
+- finalists hard-block on blocked creators from `creator-blacklist.json` using either discovery `pool.dev` or OKX `creatorAddress`
+- finalists hard-block on `okx_honeypot_tag`, excessive OKX bundle concentration, or unavailable critical holder / OKX advanced intel
+- if a top candidate hard-blocks during finalist enrichment, Zenith backfills the finalist set from the shortlist before thesis generation
+
 ### Deploy basis and action contracts
 
 Zenith now hardens deploy-time evaluation inputs and action contracts a little more aggressively:
@@ -433,6 +448,7 @@ Zenith now has focused provider-free checks for important deterministic control 
 - `prompt.test.js` — prompt/runtime contract expectations
 - `lessons.test.js` — threshold-evolution key alignment and attribution summaries
 - `runtime-policy.test.js` — runtime management policy decisions
+- `autonomy-engine.test.js` — best-effort shadow lane and active-thesis continuity
 - `test/test-runtime-fixes.js` — pure helper checks for required SOL floors and canonical screening-threshold summaries
 - `test/test-executor-boundary.js` — direct executor boundary checks for duplicate exposure, balance reserve enforcement, closed-position rejection, and blocked write recording
 - `cycle-trace.test.js` — cycle/action correlation and replay-envelope writing
@@ -445,6 +461,7 @@ Zenith now has focused provider-free checks for important deterministic control 
 - `screening-cycle-runner.test.js` — fail-closed screening prechecks and invalid regime-state handling
 - `management-cycle-runner.test.js` — runtime-only management cycle completion without model calls
 - `dlmm-deploy-guard.test.js` — low-yield cooldown and bounded deploy/rebalance guardrails
+- `dlmm-settlement.test.js` — bounded close/claim settlement observation helpers
 - `preflight.test.js` — `/preflight` report and recorded risk-opening validation
 - `operator-command-handlers.test.js` — scoped `/arm` parsing and durable `/resume` handling
 - `test/test-dry-run-startup.js` — provider-free dry-run startup verification for boot recovery + startup snapshot readiness
@@ -462,7 +479,7 @@ Zenith now has focused provider-free checks for important deterministic control 
 - `counterfactual-review.test.js` — observational counterfactual review persistence
 - `tools/study.test.js` — bounded LPAgent-disabled study fallback behavior
 
-Not every focused test is wired into `npm run test:hardening`; some of the newer autonomy-focused suites, such as `decision-thesis.test.js` and the broader `memory.test.js`, are still targeted regression checks that should be run explicitly when working in those areas.
+Not every focused test is wired into `npm run test:hardening`; the main remaining targeted regression suite outside the hardening gate is the broader `memory.test.js`, which should still be run explicitly when working in that area.
 
 Manual external smoke still exists for screening and the full agent path (`npm run test:screen`, `npm run test:agent`), but `npm run test:hardening` is the stronger reproducible signal for the deterministic control plane. The screening smoke now injects an empty-position view so it remains wallet-free while still exercising live discovery/detail reads.
 

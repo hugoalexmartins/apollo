@@ -32,6 +32,7 @@ test("screening thesis finalizes finalist deploy decisions into executable args"
 		cycle_id: "screening-1",
 		deploy_amount: 0.5,
 		regime_label: "neutral",
+		strategy: "spot",
 		finalists: [{ pool: "pool-1", name: "Alpha-SOL", deterministic_score: 91, hard_blocked: false }],
 		memory_version: "policy-v1",
 		shadow_memory_version: "policy-shadow-v1",
@@ -41,7 +42,54 @@ test("screening thesis finalizes finalist deploy decisions into executable args"
 	assert.equal(thesis.tool_name, "deploy_position");
 	assert.equal(thesis.args.pool_address, "pool-1");
 	assert.equal(thesis.args.amount_y, 0.5);
+	assert.equal(thesis.args.strategy, "spot");
 	assert.equal(assessment.pass, true);
+});
+
+test("screening thesis becomes inconsistent when selected pool is blocked or missing", () => {
+	const blockedParsed = parseDecisionThesisContent(JSON.stringify({
+		action: "deploy",
+		selected_pool: "pool-1",
+		summary: "Deploy into the blocked finalist.",
+		confidence: { score: 0.8, label: "high" },
+		evidence: [{ source: "ranking", summary: "top deterministic score", supports_action: true, freshness: "fresh" }],
+		freshness: { status: "fresh", oldest_signal_minutes: 3 },
+		contradictions: [],
+		invalidation_conditions: ["hard block appears", "signals go stale"],
+	}), {
+		cycle_id: "screening-contradiction",
+		decision_mode: "model",
+	});
+	const blockedThesis = finalizeScreeningThesis(blockedParsed.value, {
+		cycle_id: "screening-contradiction",
+		deploy_amount: 0.5,
+		regime_label: "neutral",
+		finalists: [{ pool: "pool-1", name: "Alpha-SOL", deterministic_score: 91, hard_blocked: true }],
+	});
+	const blockedAssessment = evaluateDecisionThesis(blockedThesis);
+	assert.equal(blockedAssessment.pass, false);
+	assert.ok(blockedThesis.contradictions.includes("selected_pool_hard_blocked"));
+
+	const missingParsed = parseDecisionThesisContent(JSON.stringify({
+		action: "deploy",
+		selected_pool: "pool-missing",
+		summary: "Deploy into a non-finalist.",
+		confidence: { score: 0.8, label: "high" },
+		evidence: [{ source: "ranking", summary: "top deterministic score", supports_action: true, freshness: "fresh" }],
+		freshness: { status: "fresh", oldest_signal_minutes: 3 },
+		contradictions: [],
+		invalidation_conditions: ["signals go stale"],
+	}), {
+		cycle_id: "screening-missing",
+		decision_mode: "model",
+	});
+	const missingThesis = finalizeScreeningThesis(missingParsed.value, {
+		cycle_id: "screening-missing",
+		deploy_amount: 0.5,
+		regime_label: "neutral",
+		finalists: [{ pool: "pool-1", name: "Alpha-SOL", deterministic_score: 91, hard_blocked: false }],
+	});
+	assert.ok(missingThesis.contradictions.includes("selected_pool_not_in_finalists"));
 });
 
 test("critic blocks deploy thesis during recent realized loss cluster", () => {

@@ -5,6 +5,7 @@ import path from "node:path";
 import test from "node:test";
 
 import { foldActionJournal, readActionJournal, setActionJournalPathForTests } from "./action-journal.js";
+import { config } from "./config.js";
 import {
   executeTool,
   resetExecutorTestOverrides,
@@ -233,6 +234,63 @@ test("executor auto-swap uses observed recovered amount and journals the swap wo
 		assert.equal(folded.some((workflow) => workflow.workflow_id === "cycle-close:close_position:1"), true);
 		assert.equal(folded.some((workflow) => workflow.workflow_id === "cycle-close:close_position:1:auto_swap_close"), true);
 	} finally {
+		resetExecutorTestOverrides();
+		setAutonomousWriteSuppression({ suppressed: false });
+		setActionJournalPathForTests(null);
+		process.chdir(originalCwd);
+		fs.rmSync(tempDir, { recursive: true, force: true });
+	}
+});
+
+test("executor auto-swap after claim uses observed claimed mint and amount", async () => {
+	const originalCwd = process.cwd();
+	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "zenith-executor-auto-swap-claim-test-"));
+	const journalPath = path.join(tempDir, "data", "workflow-actions.jsonl");
+	const originalAutoSwapAfterClaim = config.management.autoSwapAfterClaim;
+
+	try {
+		process.chdir(tempDir);
+		fs.mkdirSync(path.join(tempDir, "logs"), { recursive: true });
+		setActionJournalPathForTests(journalPath);
+		setAutonomousWriteSuppression({ suppressed: false });
+		config.management.autoSwapAfterClaim = true;
+
+		let receivedSwapArgs = null;
+		setExecutorTestOverrides({
+			getMyPositions: async () => ({ total_positions: 1, positions: [{ position: "pos-claim-1", pool: "pool-claim-1" }] }),
+			getWalletBalances: async () => ({ sol: 10, sol_price: 100, tokens: [] }),
+			recordToolOutcome: () => {},
+			tools: {
+				claim_fees: async () => ({
+					success: true,
+					position: "pos-claim-1",
+					claimed_mint: "mint-quote-1",
+					claimed_amount_received: 4.25,
+				}),
+				swap_token: async (args) => {
+					receivedSwapArgs = args;
+					return { success: true, tx: "swap-tx-claim-1" };
+				},
+			},
+		});
+
+		const result = await executeTool(
+			"claim_fees",
+			{ position_address: "pos-claim-1" },
+			buildApprovedMeta("cycle-claim", "cycle-claim:claim_fees:1"),
+		);
+
+		assert.equal(result.success, true);
+		assert.ok(receivedSwapArgs);
+		assert.equal(receivedSwapArgs.input_mint, "mint-quote-1");
+		assert.equal(receivedSwapArgs.amount, 4.25);
+
+		const journal = readActionJournal();
+		assert.equal(journal.parse_errors.length, 0);
+		const folded = foldActionJournal(journal.entries);
+		assert.equal(folded.some((workflow) => workflow.workflow_id === "cycle-claim:claim_fees:1:auto_swap_claim"), true);
+	} finally {
+		config.management.autoSwapAfterClaim = originalAutoSwapAfterClaim;
 		resetExecutorTestOverrides();
 		setAutonomousWriteSuppression({ suppressed: false });
 		setActionJournalPathForTests(null);

@@ -1,3 +1,4 @@
+import { matchBlacklistedAddresses } from "../address-blacklist.js";
 import { fetchWithTimeout } from "./fetch-utils.js";
 
 const DATAPI_BASE = "https://datapi.jup.ag/v1";
@@ -168,6 +169,20 @@ export async function getTokenHolders({ mint, limit = 20 }) {
 
   const totalBundlersPct = bundlers.reduce((s, b) => s + (Number(b.percentage) || 0), 0);
 
+  const blacklistedAddresses = matchBlacklistedAddresses([
+    ...realHolders.map((holder) => ({
+      address: holder.address,
+      match_type: "holder",
+    })),
+    ...realHolders
+      .filter((holder) => holder.funding?.address)
+      .map((holder) => ({
+        address: holder.funding.address,
+        match_type: "funding",
+        holder_address: holder.address,
+      })),
+  ]);
+
   // ─── Smart Wallet / KOL Cross-reference ──────────────────────
   // Use targeted holders endpoint — only returns matching wallets, no noise
   const { listSmartWallets } = await import("../smart-wallets.js");
@@ -243,6 +258,7 @@ export async function getTokenHolders({ mint, limit = 20 }) {
     top_10_real_holders_pct: top10Pct.toFixed(2),
     bundlers_pct_in_top_100: totalBundlersPct.toFixed(4),
     bundlers,
+    blacklisted_addresses: blacklistedAddresses,
     smart_wallets_holding: smartWalletsHolding,
     holders: mapped,
   };

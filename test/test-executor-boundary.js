@@ -137,6 +137,15 @@ async function main() {
   assert.equal(result.pass, false);
   assert.match(result.reason, /not currently open/i);
 
+	setExecutorTestOverrides({
+		getMyPositions: async () => ({ error: "positions unavailable" }),
+	});
+	result = await runSafetyChecks("close_position", {
+		position_address: "missing-position",
+	}, { cycle_id: "management-test" });
+	assert.equal(result.pass, false);
+	assert.match(result.reason, /unable to verify open positions/i);
+
 	let updateConfigCalled = false;
 	setExecutorTestOverrides({
 		tools: {

@@ -3,6 +3,14 @@ import { runScreeningDecisionEngine } from "./autonomy-engine.js";
 
 import { buildOpenPositionPnlInputs } from "./runtime-helpers.js";
 
+function classifyScreeningDecisionStatus(decisionResult) {
+	if (decisionResult?.manual_review) return "manual_review";
+	if (decisionResult?.error || decisionResult?.success === false) return "failed_write";
+	if (decisionResult?.blocked) return "held";
+	if (decisionResult?.success) return "completed";
+	return "held";
+}
+
 export function createScreeningCycleRunner(deps) {
   return async function runScreeningCycle({ cycleId } = {}) {
     const {
@@ -152,10 +160,70 @@ export function createScreeningCycleRunner(deps) {
 
       const currentBalance = preBalance;
       const performanceSummary = getPerformanceSummary?.() || null;
-      const discoverySnapshot = await discoverPools({
-        page_size: 50,
-        screeningConfig: config.screening,
-      }).catch((error) => ({ pools: [], error: error.message }));
+      let discoverySnapshot;
+      try {
+        discoverySnapshot = await discoverPools({
+          page_size: 50,
+          screeningConfig: config.screening,
+        });
+      } catch (error) {
+        const failure = classifyRuntimeFailure(error);
+        screeningEvaluation = {
+          cycle_id: cycleId,
+          cycle_type: "screening",
+          status: "failed_candidates",
+          summary: {
+            reason_code: failure.reason_code,
+            error: failure.message,
+          },
+          candidates: [],
+        };
+        appendReplayEnvelope({
+          cycle_id: cycleId,
+          cycle_type: "screening",
+          reason_code: failure.reason_code,
+          error: failure.message,
+        });
+        writeEvidenceBundle({
+          cycle_id: cycleId,
+          cycle_type: "screening",
+          status: "failed_candidates",
+          reason_code: failure.reason_code,
+          error: failure.message,
+          written_at: new Date().toISOString(),
+        });
+        screenReport = `Screening failed closed: [${failure.reason_code}] ${failure.message}`;
+        return;
+      }
+      if (discoverySnapshot?.error) {
+        const failure = classifyRuntimeFailure(new Error(discoverySnapshot.error));
+        screeningEvaluation = {
+          cycle_id: cycleId,
+          cycle_type: "screening",
+          status: "failed_candidates",
+          summary: {
+            reason_code: failure.reason_code,
+            error: failure.message,
+          },
+          candidates: [],
+        };
+        appendReplayEnvelope({
+          cycle_id: cycleId,
+          cycle_type: "screening",
+          reason_code: failure.reason_code,
+          error: failure.message,
+        });
+        writeEvidenceBundle({
+          cycle_id: cycleId,
+          cycle_type: "screening",
+          status: "failed_candidates",
+          reason_code: failure.reason_code,
+          error: failure.message,
+          written_at: new Date().toISOString(),
+        });
+        screenReport = `Screening failed closed: [${failure.reason_code}] ${failure.message}`;
+        return;
+      }
       const rawRegimeClassification = classifyRuntimeRegime({
         walletSol: currentBalance.sol,
         positionsCount: prePositions.total_positions,
@@ -427,8 +495,6 @@ export function createScreeningCycleRunner(deps) {
         return;
       }
       const shortlist = candidates.slice(0, Math.min(5, candidates.length));
-      const finalists = shortlist.slice(0, Math.min(2, shortlist.length));
-      const scorePreloadLimit = finalists.length;
 
 		if (shortlist.length === 0) {
 			log("cron", "Screening skipped - no eligible candidates after deterministic filters");
@@ -468,12 +534,15 @@ export function createScreeningCycleRunner(deps) {
         hard_blocks: [],
         smart_wallet_count: 0,
         holder_metrics: null,
-        wallet_score_source: finalists.some((candidate) => candidate.pool === pool.pool) ? "finalist_preload" : "not_loaded",
+        okx: null,
+        wallet_score_source: "finalist_preload",
         wallet_score_age_minutes: null,
       }));
 
       const finalistBlocks = [];
-      for (const pool of finalists) {
+		const finalists = [];
+		const inspectedCandidates = [];
+	      for (const pool of shortlist) {
         const planningPoolData = {
           six_hour_volatility: asNumber(pool.six_hour_volatility ?? pool.volatility, 0),
           volatility: asNumber(pool.six_hour_volatility ?? pool.volatility, 0),
@@ -506,7 +575,18 @@ export function createScreeningCycleRunner(deps) {
           holders: inspection.holders,
           narrative: inspection.narrative,
           scoredLpers,
+          okx: inspection.okx,
+			availability: inspection.availability,
         });
+        Object.assign(pool, {
+			hard_blocked: candidateIntel.hard_blocked,
+			hard_blocks: candidateIntel.hard_blocks,
+			context_score: candidateIntel.score.context_score,
+		});
+			inspectedCandidates.push(pool);
+			if (!candidateIntel.hard_blocked && finalists.length < 2) {
+				finalists.push(pool);
+			}
 
         const evalEntry = candidateEvaluations.find((entry) => entry.pool === pool.pool);
         if (evalEntry) {
@@ -515,6 +595,7 @@ export function createScreeningCycleRunner(deps) {
           evalEntry.hard_blocks = candidateIntel.hard_blocks;
           evalEntry.smart_wallet_count = candidateIntel.smart_wallet_count;
           evalEntry.holder_metrics = candidateIntel.holder_metrics;
+          evalEntry.okx = candidateIntel.okx;
           evalEntry.wallet_score_source = candidateIntel.wallet_score_source;
           evalEntry.wallet_score_age_minutes = candidateIntel.wallet_score_age_minutes;
         }
@@ -527,10 +608,11 @@ export function createScreeningCycleRunner(deps) {
           candidateIntel,
         }));
       }
+		const scorePreloadLimit = inspectedCandidates.length;
 
       const candidateContext = buildCandidateContext({ shortlist, finalists, inspectionRows: finalistBlocks });
 
-		const activeTop = shortlist[0] || null;
+		const activeTop = finalists[0] || null;
 		const alternates = [];
         for (const altRegime of listCounterfactualRegimes(regimeContext.regime)) {
           const altPack = getRegimePack(altRegime);
@@ -595,6 +677,7 @@ export function createScreeningCycleRunner(deps) {
 			deployAmount,
 			candidateContext,
 			finalists,
+			strategy: strategyKey,
 			recentPerformance,
 			getMemoryContextRuntime: getMemoryContext,
 			getMemoryVersionStatusRuntime: getMemoryVersionStatus,
@@ -651,7 +734,7 @@ export function createScreeningCycleRunner(deps) {
 		screeningEvaluation = {
 			cycle_id: cycleId,
 			cycle_type: "screening",
-			status: decision.active.critic.pass && decision.active.thesis.tool_name ? "completed" : decision.active.critic.status === "manual_review" ? "manual_review" : "held",
+			status: classifyScreeningDecisionStatus(decisionResult),
 			summary: {
 				total_screened: screeningTopCandidates?.total_screened ?? candidates.length,
 				total_eligible: totalEligible,

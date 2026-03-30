@@ -23,6 +23,7 @@
   "maxTokenAgeHours": null,
   "minFeeActiveTvlRatio": 0.05,
   "minTokenFeesSol": 30,
+  "maxBundlePct": 30,
   "takeProfitFeePct": 3,
   "stopLossPct": -20,
   "trailingTakeProfit": true,

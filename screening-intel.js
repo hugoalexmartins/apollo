@@ -1,7 +1,9 @@
 import { config } from "./config.js";
+import { isBlacklistedCreator } from "./creator-blacklist.js";
 import { recallForPool } from "./pool-memory.js";
 import { getWalletScoreMemory, recallForScreening } from "./memory.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
+import { getFullTokenAnalysis } from "./tools/okx.js";
 import { getTokenHolders, getTokenInfo, getTokenNarrative } from "./tools/token.js";
 
 export function asNumber(value, fallback = 0) {
@@ -96,16 +98,40 @@ function hasUsableNarrative(narrativeResult) {
   return typeof text === "string" && text.trim().length >= 20;
 }
 
+function formatBlacklistedAddressBlock(hits = []) {
+	const summary = hits
+		.slice(0, 2)
+		.map((hit) => `${hit.match_type || "address"}:${String(hit.address || "").slice(0, 8)}`)
+		.join(", ");
+	const overflow = hits.length > 2 ? `, +${hits.length - 2} more` : "";
+	return `blacklisted_scam_addresses ${hits.length}${summary ? ` (${summary}${overflow})` : ""}`;
+}
+
 export function evaluateCandidateIntel(pool, {
   smartWallets,
   holders,
   narrative,
   scoredLpers,
+  okx,
+  availability = {},
 }) {
   const smartWalletCount = smartWallets?.in_pool?.length ?? 0;
+  const holdersUnavailable = availability.holders === "unavailable";
+  const okxAdvancedUnavailable = availability.okx_advanced === "unavailable";
   const top10Pct = asNumber(holders?.top_10_real_holders_pct, 0);
   const bundlersPct = asNumber(holders?.bundlers_pct_in_top_100, 0);
   const globalFeesSol = asNumber(holders?.global_fees_sol, 0);
+  const blacklistedAddressHits = Array.isArray(holders?.blacklisted_addresses)
+		? holders.blacklisted_addresses
+		: [];
+  const blockedCreator = isBlacklistedCreator(pool?.dev)
+		? pool.dev
+		: isBlacklistedCreator(okx?.advanced?.creator)
+			? okx.advanced.creator
+			: null;
+  const bundlePct = asNumber(okx?.advanced?.bundle_pct, 0);
+  const riskLevel = okx?.advanced?.risk_level ?? null;
+  const clusterKol = Array.isArray(okx?.clusters) && okx.clusters.some((cluster) => cluster.has_kol);
   const lpWalletTopScore = asNumber(scoredLpers?.candidates?.[0]?.score_breakdown?.total_score, 0);
   const hardBlocks = [];
 
@@ -118,6 +144,24 @@ export function evaluateCandidateIntel(pool, {
   if (holders && bundlersPct > config.screening.maxBundlersPct) {
     hardBlocks.push(`bundlers_pct ${bundlersPct.toFixed(1)} > ${config.screening.maxBundlersPct}`);
   }
+  if (holdersUnavailable) {
+		hardBlocks.push("holder_intel_unavailable");
+	}
+  if (blacklistedAddressHits.length > 0) {
+		hardBlocks.push(formatBlacklistedAddressBlock(blacklistedAddressHits));
+	}
+  if (blockedCreator) {
+		hardBlocks.push(`blocked_creator ${String(blockedCreator).slice(0, 8)}`);
+	}
+  if (okxAdvancedUnavailable) {
+		hardBlocks.push("okx_advanced_unavailable");
+	}
+  if (okx?.advanced?.is_honeypot) {
+		hardBlocks.push("okx_honeypot_tag");
+	}
+  if (okx?.advanced?.bundle_pct != null && bundlePct > config.screening.maxBundlePct) {
+		hardBlocks.push(`okx_bundle_pct ${bundlePct.toFixed(1)} > ${config.screening.maxBundlePct}`);
+	}
   if (smartWalletCount === 0 && !hasUsableNarrative(narrative)) {
     hardBlocks.push("missing_specific_narrative_without_smart_wallets");
   }
@@ -126,6 +170,9 @@ export function evaluateCandidateIntel(pool, {
     smart_wallet_bonus: roundMetric(Math.min(12, smartWalletCount * 4)),
     lp_wallet_bonus: roundMetric(Math.min(10, lpWalletTopScore / 10)),
     narrative_bonus: hasUsableNarrative(narrative) ? 4 : 0,
+    okx_smart_money_bonus: okx?.advanced?.smart_money_buy ? 3 : 0,
+    okx_dev_exit_bonus: okx?.advanced?.dev_sold_all ? 2 : 0,
+    okx_cluster_kol_bonus: clusterKol ? 2 : 0,
   };
   const walletScoreMessage = scoredLpers?.message || null;
   const walletScoreAgeMatch = walletScoreMessage?.match(/from\s+(\d+)\s+minute/);
@@ -139,6 +186,7 @@ export function evaluateCandidateIntel(pool, {
           top_10_pct: roundMetric(top10Pct),
           bundlers_pct: roundMetric(bundlersPct),
           global_fees_sol: roundMetric(globalFeesSol),
+				blacklisted_address_hits: blacklistedAddressHits.length,
         }
       : null,
     score: {
@@ -146,6 +194,30 @@ export function evaluateCandidateIntel(pool, {
       context_score: roundMetric((pool.deterministic_score || 0) + Object.values(bonusBreakdown).reduce((sum, value) => sum + value, 0)),
       bonus_breakdown: bonusBreakdown,
     },
+    okx: okx
+      ? {
+          risk_level: riskLevel,
+          creator: okx.advanced?.creator ?? pool?.dev ?? null,
+          creator_blocked: Boolean(blockedCreator),
+          bundle_pct: okx.advanced?.bundle_pct ?? null,
+          sniper_pct: okx.advanced?.sniper_pct ?? null,
+          suspicious_pct: okx.advanced?.suspicious_pct ?? null,
+          smart_money_buy: Boolean(okx.advanced?.smart_money_buy),
+          dev_sold_all: Boolean(okx.advanced?.dev_sold_all),
+          dex_boost: Boolean(okx.advanced?.dex_boost),
+          dex_screener_paid: Boolean(okx.advanced?.dex_screener_paid),
+          price_vs_ath_pct: okx.price?.price_vs_ath_pct ?? null,
+          price_change_5m: okx.price?.price_change_5m ?? null,
+          price_change_1h: okx.price?.price_change_1h ?? null,
+          volume_5m: okx.price?.volume_5m ?? null,
+          volume_1h: okx.price?.volume_1h ?? null,
+          market_cap: okx.price?.market_cap ?? null,
+          liquidity: okx.price?.liquidity ?? null,
+          holders: okx.price?.holders ?? null,
+          top_cluster_trend: okx.clusters?.[0]?.trend ?? null,
+          cluster_has_kol: clusterKol,
+        }
+      : null,
     wallet_score_source: walletScoreMessage?.includes("reused wallet-score memory") ? "memory_cache" : "live_or_not_preloaded",
     wallet_score_age_minutes: walletScoreAgeMatch ? Number(walletScoreAgeMatch[1]) : null,
   };
@@ -187,11 +259,12 @@ export function formatCandidateInspection(candidate) {
 
 export async function inspectCandidate(pool, executeTool, { includeWalletScore = true } = {}) {
   const mint = pool.base?.mint;
-  const [smartWallets, holders, narrative, tokenInfo, poolMemory, activeBin] = await Promise.allSettled([
+  const [smartWallets, holders, narrative, tokenInfo, okx, poolMemory, activeBin] = await Promise.allSettled([
     checkSmartWalletsOnPool({ pool_address: pool.pool }),
     mint ? getTokenHolders({ mint, limit: 100 }) : Promise.resolve(null),
     mint ? getTokenNarrative({ mint }) : Promise.resolve(null),
     mint ? getTokenInfo({ query: mint }) : Promise.resolve(null),
+    mint ? getFullTokenAnalysis(mint) : Promise.resolve(null),
     Promise.resolve(recallForPool(pool.pool)),
     executeTool("get_active_bin", { pool_address: pool.pool }),
   ]);
@@ -211,8 +284,15 @@ export async function inspectCandidate(pool, executeTool, { includeWalletScore =
   const h = holders.status === "fulfilled" ? holders.value : null;
   const n = narrative.status === "fulfilled" ? narrative.value : null;
   const ti = tokenInfo.status === "fulfilled" ? tokenInfo.value?.results?.[0] : null;
+  const okxInfo = okx.status === "fulfilled" ? okx.value : null;
   const mem = poolMemory.status === "fulfilled" ? poolMemory.value : null;
   const active = activeBin.status === "fulfilled" ? activeBin.value : null;
+  const availability = {
+		holders: mint ? (holders.status === "fulfilled" ? "ok" : "unavailable") : "skipped",
+		okx_advanced: mint
+			? (okx.status === "fulfilled" && okx.value?.availability?.advanced === "ok" ? "ok" : "unavailable")
+			: "skipped",
+	};
 
   return {
     pool,
@@ -220,9 +300,11 @@ export async function inspectCandidate(pool, executeTool, { includeWalletScore =
     holders: h,
     narrative: n,
     tokenInfo: ti,
+    okx: okxInfo,
     poolMemory: mem,
     activeBin: active,
     scoredLpers,
+		availability,
   };
 }
 
@@ -248,7 +330,6 @@ export function formatCandidates(candidates) {
 
 export function buildCandidateContext({
   shortlist,
-  finalists,
   inspectionRows,
 }) {
   const rankedShortlist = shortlist.length > 0
@@ -256,7 +337,7 @@ export function buildCandidateContext({
     : "none";
   let candidateContext = `\nRANKED SHORTLIST (deterministic rank before enrichment):\n${rankedShortlist}\n`;
   if (inspectionRows.length > 0) {
-    candidateContext += `\nFINALIST ANALYSIS (only top ${finalists.length} candidate${finalists.length === 1 ? "" : "s"} were enriched with smart wallets, holders, narrative, planner context, and LP-wallet scoring):\n${inspectionRows.join("\n\n")}\n`;
+    candidateContext += `\nFINALIST ANALYSIS (only top ${inspectionRows.length} candidate${inspectionRows.length === 1 ? "" : "s"} were enriched with smart wallets, holders, OKX market intel, narrative, planner context, and LP-wallet scoring):\n${inspectionRows.join("\n\n")}\n`;
   }
   return candidateContext;
 }
@@ -272,6 +353,7 @@ export function formatFinalistInspectionBlock({
   const h = inspection.holders;
   const n = inspection.narrative;
   const ti = inspection.tokenInfo;
+  const okx = inspection.okx;
   const mem = inspection.poolMemory;
   const scoredLpers = inspection.scoredLpers || {
     message: "wallet score unavailable",
@@ -287,6 +369,18 @@ export function formatFinalistInspectionBlock({
     : null;
   const holderLine = h
     ? `  holders: top_10_pct=${h.top_10_real_holders_pct ?? "?"}%, bundlers_pct=${h.bundlers_pct_in_top_100 ?? "?"}%, global_fees_sol=${h.global_fees_sol ?? "?"}`
+    : null;
+  const okxLine = candidateIntel.okx
+    ? `  okx: risk=${candidateIntel.okx.risk_level ?? "?"}, creator=${candidateIntel.okx.creator ? String(candidateIntel.okx.creator).slice(0, 8) : "?"}${candidateIntel.okx.creator_blocked ? "(blocked)" : ""}, bundle=${candidateIntel.okx.bundle_pct ?? "?"}%, sniper=${candidateIntel.okx.sniper_pct ?? "?"}%, suspicious=${candidateIntel.okx.suspicious_pct ?? "?"}%, ath=${candidateIntel.okx.price_vs_ath_pct ?? "?"}%${candidateIntel.okx.top_cluster_trend ? `, cluster=${candidateIntel.okx.top_cluster_trend}` : ""}${candidateIntel.okx.cluster_has_kol ? ", kol_cluster=yes" : ""}`
+    : null;
+  const okxTagsLine = okx?.advanced
+    ? `  okx_tags: ${[
+        okx.advanced.is_honeypot ? "honeypot" : null,
+        okx.advanced.smart_money_buy ? "smart_money_buy" : null,
+        okx.advanced.dev_sold_all ? "dev_sold_all" : null,
+        okx.advanced.dex_boost ? "dex_boost" : null,
+        okx.advanced.dex_screener_paid ? "ds_paid" : null,
+      ].filter(Boolean).join(", ") || "none"}`
     : null;
   const narrativeLine = truncatePromptText(n?.narrative, 200);
   const poolMemoryLine = truncatePromptText(mem, 140);
@@ -308,6 +402,8 @@ export function formatFinalistInspectionBlock({
     `  hard_gate: ${candidateIntel.hard_blocked ? `BLOCKED (${candidateIntel.hard_blocks.join(", ")})` : "pass"}`,
     smartWalletLine,
     holderLine,
+    okxLine,
+    okxTagsLine,
     inspection.activeBin?.binId != null ? `  active_bin: ${inspection.activeBin.binId}` : null,
     momentum ? `  momentum: ${momentum}` : null,
     narrativeLine ? `  narrative: ${narrativeLine}` : null,

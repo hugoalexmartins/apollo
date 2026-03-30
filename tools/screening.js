@@ -1,4 +1,5 @@
 import { config } from "../config.js";
+import { isBlacklistedCreator } from "../creator-blacklist.js";
 import { isBlacklisted } from "../token-blacklist.js";
 import { log } from "../logger.js";
 import { evaluateExposureAdmission } from "../runtime-policy.js";
@@ -100,12 +101,16 @@ export async function discoverPools({
       log("blacklist", `Filtered blacklisted token ${p.base?.symbol} (${p.base?.mint?.slice(0, 8)}) in pool ${p.name}`);
       return false;
     }
+    if (isBlacklistedCreator(p.dev)) {
+      log("creator_blacklist", `Filtered blocked creator ${p.dev?.slice(0, 8)} in pool ${p.name}`);
+      return false;
+    }
     return true;
   });
 
   const filtered = condensed.length - pools.length;
   if (filtered > 0) {
-    log("blacklist", `Filtered ${filtered} pool(s) with blacklisted tokens`);
+    log("blacklist", `Filtered ${filtered} pool(s) with blacklisted tokens or creators`);
   }
 
   const result = {
@@ -329,6 +334,7 @@ function condensePool(p) {
     holders: p.base_token_holders,
     mcap: round(p.token_x?.market_cap),
     organic_score: Math.round(p.token_x?.organic_score || 0),
+    dev: p.token_x?.dev || null,
 
     // Position health
     active_positions: p.active_positions,

@@ -256,3 +256,115 @@ test("management runner stamps screening trigger before follow-on empty-book scr
 	assert.equal(screeningTriggeredAt.length, 1);
 	assert.equal(typeof screeningTriggeredAt[0], "number");
 });
+
+test("management runner escalates blocked runtime actions into model evaluation", async () => {
+	const evaluations = [];
+	let agentLoopCalls = 0;
+	const executeCalls = [];
+
+	const run = createManagementCycleRunner({
+		log: () => {},
+		config: { llm: { managementModel: "test-model", maxSteps: 4 }, management: { outOfRangeWaitMinutes: 30 } },
+		getMyPositions: async () => ({ positions: [{ position: "pos-1", pool: "pool-1", pair: "Alpha-SOL", in_range: true, instruction: null, age_minutes: 30, unclaimed_fees_usd: 0 }] }),
+		getWalletBalances: async () => ({ sol: 2 }),
+		validateStartupSnapshot: () => null,
+		classifyRuntimeFailure: () => ({ reason_code: "ERR", message: "err" }),
+		appendReplayEnvelope: () => {},
+		writeEvidenceBundle: () => {},
+		enforceManagementIntervalFromPositions: () => ({ interval: 3, maxVolatility: 1 }),
+		recordPositionSnapshot: () => {},
+		getPositionPnl: async () => ({ pnl_pct: 6, pnl_usd: 10, unclaimed_fee_usd: 0, all_time_fees_usd: 0, fee_per_tvl_24h: 0.05, current_value_usd: 10, lower_bin: 1, upper_bin: 2, active_bin: 1, in_range: true }),
+		recallForPool: () => null,
+		recallForManagement: () => [],
+		isPnlSignalStale: () => false,
+		updatePnlAndCheckExits: () => null,
+		evaluatePortfolioGuard: () => ({ blocked: false }),
+		runManagementRuntimeActions: async () => [{ position: "pos-1", pair: "Alpha-SOL", toolName: "close_position", reason: "runtime close", rule: "RULE", actionId: "m-1", result: { blocked: true, reason: "runtime blocked" } }],
+		listActionJournalWorkflowsByCycle: () => [],
+		executeTool: async (name, args, meta) => {
+			executeCalls.push({ name, args, meta });
+			return { success: true, tool: name };
+		},
+		didRuntimeHandleManagementAction: () => false,
+		classifyManagementModelGate: () => ({ route: "runtime" }),
+		summarizeRuntimeActionResult: () => "blocked",
+		roundMetric: (value) => value,
+		agentLoop: async () => {
+			agentLoopCalls += 1;
+			return agentLoopCalls === 1
+				? { content: JSON.stringify({ action: "close", position: "pos-1", summary: "Close it.", confidence: { score: 0.8, label: "high" }, evidence: [{ source: "instruction", summary: "threshold reached", supports_action: true, freshness: "fresh" }, { source: "position_state", summary: "position remains eligible for close", supports_action: true, freshness: "fresh" }], freshness: { status: "fresh", oldest_signal_minutes: 1 }, contradictions: [], invalidation_conditions: ["position no longer open"] }) }
+				: { content: JSON.stringify({ action: "hold", position: "pos-1", summary: "Hold.", confidence: { score: 0.6, label: "medium" }, evidence: [{ source: "shadow", summary: "hold", supports_action: true, freshness: "fresh" }], freshness: { status: "fresh", oldest_signal_minutes: 1 }, contradictions: [], invalidation_conditions: ["market changes"] }) };
+		},
+		getPerformanceHistory: () => ({ positions: [] }),
+		getMemoryContext: () => null,
+		getMemoryVersionStatus: () => ({ active_version: "policy-v1", shadow_version: "policy-shadow-v1" }),
+		shouldTriggerFollowOnScreening: () => false,
+		runTriggeredScreening: async () => {},
+		recordCycleEvaluation: (value) => evaluations.push(value),
+		refreshRuntimeHealth: () => {},
+		telegramEnabled: () => false,
+		sendMessage: async () => {},
+		notifyOutOfRange: async () => {},
+		getManagementBusy: () => false,
+		getScreeningBusy: () => false,
+		getScreeningLastTriggered: () => 0,
+		setScreeningLastTriggered: () => {},
+		setManagementBusy: () => {},
+		setManagementLastRun: () => {},
+	});
+
+	await run({ cycleId: "management-test-runtime-escalation", screeningCooldownMs: 0 });
+	assert.equal(agentLoopCalls, 2);
+	assert.equal(executeCalls.length, 1);
+	assert.equal(executeCalls[0].name, "close_position");
+	assert.equal(evaluations[0].status, "completed");
+});
+
+test("management runner marks failed_write when model-approved write errors", async () => {
+	const evaluations = [];
+	const run = createManagementCycleRunner({
+		log: () => {},
+		config: { llm: { managementModel: "test-model", maxSteps: 4 }, management: { outOfRangeWaitMinutes: 30 } },
+		getMyPositions: async () => ({ positions: [{ position: "pos-1", pool: "pool-1", pair: "Alpha-SOL", in_range: true, instruction: "close at 5%", age_minutes: 30, unclaimed_fees_usd: 0 }] }),
+		getWalletBalances: async () => ({ sol: 2 }),
+		validateStartupSnapshot: () => null,
+		classifyRuntimeFailure: () => ({ reason_code: "ERR", message: "err" }),
+		appendReplayEnvelope: () => {},
+		writeEvidenceBundle: () => {},
+		enforceManagementIntervalFromPositions: () => ({ interval: 3, maxVolatility: 1 }),
+		recordPositionSnapshot: () => {},
+		getPositionPnl: async () => ({ pnl_pct: 6, pnl_usd: 10, unclaimed_fee_usd: 0, all_time_fees_usd: 0, fee_per_tvl_24h: 0.05, current_value_usd: 10, lower_bin: 1, upper_bin: 2, active_bin: 1, in_range: true }),
+		recallForPool: () => null,
+		recallForManagement: () => [],
+		isPnlSignalStale: () => false,
+		updatePnlAndCheckExits: () => null,
+		evaluatePortfolioGuard: () => ({ blocked: false }),
+		runManagementRuntimeActions: async () => [],
+		listActionJournalWorkflowsByCycle: () => [],
+		executeTool: async () => ({ error: "tx failed" }),
+		didRuntimeHandleManagementAction: () => false,
+		classifyManagementModelGate: () => ({ route: "model" }),
+		summarizeRuntimeActionResult: () => "error",
+		roundMetric: (value) => value,
+		agentLoop: async () => ({ content: JSON.stringify({ action: "close", position: "pos-1", summary: "Close it.", confidence: { score: 0.8, label: "high" }, evidence: [{ source: "instruction", summary: "threshold reached", supports_action: true, freshness: "fresh" }, { source: "position_state", summary: "position remains eligible for close", supports_action: true, freshness: "fresh" }], freshness: { status: "fresh", oldest_signal_minutes: 1 }, contradictions: [], invalidation_conditions: ["position no longer open"] }) }),
+		getPerformanceHistory: () => ({ positions: [] }),
+		getMemoryContext: () => null,
+		getMemoryVersionStatus: () => ({ active_version: "policy-v1", shadow_version: "policy-shadow-v1" }),
+		shouldTriggerFollowOnScreening: () => false,
+		runTriggeredScreening: async () => {},
+		recordCycleEvaluation: (value) => evaluations.push(value),
+		refreshRuntimeHealth: () => {},
+		telegramEnabled: () => false,
+		sendMessage: async () => {},
+		notifyOutOfRange: async () => {},
+		getManagementBusy: () => false,
+		getScreeningBusy: () => false,
+		getScreeningLastTriggered: () => 0,
+		setScreeningLastTriggered: () => {},
+		setManagementBusy: () => {},
+		setManagementLastRun: () => {},
+	});
+
+	await run({ cycleId: "management-test-failed-write", screeningCooldownMs: 0 });
+	assert.equal(evaluations[0].status, "failed_write");
+});

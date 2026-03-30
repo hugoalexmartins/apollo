@@ -113,6 +113,49 @@ export function evaluatePostCloseSettlementObservation({
 	};
 }
 
+export function evaluatePostClaimSettlementObservation({
+	previousBalancesByMint = {},
+	observedBalancesByMint = {},
+	previousUnclaimedFeeUsd,
+	observedUnclaimedFeeUsd,
+}) {
+	for (const [mint, previousBalance] of Object.entries(previousBalancesByMint)) {
+		const observedBalance = observedBalancesByMint[mint];
+		const observedBalanceDelta = computeObservedTokenDelta({
+			previousBalance,
+			observedBalance,
+		});
+
+		if (Number.isFinite(observedBalanceDelta) && observedBalanceDelta > 0) {
+			return {
+				settled: true,
+				signal: "token_balance_delta_observed",
+				observed_mint: mint,
+				observed_balance: observedBalance,
+				observed_amount_received: observedBalanceDelta,
+				observed_balance_delta: observedBalanceDelta,
+				observed_unclaimed_fee_usd: observedUnclaimedFeeUsd ?? null,
+			};
+		}
+	}
+
+	const previousFees = Number(previousUnclaimedFeeUsd);
+	const observedFees = Number(observedUnclaimedFeeUsd);
+	if (Number.isFinite(previousFees) && Number.isFinite(observedFees) && observedFees < previousFees) {
+		return {
+			settled: true,
+			signal: "unclaimed_fee_drop_observed",
+			observed_unclaimed_fee_usd: observedFees,
+			observed_unclaimed_fee_delta: previousFees - observedFees,
+		};
+	}
+
+	return {
+		settled: false,
+		reason: "claim_settlement_signal_not_observed",
+	};
+}
+
 export async function getWalletTokenBalance({ walletPubkey, mint, getConnection } = {}) {
 	if (!walletPubkey || !mint) return null;
 	const response = await getConnection().getParsedTokenAccountsByOwner(walletPubkey, {
@@ -190,4 +233,79 @@ export async function waitForPostCloseSettlement({
 	}
 
 	return { settled: false, reason: "settlement_signal_not_observed" };
+}
+
+export async function waitForPostClaimSettlement({
+	walletPubkey,
+	observedMints = [],
+	positionAddress,
+	previousBalancesByMint = {},
+	previousUnclaimedFeeUsd = null,
+	maxAttempts = 6,
+	delayMs = 1000,
+	getConnection,
+	getMyPositions,
+	log,
+}) {
+	if ((observedMints?.length || 0) === 0 && !positionAddress) {
+		return { settled: false, reason: "missing_claim_settlement_observation_targets" };
+	}
+	const uniqueMints = [...new Set((observedMints || []).filter(Boolean))];
+
+	for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+		const observedBalancesByMint = {};
+		let observedUnclaimedFeeUsd = null;
+
+		try {
+			for (const mint of uniqueMints) {
+				const response = await getConnection().getParsedTokenAccountsByOwner(walletPubkey, {
+					mint: new PublicKey(mint),
+				});
+				observedBalancesByMint[mint] = (response.value || []).reduce((sum, account) => {
+					const amount = Number(account.account.data.parsed.info.tokenAmount.uiAmount || 0);
+					return sum + (Number.isFinite(amount) ? amount : 0);
+				}, 0);
+			}
+		} catch (error) {
+			log("claim_warn", `Claim settlement balance check ${attempt}/${maxAttempts} failed: ${error.message}`);
+		}
+
+		try {
+			if (positionAddress) {
+				const openPositions = await getMyPositions({ force: true });
+				if (!openPositions?.error && Array.isArray(openPositions?.positions)) {
+					const openPosition = openPositions.positions.find((position) => position.position === positionAddress);
+					observedUnclaimedFeeUsd = Number(openPosition?.unclaimed_fees_usd ?? openPosition?.unclaimed_fee_usd ?? null);
+				}
+			}
+		} catch (error) {
+			log("claim_warn", `Claim settlement open-position check ${attempt}/${maxAttempts} failed: ${error.message}`);
+		}
+
+		const observed = evaluatePostClaimSettlementObservation({
+			previousBalancesByMint,
+			observedBalancesByMint,
+			previousUnclaimedFeeUsd,
+			observedUnclaimedFeeUsd,
+		});
+		if (observed.settled) {
+			return {
+				settled: true,
+				signal: observed.signal,
+				observed_mint: observed.observed_mint ?? null,
+				observed_amount_received: observed.observed_amount_received ?? null,
+				observed_balance: observed.observed_balance ?? null,
+				observed_balance_delta: observed.observed_balance_delta ?? null,
+				observed_unclaimed_fee_usd: observed.observed_unclaimed_fee_usd ?? null,
+				observed_unclaimed_fee_delta: observed.observed_unclaimed_fee_delta ?? null,
+				attempts: attempt,
+			};
+		}
+
+		if (attempt < maxAttempts) {
+			await new Promise((resolve) => setTimeout(resolve, delayMs));
+		}
+	}
+
+	return { settled: false, reason: "claim_settlement_signal_not_observed" };
 }

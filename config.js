@@ -45,6 +45,7 @@ export const config = {
     minTokenFeesSol:   u.minTokenFeesSol   ?? 30,  // global fees paid (priority+jito tips). below = bundled/scam
     maxBundlersPct:    u.maxBundlersPct    ?? 30,  // max bundlers % in top 100 holders
     maxTop10Pct:       u.maxTop10Pct       ?? 60,  // max top 10 holders concentration
+    maxBundlePct:      u.maxBundlePct      ?? 30,  // OKX bundle holding threshold for finalist hard block
   },
 
   // ─── Position Management ────────────────
@@ -177,6 +178,7 @@ export function reloadScreeningThresholds() {
     if (fresh.maxBinStep     != null) s.maxBinStep     = fresh.maxBinStep;
     if (fresh.maxBundlersPct != null) s.maxBundlersPct = fresh.maxBundlersPct;
     if (fresh.maxTop10Pct    != null) s.maxTop10Pct    = fresh.maxTop10Pct;
+    if (fresh.maxBundlePct   != null) s.maxBundlePct   = fresh.maxBundlePct;
     if (hasOwn("minTokenAgeHours")) s.minTokenAgeHours = normalizeOptionalNonNegativeNumber(fresh.minTokenAgeHours, s.minTokenAgeHours);
     if (hasOwn("maxTokenAgeHours")) s.maxTokenAgeHours = normalizeOptionalNonNegativeNumber(fresh.maxTokenAgeHours, s.maxTokenAgeHours);
     if (fresh.timeframe      != null) s.timeframe      = fresh.timeframe;
