@@ -146,6 +146,25 @@ function appendCommittedWriteWarning(warnings, logType, prefix, error) {
 	log(logType, message);
 }
 
+export function resolveDeployInitialValueUsd({
+	initialValueUsd = null,
+	amountSol = 0,
+	solPrice = 0,
+	amountToken = 0,
+	activePrice = 0,
+} = {}) {
+	const explicit = Number(initialValueUsd);
+	if (Number.isFinite(explicit) && explicit > 0) {
+		return explicit;
+	}
+	return estimateInitialValueUsd({
+		amountSol,
+		solPrice,
+		amountToken,
+		activePrice,
+	});
+}
+
 async function getPool(poolAddress) {
 	const key = poolAddress.toString();
 	if (!poolCache.has(key)) {
@@ -215,6 +234,7 @@ export async function deployPosition({
 	volatility,
 	fee_tvl_ratio,
 	organic_score,
+	initial_value_usd,
 	decision_context = null,
 	bypass_portfolio_guard = false,
 }) {
@@ -316,7 +336,8 @@ export async function deployPosition({
 	const finalAmountX = amount_x ?? 0;
 	const walletBalances = await getWalletBalances({}).catch(() => null);
 	const solPrice = Number(walletBalances?.sol_price) || 0;
-	const deployValueUsd = estimateInitialValueUsd({
+	const resolvedInitialValueUsd = resolveDeployInitialValueUsd({
+		initialValueUsd: initial_value_usd,
 		amountSol: finalAmountY,
 		solPrice,
 		amountToken: finalAmountX,
@@ -360,7 +381,7 @@ export async function deployPosition({
 			amount_sol: finalAmountY,
 			amount_x: finalAmountX,
 			active_bin: activeBin.binId,
-			initial_value_usd: deployValueUsd,
+			initial_value_usd: resolvedInitialValueUsd,
 			opened_by_cycle_id: decision_context?.cycle_id || null,
 			opened_by_action_id: decision_context?.action_id || null,
 			opened_by_workflow_id: decision_context?.workflow_id || null,

@@ -9,6 +9,7 @@ import {
 	deployPosition,
 	finalizeCommittedWriteResult,
 	rebalanceOnExit,
+	resolveDeployInitialValueUsd,
 	shouldIgnoreTrackedLivePosition,
 } from "./tools/dlmm.js";
 
@@ -119,4 +120,16 @@ test("finalizeCommittedWriteResult keeps committed writes successful while surfa
 	assert.equal(result.manual_review_required, true);
 	assert.match(result.manual_review_reason || "", /local close recording failed/i);
 	assert.equal(result.warnings.length, 1);
+});
+
+test("resolveDeployInitialValueUsd prefers executor-derived basis over fallback recomputation", () => {
+	const result = resolveDeployInitialValueUsd({
+		initialValueUsd: 50,
+		amountSol: 0.5,
+		solPrice: 0,
+		amountToken: 0,
+		activePrice: 2,
+	});
+
+	assert.equal(result, 50);
 });
