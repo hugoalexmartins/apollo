@@ -466,7 +466,7 @@ export function evaluateDeployAdmission({
     }
 
     const minDeploy = Math.max(0.1, config.management.deployAmountSol);
-    if (amountY < minDeploy) {
+    if (amountY > 0 && amountY < minDeploy) {
       return {
         pass: false,
         code: DEPLOY_GOVERNANCE_CODES.BELOW_MIN_DEPLOY,
