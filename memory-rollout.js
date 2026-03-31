@@ -23,6 +23,20 @@ function isString(value) {
 	return typeof value === "string" && value.trim().length > 0;
 }
 
+function isHistoryEntry(value) {
+	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function isValidStateShape(value) {
+	return Boolean(value)
+		&& typeof value === "object"
+		&& !Array.isArray(value)
+		&& isString(value.active_version)
+		&& isString(value.shadow_version)
+		&& Array.isArray(value.history)
+		&& value.history.every(isHistoryEntry);
+}
+
 function normalizeState(value = {}) {
 	return {
 		active_version: isString(value.active_version) ? value.active_version : buildDefaultState().active_version,
@@ -39,6 +53,13 @@ function loadState() {
 			...buildDefaultState(),
 			invalid_state: true,
 			error: snapshot.error,
+		};
+	}
+	if (!isValidStateShape(snapshot.value)) {
+		return {
+			...buildDefaultState(),
+			invalid_state: true,
+			error: "memory-rollout.json has invalid shape",
 		};
 	}
 	return normalizeState(snapshot.value);

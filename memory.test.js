@@ -177,3 +177,28 @@ test("memory surfaces invalid prompt-memory nuggets instead of failing open", as
 		fs.rmSync(tempDir, { recursive: true, force: true });
 	}
 });
+
+test("memory rollout fails closed on malformed parseable rollout state", async () => {
+	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "zenith-memory-rollout-invalid-state-test-"));
+	const originalDir = process.env.ZENITH_MEMORY_DIR;
+	const originalRolloutFile = process.env.ZENITH_MEMORY_ROLLOUT_FILE;
+	const rolloutPath = path.join(tempDir, "memory-rollout.json");
+
+	try {
+		process.env.ZENITH_MEMORY_DIR = tempDir;
+		process.env.ZENITH_MEMORY_ROLLOUT_FILE = rolloutPath;
+		fs.writeFileSync(rolloutPath, JSON.stringify({ active_version: 123, shadow_version: null, history: {} }, null, 2));
+
+		const rollout = await import(`./memory-rollout.js?test=${Date.now()}`);
+
+		const status = rollout.getMemoryVersionStatus();
+		assert.equal(status.invalid_state, true);
+		assert.match(status.error || "", /invalid shape/i);
+	} finally {
+		if (originalDir) process.env.ZENITH_MEMORY_DIR = originalDir;
+		else delete process.env.ZENITH_MEMORY_DIR;
+		if (originalRolloutFile) process.env.ZENITH_MEMORY_ROLLOUT_FILE = originalRolloutFile;
+		else delete process.env.ZENITH_MEMORY_ROLLOUT_FILE;
+		fs.rmSync(tempDir, { recursive: true, force: true });
+	}
+});
