@@ -6,6 +6,9 @@ This file documents the major additions and behavior changes present in this for
 
 ### 2026-03-31
 
+- Added clearer autonomous DLMM execution-shape semantics: resolved screening/deploy plans now label `spot` more explicitly as single-sided SOL vs two-sided funding plus range shape, and thesis output carries that deploy-shape metadata forward for auditability.
+- Added lean auto-derived strategy candidates from realized closes: every 5th close can now update inactive `auto_derived` review artifacts in `strategy-library.json`, but they never auto-activate, never become screening inputs automatically, and cannot become active through strategy-removal fallback.
+- Fixed the remaining deploy/runtime integrity gaps from the internal audit: token-only `spot` deploy/rebalance flows no longer fail the SOL minimum gate, executor-derived `initial_value_usd` is now preserved instead of being silently recomputed to zero from a second lookup, and both memory-rollout and threshold-rollout state now fail closed on malformed parseable persistence instead of silently normalizing or clearing state.
 - Fixed the last autonomy-control audit gaps in the live write path: fresh positions now suppress PnL-driven management closes for the first two minutes after deploy, including parsed instruction-threshold exits.
 - Hardened executor write gating so expired recovery-resume overrides re-latch before any write can pass, and cycle-driven `manual_review` terminals now suppress later autonomous writes immediately in-process.
 - Tightened committed-write truthfulness across deploy / claim / close follow-up paths: once a transaction is confirmed, later settlement or local persistence failures now surface as `manual_review_required` instead of misclassifying the landed write as a hard failure.
