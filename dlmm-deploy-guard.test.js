@@ -5,7 +5,12 @@ import path from "node:path";
 import test from "node:test";
 
 import { recordPoolDeploy } from "./pool-memory.js";
-import { deployPosition, rebalanceOnExit } from "./tools/dlmm.js";
+import {
+	deployPosition,
+	finalizeCommittedWriteResult,
+	rebalanceOnExit,
+	shouldIgnoreTrackedLivePosition,
+} from "./tools/dlmm.js";
 
 test("deployPosition blocks low-yield cooldown pools before any execution path", async () => {
   const originalCwd = process.cwd();
@@ -96,4 +101,22 @@ test("rebalanceOnExit blocks redeploy when remaining open risk is unknown", asyn
 		process.chdir(originalCwd);
 		fs.rmSync(tempDir, { recursive: true, force: true });
 	}
+});
+
+test("suppressed failed deploy positions are ignored by live adoption", () => {
+	assert.equal(shouldIgnoreTrackedLivePosition({ closed: true, suppress_live_adoption: true }), true);
+	assert.equal(shouldIgnoreTrackedLivePosition({ closed: true, suppress_live_adoption: false }), false);
+	assert.equal(shouldIgnoreTrackedLivePosition({ closed: false, suppress_live_adoption: true }), false);
+});
+
+test("finalizeCommittedWriteResult keeps committed writes successful while surfacing manual review", () => {
+	const result = finalizeCommittedWriteResult(
+		{ success: true, position: "pos-committed-1" },
+		["Local close recording failed: state unavailable"],
+	);
+
+	assert.equal(result.success, true);
+	assert.equal(result.manual_review_required, true);
+	assert.match(result.manual_review_reason || "", /local close recording failed/i);
+	assert.equal(result.warnings.length, 1);
 });
