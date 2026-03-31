@@ -2,7 +2,7 @@
 
 **Autonomous Meteora DLMM liquidity management agent for Solana, powered by LLM-guided runtime orchestration.**
 
-Implementation status updated: `2026-03-30`
+Implementation status updated: `2026-03-31`
 
 ---
 
@@ -46,7 +46,10 @@ A third health check runs on `healthCheckIntervalMin` (default `60`) to summariz
 - Screening now uses both holder/funding-address blacklists and creator/deployer denylists: `address-blacklist.json` trips finalist holder/funder hard blocks, while `creator-blacklist.json` blocks known bad deployers from either discovery `pool.dev` data or OKX `creatorAddress`
 - Screening finalist selection now backfills around enriched hard blocks, so one blocked top candidate no longer poisons the entire finalist window before thesis generation
 - Screening and management cycle statuses are now more truthful: provider/discovery failures surface as `failed_candidates`, approved-write execution errors surface as `failed_write`, and blocked runtime actions can escalate into model review instead of disappearing behind runtime-only handling
+- Management now suppresses PnL-driven closes for the first two minutes after deploy, including parsed instruction-threshold exits, so fresh positions do not get closed on immediately noisy early PnL prints
 - `claim_fees` now uses bounded post-claim settlement observation instead of a single immediate balance diff, and claim auto-swap follows the actually observed claimed mint/amount rather than assuming the base leg
+- Committed write truthfulness is now tighter across deploy / claim / close follow-up paths: if a transaction lands but local settlement or persistence checks later fail, Zenith keeps the write result successful, raises `manual_review_required`, suppresses later autonomous writes in-process, and re-applies that suppression after restart through boot recovery
+- Wide-range deploy and recovery safety is tighter too: empty positions created before a failed liquidity-add phase are suppressed from later live adoption, direct deploys re-check blacklisted base mints at the executor boundary, and state sync now treats persisted `manual_review` workflows as blockers instead of auto-closing through them
 - Agent-side tool execution is more fault-tolerant: malformed tool-call JSON is repaired before execution, assistant tool-call history is sanitized before replay to the model, and polluted tool names are normalized before dispatch reaches the executor boundary
 - LP Agent consumers now share one bounded client across scoring and overview reads, with shared multi-key quota accounting, 429 retry/backoff, and a common anti-burst delay instead of separate ad hoc fetch paths
 - `tools/dlmm.js` is now narrower: pure DLMM planning, settlement observation, live position-context enrichment, and rebalance/compounding context helpers were split into dedicated modules while keeping the public tool surface stable

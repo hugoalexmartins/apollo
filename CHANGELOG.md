@@ -4,6 +4,14 @@ This file documents the major additions and behavior changes present in this for
 
 ## Recent updates
 
+### 2026-03-31
+
+- Fixed the last autonomy-control audit gaps in the live write path: fresh positions now suppress PnL-driven management closes for the first two minutes after deploy, including parsed instruction-threshold exits.
+- Hardened executor write gating so expired recovery-resume overrides re-latch before any write can pass, and cycle-driven `manual_review` terminals now suppress later autonomous writes immediately in-process.
+- Tightened committed-write truthfulness across deploy / claim / close follow-up paths: once a transaction is confirmed, later settlement or local persistence failures now surface as `manual_review_required` instead of misclassifying the landed write as a hard failure.
+- Hardened deploy and restart safety around manual review: wide-range empty-position orphans are suppressed from later live adoption, deploy safety now re-checks blacklisted base mints at the executor boundary, boot recovery re-suppresses persisted write-side `manual_review` workflows after restart, and state sync no longer auto-closes positions that are still under manual review.
+- Added focused regression coverage for the new runtime-policy, executor lifecycle, DLMM write-truthfulness, state-sync, and boot-recovery paths; the hardening core suite now passes with the final restart/manual-review closure in place.
+
 ### 2026-03-30
 
 - Closed the remaining config-truth and edge-entry semantics gaps: boot config hydration now validates persisted mutable config through the shared registry, `reloadScreeningThresholds()` now validates screening keys through the same registry path, threshold-rollout screening writes now normalize before write/apply/revert, and `healthCheckIntervalMin` is now a real scheduled runtime setting instead of a dead config field.
