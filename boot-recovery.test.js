@@ -187,6 +187,95 @@ test("boot recovery blocks autonomous writes when open-position observation is i
 	}
 });
 
+test("boot recovery fails closed when open-position observation throws", async () => {
+	const originalCwd = process.cwd();
+	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "zenith-boot-recovery-open-positions-throw-test-"));
+	const journalPath = path.join(tempDir, "data", "workflow-actions.jsonl");
+
+	try {
+		process.chdir(tempDir);
+		fs.mkdirSync(path.join(tempDir, "logs"), { recursive: true });
+		setActionJournalPathForTests(journalPath);
+
+		appendActionLifecycle({
+			workflow_id: "cycle-throw:close_position:1",
+			lifecycle: "intent",
+			tool: "close_position",
+			cycle_id: "cycle-throw",
+			action_id: "cycle-throw:close_position:1",
+			position_address: "pos-throw-1",
+		});
+
+		const decision = await runBootRecovery({
+			observeOpenPositions: async () => {
+				throw new Error("rpc boom");
+			},
+			observeTrackedPositions: async () => [],
+		});
+
+		assert.equal(decision.suppress_autonomous_writes, true);
+		assert.equal(decision.reason_code, "OPEN_POSITIONS_INVALID");
+		assert.equal(decision.parked_manual_review_workflows.includes("cycle-throw:close_position:1"), true);
+		assert.match(decision.observed.open_positions_error || "", /rpc boom/i);
+	} finally {
+		setActionJournalPathForTests(null);
+		process.chdir(originalCwd);
+		fs.rmSync(tempDir, { recursive: true, force: true });
+	}
+});
+
+test("boot recovery re-suppresses persisted manual-review write workflows after restart", async () => {
+	const originalCwd = process.cwd();
+	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "zenith-boot-recovery-persisted-manual-review-test-"));
+	const journalPath = path.join(tempDir, "data", "workflow-actions.jsonl");
+
+	try {
+		process.chdir(tempDir);
+		fs.mkdirSync(path.join(tempDir, "logs"), { recursive: true });
+		setActionJournalPathForTests(journalPath);
+
+		appendActionLifecycle({
+			workflow_id: "cycle-restart:claim_fees:1",
+			lifecycle: "intent",
+			tool: "claim_fees",
+			cycle_id: "cycle-restart",
+			action_id: "cycle-restart:claim_fees:1",
+			position_address: "pos-restart-1",
+		});
+		appendActionLifecycle({
+			workflow_id: "cycle-restart:claim_fees:1",
+			lifecycle: "completed",
+			tool: "claim_fees",
+			cycle_id: "cycle-restart",
+			action_id: "cycle-restart:claim_fees:1",
+			position_address: "pos-restart-1",
+		});
+		appendActionLifecycle({
+			workflow_id: "cycle-restart:claim_fees:1",
+			lifecycle: "manual_review",
+			tool: "claim_fees",
+			cycle_id: "cycle-restart",
+			action_id: "cycle-restart:claim_fees:1",
+			position_address: "pos-restart-1",
+			reason: "Post-claim settlement not observed before timeout: settlement_not_observed",
+		});
+
+		const decision = await runBootRecovery({
+			observeOpenPositions: async () => ({ positions: [] }),
+			observeTrackedPositions: async () => [],
+		});
+
+		assert.equal(decision.suppress_autonomous_writes, true);
+		assert.equal(decision.reason_code, "UNRESOLVED_WORKFLOW");
+		assert.equal(decision.parked_manual_review_workflows.includes("cycle-restart:claim_fees:1"), true);
+		assert.equal(decision.incident_key, "cycle-restart:claim_fees:1");
+	} finally {
+		setActionJournalPathForTests(null);
+		process.chdir(originalCwd);
+		fs.rmSync(tempDir, { recursive: true, force: true });
+	}
+});
+
 test("invalid state.json does not erase journal-based recovery gating", async () => {
   const originalCwd = process.cwd();
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "zenith-boot-recovery-invalid-state-test-"));

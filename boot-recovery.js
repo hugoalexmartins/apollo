@@ -204,7 +204,16 @@ export async function runBootRecovery({
 } = {}) {
   const journal = readActionJournal();
   const folded = foldActionJournal(journal.entries);
-  const openPositions = await observeOpenPositions();
+  let openPositions = { positions: [] };
+  try {
+    openPositions = await observeOpenPositions();
+  } catch (error) {
+    openPositions = {
+      positions: [],
+      error: error.message,
+    };
+    log("recovery_warn", `Open-position observation failed during boot recovery: ${error.message}`);
+  }
   const openPositionsValid = isValidOpenPositionObservation(openPositions);
 
   let trackedPositions = [];
@@ -238,6 +247,11 @@ export async function runBootRecovery({
 
   const observedOpenPositions = new Set([...openPositionSet, ...trackedOpenSet]);
 
+  const persistedManualReviewWorkflows = folded.filter((workflow) => {
+    if (!WRITE_TOOLS.has(workflow.tool)) return false;
+    return workflow.lifecycle === "manual_review";
+  });
+
   const unresolvedWriteWorkflows = folded.filter((workflow) => {
     if (!WRITE_TOOLS.has(workflow.tool)) return false;
     if (workflow.lifecycle === "completed" || workflow.lifecycle === "manual_review") return false;
@@ -245,7 +259,7 @@ export async function runBootRecovery({
   });
 
   const completedOnBoot = [];
-  const parkedManualReview = [];
+  const parkedManualReview = persistedManualReviewWorkflows.map((workflow) => workflow.workflow_id);
   for (const workflow of unresolvedWriteWorkflows) {
     const resolution = openPositionsValid
       ? resolveWorkflowByObservation(workflow, {
@@ -269,7 +283,9 @@ export async function runBootRecovery({
     if (resolution.lifecycle === "completed") {
       completedOnBoot.push(workflow.workflow_id);
     } else {
-      parkedManualReview.push(workflow.workflow_id);
+      if (!parkedManualReview.includes(workflow.workflow_id)) {
+        parkedManualReview.push(workflow.workflow_id);
+      }
     }
   }
 
