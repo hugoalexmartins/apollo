@@ -18,16 +18,18 @@ import {
 	consumeOneShotGeneralWriteApproval,
 	evaluateGeneralWriteApproval,
 } from "../operator-controls.js";
-import { evaluatePortfolioGuard } from "../portfolio-guards.js";
-import { validateRecordedRiskOpeningPreflight } from "../preflight.js";
 import {
 	addPoolNote,
 	getPoolDeployCooldown,
 	getPoolMemory,
 } from "../pool-memory.js";
-import { buildOpenPositionPnlInputs } from "../runtime-helpers.js";
-import { estimateInitialValueUsd } from "../runtime-helpers.js";
+import { evaluatePortfolioGuard } from "../portfolio-guards.js";
+import { validateRecordedRiskOpeningPreflight } from "../preflight.js";
 import { getRuntimeHealth } from "../runtime-health.js";
+import {
+	buildOpenPositionPnlInputs,
+	estimateInitialValueUsd,
+} from "../runtime-helpers.js";
 import { evaluateDeployAdmission } from "../runtime-policy.js";
 import {
 	addSmartWallet,
@@ -60,9 +62,9 @@ import {
 	claimFees,
 	closePosition,
 	deployPosition,
-	getPoolGovernanceMetadata,
 	getActiveBin,
 	getMyPositions,
+	getPoolGovernanceMetadata,
 	getPositionPnl,
 	getWalletPositions,
 	rebalanceOnExit,
@@ -73,9 +75,7 @@ import {
 	attachWriteDecisionContext,
 	recordWriteToolOutcome,
 } from "./executor-lifecycle.js";
-import {
-	runSafetyChecksWithDeps,
-} from "./executor-safety.js";
+import { runSafetyChecksWithDeps } from "./executor-safety.js";
 import { handleSuccessfulToolSideEffects } from "./executor-side-effects.js";
 import { discoverPools, getPoolDetail, getTopCandidates } from "./screening.js";
 import { getPoolInfo, scoreTopLPers, studyTopLPers } from "./study.js";
@@ -150,6 +150,10 @@ function normalizeToolName(name) {
 	return typeof name === "string" ? name.replace(/<.*$/, "").trim() : "";
 }
 
+function buildManualReviewSuppressionReason(toolName, reason) {
+	return `${toolName} requires manual review: ${reason || "unknown write-state divergence"}`;
+}
+
 // Registered by index.js so update_config can restart cron jobs when intervals change
 let _cronRestarter = null;
 export function registerCronRestarter(fn) {
@@ -178,7 +182,9 @@ export function setAutonomousWriteSuppression({
 		? reason || "manual review required"
 		: null;
 	_writeSuppressionCode = _autonomousWriteSuppressed ? code || null : null;
-	_writeSuppressionIncidentKey = _autonomousWriteSuppressed ? incidentKey || null : null;
+	_writeSuppressionIncidentKey = _autonomousWriteSuppressed
+		? incidentKey || null
+		: null;
 	if (_autonomousWriteSuppressed) {
 		_writeSuppressionOverrideUntilMs = null;
 		_writeSuppressionResumeReason = null;
@@ -186,7 +192,9 @@ export function setAutonomousWriteSuppression({
 		_writeSuppressionResumeIncidentKey = null;
 		return;
 	}
-	const parsedOverrideUntilMs = Number.isFinite(Number(overrideUntilMs))
+	const hasExplicitOverrideUntilMs =
+		overrideUntilMs != null && overrideUntilMs !== "";
+	const parsedOverrideUntilMs = hasExplicitOverrideUntilMs && Number.isFinite(Number(overrideUntilMs))
 		? Number(overrideUntilMs)
 		: Number.isFinite(Date.parse(overrideUntil || ""))
 			? Date.parse(overrideUntil)
@@ -198,9 +206,14 @@ export function setAutonomousWriteSuppression({
 }
 
 export function getAutonomousWriteSuppression() {
-	if (!_autonomousWriteSuppressed && Number.isFinite(_writeSuppressionOverrideUntilMs) && Date.now() > _writeSuppressionOverrideUntilMs) {
+	if (
+		!_autonomousWriteSuppressed &&
+		Number.isFinite(_writeSuppressionOverrideUntilMs) &&
+		Date.now() > _writeSuppressionOverrideUntilMs
+	) {
 		_autonomousWriteSuppressed = true;
-		_writeSuppressionReason = _writeSuppressionResumeReason || "manual review required";
+		_writeSuppressionReason =
+			_writeSuppressionResumeReason || "manual review required";
 		_writeSuppressionCode = _writeSuppressionResumeCode || null;
 		_writeSuppressionIncidentKey = _writeSuppressionResumeIncidentKey || null;
 		_writeSuppressionOverrideUntilMs = null;
@@ -213,7 +226,9 @@ export function getAutonomousWriteSuppression() {
 		reason: _writeSuppressionReason,
 		code: _writeSuppressionCode,
 		incident_key: _writeSuppressionIncidentKey,
-		override_until: Number.isFinite(_writeSuppressionOverrideUntilMs) ? new Date(_writeSuppressionOverrideUntilMs).toISOString() : null,
+		override_until: Number.isFinite(_writeSuppressionOverrideUntilMs)
+			? new Date(_writeSuppressionOverrideUntilMs).toISOString()
+			: null,
 	};
 }
 
@@ -329,11 +344,12 @@ const toolMap = {
 		}
 		return { error: "invalid mode" };
 	},
-	update_config: ({ changes, reason = "" }) => runUpdateConfig({
-		changes,
-		reason,
-		cronRestarter: _cronRestarter,
-	}),
+	update_config: ({ changes, reason = "" }) =>
+		runUpdateConfig({
+			changes,
+			reason,
+			cronRestarter: _cronRestarter,
+		}),
 };
 
 // Tools that modify on-chain state (need extra safety checks)
@@ -345,13 +361,19 @@ const WRITE_TOOLS = new Set([
 	"close_position",
 	"swap_token",
 ]);
-const GENERAL_APPROVAL_REQUIRED_TOOLS = new Set([...WRITE_TOOLS, "update_config"]);
+const GENERAL_APPROVAL_REQUIRED_TOOLS = new Set([
+	...WRITE_TOOLS,
+	"update_config",
+]);
 
 function resolveDecisionGate(meta = {}, args = {}) {
 	if (meta?.decision_gate && typeof meta.decision_gate === "object") {
 		return meta.decision_gate;
 	}
-	if (args?.decision_context?.decision_gate && typeof args.decision_context.decision_gate === "object") {
+	if (
+		args?.decision_context?.decision_gate &&
+		typeof args.decision_context.decision_gate === "object"
+	) {
 		return args.decision_context.decision_gate;
 	}
 	return null;
@@ -376,6 +398,14 @@ export async function executeTool(name, args, meta = {}) {
 			meta,
 			reason,
 		});
+		if (meta.cycle_id) {
+			setAutonomousWriteSuppression({
+				suppressed: true,
+				reason: buildManualReviewSuppressionReason(toolName, reason),
+				code: "WRITE_MANUAL_REVIEW",
+				incidentKey: workflowId || meta.action_id || null,
+			});
+		}
 	}
 
 	// ─── Validate tool exists ─────────────────
@@ -389,10 +419,13 @@ export async function executeTool(name, args, meta = {}) {
 	if (toolName === "deploy_position" && normalizedArgs) {
 		const wallet = await getWalletBalancesRuntime({}).catch(() => null);
 		const solPrice = Number(wallet?.sol_price) || 0;
-		const solLeg = Number(normalizedArgs.amount_y ?? normalizedArgs.amount_sol ?? 0);
-		const derivedInitialValueUsd = solPrice > 0 && solLeg > 0
-			? estimateInitialValueUsd({ amountSol: solLeg, solPrice })
-			: null;
+		const solLeg = Number(
+			normalizedArgs.amount_y ?? normalizedArgs.amount_sol ?? 0,
+		);
+		const derivedInitialValueUsd =
+			solPrice > 0 && solLeg > 0
+				? estimateInitialValueUsd({ amountSol: solLeg, solPrice })
+				: null;
 		normalizedArgs = {
 			...normalizedArgs,
 			initial_value_usd: derivedInitialValueUsd,
@@ -406,7 +439,11 @@ export async function executeTool(name, args, meta = {}) {
 	}
 
 	// ─── Pre-execution safety checks ──────────
-	if (!meta.cycle_id && GENERAL_APPROVAL_REQUIRED_TOOLS.has(toolName) && !WRITE_TOOLS.has(toolName)) {
+	if (
+		!meta.cycle_id &&
+		GENERAL_APPROVAL_REQUIRED_TOOLS.has(toolName) &&
+		!WRITE_TOOLS.has(toolName)
+	) {
 		const safetyCheck = await runSafetyChecks(toolName, normalizedArgs, meta);
 		if (!safetyCheck.pass) {
 			log("safety_block", `${toolName} blocked: ${safetyCheck.reason}`);
@@ -423,7 +460,10 @@ export async function executeTool(name, args, meta = {}) {
 			reason: "Autonomous memory mutation is disabled for cycle-driven roles.",
 		};
 	}
-	if (meta.cycle_id && (toolName === "set_position_note" || toolName === "add_pool_note")) {
+	if (
+		meta.cycle_id &&
+		(toolName === "set_position_note" || toolName === "add_pool_note")
+	) {
 		return {
 			blocked: true,
 			reason: "Autonomous note mutation is disabled for cycle-driven roles.",
@@ -431,9 +471,10 @@ export async function executeTool(name, args, meta = {}) {
 	}
 
 	if (WRITE_TOOLS.has(toolName)) {
-		if (_autonomousWriteSuppressed) {
+		const suppression = getAutonomousWriteSuppression();
+		if (suppression.suppressed) {
 			const reason =
-				_writeSuppressionReason ||
+				suppression.reason ||
 				"manual review required before autonomous writes can resume";
 			recordToolOutcomeRuntime({
 				tool: toolName,
@@ -495,8 +536,12 @@ export async function executeTool(name, args, meta = {}) {
 						thesis_id: meta.thesis_id || decisionGate?.thesis_id || null,
 						critic_status: meta.critic_status || decisionGate?.status || null,
 						critic_code: meta.critic_code || decisionGate?.reason_code || null,
-						memory_version: meta.memory_version || decisionGate?.memory_version || null,
-						shadow_memory_version: meta.shadow_memory_version || decisionGate?.shadow_memory_version || null,
+						memory_version:
+							meta.memory_version || decisionGate?.memory_version || null,
+						shadow_memory_version:
+							meta.shadow_memory_version ||
+							decisionGate?.shadow_memory_version ||
+							null,
 					},
 				});
 				return {
@@ -583,15 +628,24 @@ export async function executeTool(name, args, meta = {}) {
 				log,
 				config,
 			});
-		if (!meta.cycle_id && GENERAL_APPROVAL_REQUIRED_TOOLS.has(toolName)) {
+			if (WRITE_TOOLS.has(toolName) && result?.manual_review_required) {
+				appendManualReviewTerminal(
+					result.manual_review_reason ||
+						"write succeeded but local follow-up requires manual review",
+				);
+			}
+			if (!meta.cycle_id && GENERAL_APPROVAL_REQUIRED_TOOLS.has(toolName)) {
 				consumeOneShotGeneralWriteApproval({
 					tool_name: toolName,
 					pool_address: normalizedArgs?.pool_address || null,
-					position_address: normalizedArgs?.position_address || result?.position || null,
+					position_address:
+						normalizedArgs?.position_address || result?.position || null,
 					amount_sol:
 						toolName === "deploy_position"
-							? normalizedArgs?.amount_y ?? normalizedArgs?.amount_sol ?? 0
-							: toolName === "swap_token" && (normalizedArgs?.output_mint === "SOL" || normalizedArgs?.input_mint === "SOL")
+							? (normalizedArgs?.amount_y ?? normalizedArgs?.amount_sol ?? 0)
+							: toolName === "swap_token" &&
+									(normalizedArgs?.output_mint === "SOL" ||
+										normalizedArgs?.input_mint === "SOL")
 								? Number(normalizedArgs?.amount || 0)
 								: null,
 				});

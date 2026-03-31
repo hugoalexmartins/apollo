@@ -1,3 +1,5 @@
+import { isBlacklisted } from "../token-blacklist.js";
+
 export function mergeOpenPositions(livePositions = [], trackedPositions = []) {
 	const merged = new Map();
 	for (const position of [...livePositions, ...trackedPositions]) {
@@ -74,6 +76,12 @@ export async function runSafetyChecksWithDeps(name, args, meta = {}, deps = {}) 
 				}
 				args.base_mint = governanceMetadata.base_mint;
 				args.bin_step = governanceMetadata.bin_step;
+				if (isBlacklisted(args.base_mint)) {
+					return {
+						pass: false,
+						reason: `Base token ${args.base_mint} is blacklisted and cannot be deployed.`,
+					};
+				}
 			}
 			const positions = await getMyPositionsRuntime({ force: true });
 			if (positions?.error) {
