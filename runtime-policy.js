@@ -7,6 +7,8 @@ function roundMetric(value) {
   return Number(Number(value || 0).toFixed(2));
 }
 
+const FRESH_POSITION_PNL_EXIT_MINUTES = 2;
+
 export const MANAGEMENT_SUBREASONS = Object.freeze({
   INSTRUCTION: "instruction_condition_met",
   EXIT_ALERT: "exit_alert",
@@ -172,6 +174,25 @@ export function isPnlSignalStale(position = {}) {
   return Date.now() - observedAtMs > maxAgeMs;
 }
 
+function resolvePositionAgeMinutes(position = {}) {
+  const explicitAgeMinutes = Number(position?.age_minutes);
+  if (Number.isFinite(explicitAgeMinutes) && explicitAgeMinutes >= 0) {
+    return explicitAgeMinutes;
+  }
+
+  const deployedAtMs = Number.isFinite(Date.parse(position?.deployed_at || ""))
+    ? Date.parse(position.deployed_at)
+    : null;
+  if (deployedAtMs == null) return null;
+
+  return Math.max(0, Math.floor((Date.now() - deployedAtMs) / 60000));
+}
+
+function shouldSkipFreshPositionPnlExit(position = {}) {
+  const ageMinutes = resolvePositionAgeMinutes(position);
+  return ageMinutes != null && ageMinutes < FRESH_POSITION_PNL_EXIT_MINUTES;
+}
+
 export function evaluateTrackedPositionExit({
   positionState = {},
   currentPnlPct,
@@ -184,6 +205,16 @@ export function evaluateTrackedPositionExit({
   let trailingActive = Boolean(positionState?.trailing_active);
 
   if (stale || !Number.isFinite(normalizedPnlPct)) {
+    return {
+      action: null,
+      peak_pnl_pct: peakPnlPct,
+      trailing_active: trailingActive,
+      notes: [],
+      log_message: null,
+    };
+  }
+
+  if (shouldSkipFreshPositionPnlExit(positionState)) {
     return {
       action: null,
       peak_pnl_pct: peakPnlPct,
@@ -474,7 +505,8 @@ export function evaluateDeployAdmission({
 
 export function planManagementRuntimeAction(position, config, expectedVolumeProfile = null, { phase = "all" } = {}) {
   const instructionGate = classifyInstructionRuntimeGate(position);
-  if (instructionGate.action === "close") {
+  const freshPositionPnlExitBlocked = shouldSkipFreshPositionPnlExit(position);
+  if (instructionGate.action === "close" && !freshPositionPnlExitBlocked) {
     return {
       toolName: "close_position",
       args: { position_address: position.position, reason: position.instruction },
@@ -509,7 +541,7 @@ export function planManagementRuntimeAction(position, config, expectedVolumeProf
     volume_window: position.volume_window,
   });
 
-  if (position.exitAlert && !pnlSignalStale) {
+  if (position.exitAlert && !pnlSignalStale && !freshPositionPnlExitBlocked) {
     return {
       toolName: "close_position",
       args: { position_address: position.position, reason: position.exitAlert },
@@ -518,7 +550,7 @@ export function planManagementRuntimeAction(position, config, expectedVolumeProf
     };
   }
 
-  if (pnlPct != null && pnlPct <= config.management.emergencyPriceDropPct) {
+  if (!freshPositionPnlExitBlocked && pnlPct != null && pnlPct <= config.management.emergencyPriceDropPct) {
     return {
       toolName: "close_position",
       args: { position_address: position.position, reason: "emergency stop loss" },

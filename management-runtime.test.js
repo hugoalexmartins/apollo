@@ -121,6 +121,31 @@ test("runManagementRuntimeActions closes parsed instruction thresholds without e
   assert.equal(results[0].position, "pos-inst-close");
 });
 
+test("runManagementRuntimeActions suppresses parsed instruction closes for fresh positions", async () => {
+	const calls = [];
+	const results = await runManagementRuntimeActions([
+		{
+			position: "pos-inst-fresh",
+			pair: "Gamma-SOL",
+			in_range: true,
+			age_minutes: 1,
+			instruction: "hold until pnl >= 5%",
+			pnl: { pnl_pct: 5.8 },
+		},
+	], {
+		cycleId: "management-instruction-fresh",
+		config,
+		executeTool: async (name, args, meta) => {
+			calls.push({ name, args, meta });
+			return { success: true, tool: name };
+		},
+		getMemoryVersionStatus: () => ({ active_version: "policy-v1", shadow_version: "policy-shadow-v1" }),
+	});
+
+	assert.equal(calls.length, 0);
+	assert.equal(results.length, 0);
+});
+
 test("runManagementRuntimeActions keeps fee and low-yield reviews in the slow pass", async () => {
 	const calls = [];
 	const results = await runManagementRuntimeActions([

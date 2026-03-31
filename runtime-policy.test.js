@@ -136,6 +136,18 @@ test("stale pnl suppresses exit-alert closes", () => {
   assert.equal(result, null);
 });
 
+test("fresh positions suppress pnl-driven closes during the first 2 minutes", () => {
+	const result = planManagementRuntimeAction({
+		position: "pos-fresh-exit",
+		exitAlert: "STOP_LOSS: fresh feed should not trigger close",
+		in_range: true,
+		age_minutes: 1,
+		pnl: { pnl_pct: -55 },
+	}, config);
+
+	assert.equal(result, null);
+});
+
 test("stale pnl still allows deterministic out-of-range rebalance", () => {
   const result = planManagementRuntimeAction({
     position: "pos-stale-oor",
@@ -204,6 +216,18 @@ test("planManagementRuntimeAction deterministically closes when a parsed instruc
   assert.equal(result.args.position_address, "pos-inst-close");
 });
 
+test("planManagementRuntimeAction suppresses parsed instruction closes for fresh positions", () => {
+	const result = planManagementRuntimeAction({
+		position: "pos-inst-fresh",
+		instruction: "hold until pnl >= 5%",
+		pnl: { pnl_pct: 6.2 },
+		age_minutes: 1,
+		in_range: true,
+	}, config);
+
+	assert.equal(result, null);
+});
+
 test("evaluateTrackedPositionExit owns stop-loss and trailing-take-profit rules", () => {
   const stopLoss = evaluateTrackedPositionExit({
     positionState: { peak_pnl_pct: 0, trailing_active: false },
@@ -241,6 +265,25 @@ test("evaluateTrackedPositionExit owns stop-loss and trailing-take-profit rules"
     },
   });
   assert.match(trailingClose.action, /TRAILING_TP/i);
+});
+
+test("evaluateTrackedPositionExit ignores pnl stop-loss signals for freshly deployed positions", () => {
+	const result = evaluateTrackedPositionExit({
+		positionState: {
+			peak_pnl_pct: 0,
+			trailing_active: false,
+			deployed_at: new Date().toISOString(),
+		},
+		currentPnlPct: -11,
+		managementConfig: {
+			stopLossPct: -10,
+			trailingTakeProfit: true,
+			trailingTriggerPct: 5,
+			trailingDropPct: 3,
+		},
+	});
+
+	assert.equal(result.action, null);
 });
 
 test("evaluateScreeningCycleAdmission preserves screening gate order", () => {
