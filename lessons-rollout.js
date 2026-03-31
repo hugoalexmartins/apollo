@@ -9,6 +9,58 @@ const MIN_EVOLVE_POSITIONS = 5;
 const MAX_CHANGE_PER_STEP = 0.2;
 const MIN_ROLLOUT_CLOSES = 5;
 const ROLLOUT_MAX_HISTORY = 25;
+const ACTIVE_ROLLOUT_PHASES = new Set([
+	"active",
+	"apply_pending",
+	"rollback_pending",
+]);
+
+function isObject(value) {
+	return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function isFiniteNonNegativeNumber(value) {
+	return Number.isFinite(Number(value)) && Number(value) >= 0;
+}
+
+function isPerformanceSnapshotShape(value) {
+	if (!isObject(value)) return false;
+	return ["closes", "avg_pnl_pct", "win_rate_pct"].every((key) =>
+		Number.isFinite(Number(value[key])),
+	);
+}
+
+function isPendingDecisionShape(value) {
+	if (value == null) return true;
+	if (!isObject(value)) return false;
+	if (typeof value.status !== "string") return false;
+	if (!Array.isArray(value.changed_keys)) return false;
+	return isPerformanceSnapshotShape(value.baseline)
+		&& isPerformanceSnapshotShape(value.post)
+		&& isFiniteNonNegativeNumber(value.closes_since_start);
+}
+
+function isActiveRolloutShape(value) {
+	if (value == null) return true;
+	if (!isObject(value)) return false;
+	if (!ACTIVE_ROLLOUT_PHASES.has(value.phase)) return false;
+	if (typeof value.rollout_id !== "string" || value.rollout_id.trim().length === 0) {
+		return false;
+	}
+	if (!isFiniteNonNegativeNumber(value.start_positions_count)) return false;
+	if (!isFiniteNonNegativeNumber(value.min_closes_required)) return false;
+	if (!Array.isArray(value.changed_keys)) return false;
+	if (!isObject(value.previous_values)) return false;
+	if (!isObject(value.new_values)) return false;
+	if (!isPerformanceSnapshotShape(value.baseline)) return false;
+	return isPendingDecisionShape(value.pending_decision);
+}
+
+function isThresholdRolloutStateShape(value) {
+	return isObject(value)
+		&& (value.active == null || isActiveRolloutShape(value.active))
+		&& Array.isArray(value.history);
+}
 
 function getLessonsFile() {
 	return process.env.ZENITH_LESSONS_FILE || "./lessons.json";
@@ -99,6 +151,14 @@ function loadThresholdRolloutState() {
 	if (!snapshot.value) {
 		if (!snapshot.error) return { active: null, history: [] };
 		return { active: null, history: [], invalid_state: true, error: snapshot.error };
+	}
+	if (!isThresholdRolloutStateShape(snapshot.value)) {
+		return {
+			active: null,
+			history: [],
+			invalid_state: true,
+			error: "threshold-rollout.json has invalid shape",
+		};
 	}
 	return {
 		active: snapshot.value?.active || null,

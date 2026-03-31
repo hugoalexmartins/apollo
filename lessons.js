@@ -12,18 +12,22 @@ import {
 	writeJsonSnapshotAtomicSync,
 } from "./durable-store.js";
 import { writeEvidenceBundle } from "./evidence-bundles.js";
-import { log } from "./logger.js";
-import { recordNegativeRegimeOutcome } from "./negative-regime-memory.js";
-import { inferPerformanceRegimeSignal } from "./regime-packs.js";
-
-export {
+import {
 	evolveThresholds,
 	getThresholdRolloutState,
 	recoverThresholdRolloutState,
 } from "./lessons-rollout.js";
+import { log } from "./logger.js";
+import { recordNegativeRegimeOutcome } from "./negative-regime-memory.js";
+import { inferPerformanceRegimeSignal } from "./regime-packs.js";
+
+export { evolveThresholds, getThresholdRolloutState, recoverThresholdRolloutState };
 
 const LESSONS_FILE = process.env.ZENITH_LESSONS_FILE || "./lessons.json";
 const MIN_EVOLVE_POSITIONS = 5; // don't evolve until we have real data
+const AUTO_STRATEGY_WINDOW_HOURS = 168;
+const AUTO_STRATEGY_MIN_WIN_RATE_PCT = 80;
+const AUTO_STRATEGY_MIN_AVG_PNL_PCT = 2;
 
 function emptyLessonsData() {
 	return { lessons: [], performance: [] };
@@ -68,6 +72,148 @@ function load() {
 
 function save(data) {
 	writeJsonSnapshotAtomicSync(LESSONS_FILE, data);
+}
+
+function roundMetric(value, decimals = 2) {
+	const factor = 10 ** decimals;
+	return Math.round((Number(value) || 0) * factor) / factor;
+}
+
+function quantile(values = [], ratio = 0.5) {
+	const numeric = values
+		.map((value) => Number(value))
+		.filter((value) => Number.isFinite(value))
+		.sort((a, b) => a - b);
+	if (numeric.length === 0) return null;
+	const index = Math.min(
+		numeric.length - 1,
+		Math.max(0, Math.floor((numeric.length - 1) * ratio)),
+	);
+	return numeric[index];
+}
+
+function average(values = []) {
+	const numeric = values
+		.map((value) => Number(value))
+		.filter((value) => Number.isFinite(value));
+	if (numeric.length === 0) return null;
+	return numeric.reduce((sum, value) => sum + value, 0) / numeric.length;
+}
+
+function deriveSingleSide(rows = []) {
+	const sides = { sol: 0, token: 0, dual: 0 };
+	for (const row of rows) {
+		const amountSol = Number(row.amount_sol ?? row.amount_y ?? 0) || 0;
+		const amountToken = Number(row.amount_x ?? 0) || 0;
+		if (amountSol > 0 && amountToken > 0) sides.dual += 1;
+		else if (amountToken > 0) sides.token += 1;
+		else sides.sol += 1;
+	}
+	if (sides.dual >= sides.sol && sides.dual >= sides.token && sides.dual > 0) {
+		return "dual";
+	}
+	if (sides.token > sides.sol) {
+		return "token";
+	}
+	return "sol";
+}
+
+function deriveRangeSummary(strategy, rows = []) {
+	const binsBelow = quantile(
+		rows.map((row) => row.bin_range?.bins_below).filter((value) => value != null),
+		0.5,
+	);
+	const binsAbove = quantile(
+		rows.map((row) => row.bin_range?.bins_above).filter((value) => value != null),
+		0.5,
+		);
+	const resolvedBinsBelow = Math.max(0, Math.round(binsBelow ?? (strategy === "bid_ask" ? 69 : 18)));
+	const resolvedBinsAbove = Math.max(0, Math.round(binsAbove ?? (strategy === "bid_ask" ? 0 : 18)));
+	const totalBins = resolvedBinsBelow + resolvedBinsAbove;
+	let type = "balanced";
+	if (resolvedBinsBelow > 0 && resolvedBinsAbove === 0) type = "downside_only";
+	else if (resolvedBinsAbove > 0 && resolvedBinsBelow === 0) type = "upside_only";
+	else if (totalBins > 48) type = "wide";
+	return {
+		type,
+		bins_below: resolvedBinsBelow,
+		bins_above: resolvedBinsAbove,
+		notes: `Derived from ${rows.length} close(s); representative range ${resolvedBinsBelow}/${resolvedBinsAbove}.`,
+	};
+}
+
+function buildAutoDerivedStrategyCandidates(performance = []) {
+	const since = Date.now() - AUTO_STRATEGY_WINDOW_HOURS * 60 * 60 * 1000;
+	const recent = (performance || []).filter((row) => {
+		const recordedAt = new Date(row.recorded_at || 0).getTime();
+		return Number.isFinite(recordedAt) && recordedAt >= since;
+	});
+	if (recent.length < MIN_EVOLVE_POSITIONS) return [];
+
+	const byStrategy = new Map();
+	for (const row of recent) {
+		const strategy = String(row.strategy || "").toLowerCase();
+		if (!["bid_ask", "spot"].includes(strategy)) continue;
+		const list = byStrategy.get(strategy) || [];
+		list.push(row);
+		byStrategy.set(strategy, list);
+	}
+
+	const candidates = [];
+	for (const [strategy, rows] of byStrategy.entries()) {
+		if (rows.length < MIN_EVOLVE_POSITIONS) continue;
+		const wins = rows.filter((row) => Number(row.pnl_pct) >= 0);
+		const winRatePct = roundMetric((wins.length / rows.length) * 100, 1);
+		const avgPnlPct = roundMetric(average(rows.map((row) => row.pnl_pct)) ?? 0, 2);
+		if (winRatePct < AUTO_STRATEGY_MIN_WIN_RATE_PCT || avgPnlPct < AUTO_STRATEGY_MIN_AVG_PNL_PCT) {
+			continue;
+		}
+
+		const evidenceRows = wins.length >= 3 ? wins : rows;
+		const range = deriveRangeSummary(strategy, evidenceRows);
+		const singleSide = deriveSingleSide(evidenceRows);
+		const avgRangeEfficiency = roundMetric(average(rows.map((row) => row.range_efficiency)) ?? 0, 1);
+		const avgFeeYieldPct = roundMetric(average(rows.map((row) => row.fee_yield_pct)) ?? 0, 2);
+		const medianBinStep = Math.max(1, Math.round(quantile(rows.map((row) => row.bin_step), 0.5) ?? 0));
+		const minOrganicScore = Math.round(quantile(evidenceRows.map((row) => row.organic_score), 0.25) ?? 0);
+		const minFeeTvlRatio = roundMetric(quantile(evidenceRows.map((row) => row.fee_tvl_ratio), 0.25) ?? 0, 3);
+		const maxVolatility = roundMetric(quantile(evidenceRows.map((row) => row.volatility), 0.75) ?? 0, 2);
+		const candidateId = `auto_${strategy}_candidate`;
+		const candidateName = strategy === "spot" ? "Auto Spot Candidate" : "Auto Bid-Ask Candidate";
+
+		candidates.push({
+			id: candidateId,
+			name: candidateName,
+			lp_strategy: strategy,
+			token_criteria: {
+				min_organic_score: minOrganicScore,
+				min_fee_tvl_ratio: minFeeTvlRatio,
+				max_volatility: maxVolatility,
+				reference_bin_step: medianBinStep,
+			},
+			entry: {
+				condition: `Candidate only — derived from ${rows.length} realized close(s) over ${AUTO_STRATEGY_WINDOW_HOURS}h. Manual review required before activation.`,
+				single_side: singleSide,
+			},
+			range,
+			exit: {
+				notes: "Derived from realized closes only. This candidate is not auto-activated.",
+			},
+			best_for: `${strategy} setups with win rate ${winRatePct}% and avg PnL ${avgPnlPct}% over the last ${AUTO_STRATEGY_WINDOW_HOURS}h.`,
+			evidence: {
+				window_hours: AUTO_STRATEGY_WINDOW_HOURS,
+				positions_analyzed: rows.length,
+				win_rate_pct: winRatePct,
+				avg_pnl_pct: avgPnlPct,
+				avg_range_efficiency_pct: avgRangeEfficiency,
+				avg_fee_yield_pct: avgFeeYieldPct,
+				review_status: "manual_review_required",
+			},
+			raw: `Auto-derived from ${rows.length} closes. Representative bins ${range.bins_below}/${range.bins_above}, single_side=${singleSide}, fee_tvl>=${minFeeTvlRatio}, organic>=${minOrganicScore}.`,
+		});
+	}
+
+	return candidates;
 }
 
 // ─── Record Position Performance ──────────────────────────────
@@ -229,6 +375,17 @@ export async function recordPerformance(perf) {
 			"memory",
 			`Failed to store distribution stats in memory: ${error.message}`,
 		);
+	}
+
+	if (data.performance.length % MIN_EVOLVE_POSITIONS === 0) {
+		try {
+			const { upsertAutoDerivedStrategyCandidate } = await import("./strategy-library.js");
+			for (const candidate of buildAutoDerivedStrategyCandidates(data.performance)) {
+				upsertAutoDerivedStrategyCandidate(candidate);
+			}
+		} catch (error) {
+			log("strategy", `Failed to derive auto strategy candidate: ${error.message}`);
+		}
 	}
 
 	// Evolve thresholds every 5 closed positions

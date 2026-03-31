@@ -580,6 +580,191 @@ test("screening runner marks failed_write when approved deploy errors", async ()
 	assert.equal(evaluations[0].status, "failed_write");
 });
 
+test("screening runner resolves autonomous preset bins into deploy args when no active strategy is set", async () => {
+	let deployArgs = null;
+	const candidate = {
+		pool: "pool-quality-1",
+		name: "Quality-SOL",
+		deterministic_score: 93,
+		fee_active_tvl_ratio: 0.05,
+		fee_tvl_ratio: 0.05,
+		organic_score: 84,
+		holders: 2200,
+		bin_step: 80,
+		price_change_pct: 3,
+		active_tvl: 18000,
+		volume_24h: 52000,
+		volume_window: 52000,
+		six_hour_volatility: 4,
+	};
+
+	const run = createScreeningCycleRunner({
+		log: () => {},
+		config: { risk: { maxPositions: 3 }, management: { deployAmountSol: 0.5, gasReserve: 0.2 }, screening: {}, llm: { screeningModel: "test-model" } },
+		getMyPositions: async () => ({ total_positions: 0, positions: [] }),
+		getWalletBalances: async () => ({ sol: 2 }),
+		discoverPools: async () => ({ pools: [] }),
+		getTopCandidates: async () => ({ candidates: [candidate], total_eligible: 1, total_screened: 1, blocked_summary: {}, occupied_pools: [], occupied_mints: [], candidate_inputs: [candidate] }),
+		classifyRuntimeFailure: () => ({ reason_code: "ERR", message: "err" }),
+		validateStartupSnapshot: () => null,
+		appendReplayEnvelope: () => {},
+		writeEvidenceBundle: () => {},
+		getActiveStrategy: () => null,
+		computeDeployAmount: () => 0.5,
+		asNumber: Number,
+		deriveExpectedVolumeProfile: () => "balanced",
+		executeTool: async (name, args) => {
+			if (name === "choose_distribution_strategy") return { strategy: "spot", distribution_plan: {} };
+			if (name === "calculate_dynamic_bin_tiers") return { range_plan: { bins_below: 12, bins_above: 12 } };
+			if (name === "deploy_position") {
+				deployArgs = args;
+				return { success: true };
+			}
+			return {};
+		},
+		inspectCandidate: async () => ({
+			smartWallets: { in_pool: [{ name: "wallet-1" }] },
+			holders: { top_10_real_holders_pct: "10.00", bundlers_pct_in_top_100: "1.00", global_fees_sol: 100, blacklisted_addresses: [] },
+			narrative: { narrative: "Narrative passes." },
+			scoredLpers: { candidates: [{ metrics: { win_rate_pct: 82 } }] },
+			okx: { advanced: { bundle_pct: 1, is_honeypot: false, creator: null }, availability: { advanced: "ok" }, clusters: [], price: null },
+			poolMemory: null,
+			activeBin: { binId: 1 },
+			availability: { holders: "ok", okx_advanced: "ok" },
+		}),
+		deriveTrendBias: () => "neutral",
+		evaluateCandidateIntel: () => ({ score: { context_score: 93 }, hard_blocked: false, hard_blocks: [], smart_wallet_count: 1, holder_metrics: null, okx: null, wallet_score_source: "loaded", wallet_score_age_minutes: 5 }),
+		formatFinalistInspectionBlock: () => "",
+		buildCandidateContext: () => "",
+		roundMetric: (value) => value,
+		agentLoop: async () => ({ content: JSON.stringify({ action: "deploy", selected_pool: "pool-quality-1", summary: "Deploy the quality spot finalist.", confidence: { score: 0.85, label: "high" }, evidence: [{ source: "ranking", summary: "quality finalist", supports_action: true, freshness: "fresh" }], freshness: { status: "fresh", oldest_signal_minutes: 2 }, contradictions: [], invalidation_conditions: ["candidate becomes blocked"] }) }),
+		evaluatePortfolioGuard: () => ({ blocked: false }),
+		evaluateScreeningCycleAdmission: () => ({ allowed: true, status: "ready", summary: {} }),
+		getPerformanceSummary: () => null,
+		getPerformanceHistory: () => ({ positions: [] }),
+		getMemoryContext: () => null,
+		getMemoryVersionStatus: () => ({ active_version: "policy-v1", shadow_version: "policy-shadow-v1" }),
+		classifyRuntimeRegime: () => ({ proposed_regime: "neutral", confidence: 1, reason: "manual" }),
+		applyRegimeHysteresis: ({ classification }) => classification,
+		resolveRegimePackContext: () => ({ regime: "neutral", reason: "manual", confidence: 1, pack: { deploy: { regime_multiplier: 1 } }, effectiveScreeningConfig: {} }),
+		listCounterfactualRegimes: () => [],
+		getRegimePack: () => ({ deploy: { regime_multiplier: 1 } }),
+		getPerformanceSizingMultiplier: () => 1,
+		getRiskSizingMultiplier: () => 1,
+		getNegativeRegimeCooldown: () => ({ active: false }),
+		getNegativeRegimeMemory: () => ({ active: false }),
+		appendCounterfactualReview: () => {},
+		listActionJournalWorkflowsByCycle: () => [],
+		recordCycleEvaluation: () => {},
+		refreshRuntimeHealth: () => {},
+		telegramEnabled: () => false,
+		sendMessage: async () => {},
+		setScreeningBusy: () => {},
+		setScreeningLastTriggered: () => {},
+		setScreeningLastRun: () => {},
+	});
+
+	await run({ cycleId: "screening-test-autonomous-preset" });
+	assert.equal(deployArgs.strategy, "spot");
+	assert.equal(deployArgs.bins_below, 18);
+	assert.equal(deployArgs.bins_above, 18);
+});
+
+test("screening runner blocks autonomous spot presets using resolved strategy-specific negative memory", async () => {
+	let deployCalled = false;
+	const negativeMemoryCalls = [];
+	const candidate = {
+		pool: "pool-quality-spot-blocked",
+		name: "Blocked-Spot-SOL",
+		deterministic_score: 94,
+		fee_active_tvl_ratio: 0.05,
+		fee_tvl_ratio: 0.05,
+		organic_score: 84,
+		holders: 2200,
+		bin_step: 80,
+		price_change_pct: 3,
+		active_tvl: 18000,
+		volume_24h: 52000,
+		volume_window: 52000,
+		six_hour_volatility: 4,
+	};
+
+	const run = createScreeningCycleRunner({
+		log: () => {},
+		config: { risk: { maxPositions: 3 }, management: { deployAmountSol: 0.5, gasReserve: 0.2 }, screening: {}, llm: { screeningModel: "test-model" } },
+		getMyPositions: async () => ({ total_positions: 0, positions: [] }),
+		getWalletBalances: async () => ({ sol: 2 }),
+		discoverPools: async () => ({ pools: [] }),
+		getTopCandidates: async () => ({ candidates: [candidate], total_eligible: 1, total_screened: 1, blocked_summary: {}, occupied_pools: [], occupied_mints: [], candidate_inputs: [candidate] }),
+		classifyRuntimeFailure: () => ({ reason_code: "ERR", message: "err" }),
+		validateStartupSnapshot: () => null,
+		appendReplayEnvelope: () => {},
+		writeEvidenceBundle: () => {},
+		getActiveStrategy: () => null,
+		computeDeployAmount: () => 0.5,
+		asNumber: Number,
+		deriveExpectedVolumeProfile: () => "balanced",
+		executeTool: async (name) => {
+			if (name === "choose_distribution_strategy") return { strategy: "spot", distribution_plan: {} };
+			if (name === "calculate_dynamic_bin_tiers") return { range_plan: { bins_below: 12, bins_above: 12 } };
+			if (name === "deploy_position") {
+				deployCalled = true;
+				return { success: true };
+			}
+			return {};
+		},
+		inspectCandidate: async () => ({
+			smartWallets: { in_pool: [{ name: "wallet-1" }] },
+			holders: { top_10_real_holders_pct: "10.00", bundlers_pct_in_top_100: "1.00", global_fees_sol: 100, blacklisted_addresses: [] },
+			narrative: { narrative: "Narrative passes." },
+			scoredLpers: { candidates: [{ metrics: { win_rate_pct: 82 } }] },
+			okx: { advanced: { bundle_pct: 1, is_honeypot: false, creator: null }, availability: { advanced: "ok" }, clusters: [], price: null },
+			poolMemory: null,
+			activeBin: { binId: 1 },
+			availability: { holders: "ok", okx_advanced: "ok" },
+		}),
+		deriveTrendBias: () => "neutral",
+		evaluateCandidateIntel: () => ({ score: { context_score: 94 }, hard_blocked: false, hard_blocks: [], smart_wallet_count: 1, holder_metrics: null, okx: null, wallet_score_source: "loaded", wallet_score_age_minutes: 5 }),
+		formatFinalistInspectionBlock: () => "",
+		buildCandidateContext: () => "",
+		roundMetric: (value) => value,
+		agentLoop: async () => ({ content: JSON.stringify({ action: "hold", selected_pool: null, summary: "Hold blocked finalist.", confidence: { score: 0.7, label: "medium" }, evidence: [{ source: "risk", summary: "blocked by strategy-specific memory", supports_action: false, freshness: "fresh" }], freshness: { status: "fresh", oldest_signal_minutes: 2 }, contradictions: [], invalidation_conditions: ["cooldown expires"] }) }),
+		evaluatePortfolioGuard: () => ({ blocked: false }),
+		evaluateScreeningCycleAdmission: () => ({ allowed: true, status: "ready", summary: {} }),
+		getPerformanceSummary: () => null,
+		getPerformanceHistory: () => ({ positions: [] }),
+		getMemoryContext: () => null,
+		getMemoryVersionStatus: () => ({ active_version: "policy-v1", shadow_version: "policy-shadow-v1" }),
+		classifyRuntimeRegime: () => ({ proposed_regime: "neutral", confidence: 1, reason: "manual" }),
+		applyRegimeHysteresis: ({ classification }) => classification,
+		resolveRegimePackContext: () => ({ regime: "neutral", reason: "manual", confidence: 1, pack: { deploy: { regime_multiplier: 1 } }, effectiveScreeningConfig: {} }),
+		listCounterfactualRegimes: () => [],
+		getRegimePack: () => ({ deploy: { regime_multiplier: 1 } }),
+		getPerformanceSizingMultiplier: () => 1,
+		getRiskSizingMultiplier: () => 1,
+		getNegativeRegimeCooldown: () => ({ active: false }),
+		getNegativeRegimeMemory: ({ strategy }) => {
+			negativeMemoryCalls.push(strategy);
+			return strategy === "spot"
+				? { active: true, key: "neutral|spot", cooldown_until: new Date(Date.now() + 60_000).toISOString(), remaining_ms: 60_000, hits: 2, sample_quality: "confirmed", cumulative_negative_pnl_abs: 12 }
+				: { active: false };
+		},
+		appendCounterfactualReview: () => {},
+		listActionJournalWorkflowsByCycle: () => [],
+		recordCycleEvaluation: () => {},
+		refreshRuntimeHealth: () => {},
+		telegramEnabled: () => false,
+		sendMessage: async () => {},
+		setScreeningBusy: () => {},
+		setScreeningLastTriggered: () => {},
+		setScreeningLastRun: () => {},
+	});
+
+	await run({ cycleId: "screening-test-spot-cooldown" });
+	assert.equal(deployCalled, false);
+	assert.ok(negativeMemoryCalls.includes("spot"));
+});
+
 test("screening runner fails closed when negative regime state is invalid inside candidate blocking", async () => {
 	const evaluations = [];
 	const replays = [];

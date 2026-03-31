@@ -186,15 +186,34 @@ export function finalizeScreeningThesis(rawThesis, {
 			thesis.contradictions.push("selected_pool_hard_blocked");
 		}
 		thesis.tool_name = "deploy_position";
+		const deployStrategy = selectedPool?.deploy_strategy || (["bid_ask", "spot"].includes(strategy) ? strategy : undefined);
+		const deployBinsBelow = asFiniteNumber(selectedPool?.deploy_bins_below, null);
+		const deployBinsAbove = asFiniteNumber(selectedPool?.deploy_bins_above, null);
 		thesis.args = selectedPool
 			? {
 				pool_address: selectedPool.pool,
 				pool_name: selectedPool.name,
 				amount_y: deploy_amount,
-				strategy: ["bid_ask", "spot"].includes(strategy) ? strategy : undefined,
+				...(deployStrategy ? { strategy: deployStrategy } : {}),
+				...(deployBinsBelow != null ? { bins_below: deployBinsBelow } : {}),
+				...(deployBinsAbove != null ? { bins_above: deployBinsAbove } : {}),
 			}
 			: null;
 		thesis.target_id = selectedPool?.pool || thesis.target_id || null;
+		thesis.deploy_preset_id = asString(selectedPool?.deploy_preset_id, null);
+		thesis.deploy_preset_name = asString(selectedPool?.deploy_preset_name, null);
+		thesis.deploy_semantics_label = asString(
+			selectedPool?.deploy_semantics_label,
+			null,
+		);
+		thesis.deploy_spot_subtype = asString(
+			selectedPool?.deploy_spot_subtype,
+			null,
+		);
+		thesis.deploy_deposit_sidedness = asString(
+			selectedPool?.deploy_deposit_sidedness,
+			null,
+		);
 		thesis.evidence = mergeEvidence(thesis.evidence, selectedPool ? [
 			{
 				source: "ranking",
@@ -205,6 +224,18 @@ export function finalizeScreeningThesis(rawThesis, {
 			{
 				source: "regime",
 				summary: `regime=${regime_label || "unknown"} deploy_amount=${deploy_amount}`,
+				supports_action: true,
+				freshness: "fresh",
+			},
+			{
+				source: "strategy_preset",
+				summary: `${selectedPool.deploy_preset_id || "runtime_strategy"}: strategy=${deployStrategy || "unknown"}, bins=${deployBinsBelow ?? "?"}/${deployBinsAbove ?? "?"}`,
+				supports_action: true,
+				freshness: "fresh",
+			},
+			{
+				source: "strategy_shape",
+				summary: selectedPool.deploy_semantics_label || "deploy shape unspecified",
 				supports_action: true,
 				freshness: "fresh",
 			},
