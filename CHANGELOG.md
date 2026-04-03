@@ -4,6 +4,12 @@ This file documents the major additions and behavior changes present in this for
 
 ## Recent updates
 
+### 2026-04-03
+
+- Locked the scheduled health-check path to an explicit read-only manager summary: the cron-driven health turn now runs with tools disabled, no live lesson/memory injection, and a regression test that proves the request is sent with `tool_choice: none` and no tool surface.
+- Refreshed README setup/config guidance so the repo now points operators at `user-config.example.json` as the tracked template instead of implying a filled personal `user-config.json` belongs in version control.
+- Updated `user-config.example.json` to reflect the current mutable config surface and safer starter values, including the split model keys, read-only health-check cadence, current management/risk defaults, and an explicit `autoSwapAfterClaim: false` example stance.
+
 ### 2026-03-31
 
 - Added clearer autonomous DLMM execution-shape semantics: resolved screening/deploy plans now label `spot` more explicitly as single-sided SOL vs two-sided funding plus range shape, and thesis output carries that deploy-shape metadata forward for auditability.

@@ -2,7 +2,7 @@
 
 **Autonomous Meteora DLMM liquidity management agent for Solana, powered by LLM-guided runtime orchestration.**
 
-Implementation status updated: `2026-03-31`
+Implementation status updated: `2026-04-03`
 
 ---
 
@@ -33,7 +33,7 @@ Two specialized agents run on independent schedules:
 | **Hunter Alpha** | Every 30 min | Screening and deployment into the best current candidate |
 | **Healer Alpha** | Every 3 min | Position management, fee handling, and rebalance/exit decisions |
 
-A third health check runs on `healthCheckIntervalMin` (default `60`) to summarize portfolio state.
+A third health check runs on `healthCheckIntervalMin` (default `60`) as a read-only portfolio summary with tools disabled.
 
 **Current runtime behavior:**
 - Screening and model-managed management now generate one structured thesis per actual decision, not a vague free-form explanation: each thesis carries evidence rows, signal freshness, contradictions, confidence, invalidation conditions, and a stable `thesis_id`
@@ -50,6 +50,7 @@ A third health check runs on `healthCheckIntervalMin` (default `60`) to summariz
 - Autonomous deploy presets now carry explicit execution-shape semantics into screening and thesis output, so `spot` is labeled more truthfully as single-sided SOL vs two-sided funding plus range shape instead of one vague strategy bucket
 - Closed-position learning can now derive inactive `auto_derived` strategy candidates every 5 closes, but they stay review-only in `strategy-library.json`: they do not auto-activate and they do not change screening behavior until an operator explicitly promotes them
 - `claim_fees` now uses bounded post-claim settlement observation instead of a single immediate balance diff, and claim auto-swap follows the actually observed claimed mint/amount rather than assuming the base leg
+- Scheduled health checks now run through an explicit read-only manager turn with tools disabled, so the health cadence cannot trigger `close_position`, `claim_fees`, `swap_token`, or other live MANAGER writes
 - Committed write truthfulness is now tighter across deploy / claim / close follow-up paths: if a transaction lands but local settlement or persistence checks later fail, Zenith keeps the write result successful, raises `manual_review_required`, suppresses later autonomous writes in-process, and re-applies that suppression after restart through boot recovery
 - Wide-range deploy and recovery safety is tighter too: empty positions created before a failed liquidity-add phase are suppressed from later live adoption, direct deploys re-check blacklisted base mints at the executor boundary, and state sync now treats persisted `manual_review` workflows as blockers instead of auto-closing through them
 - Token-only `spot` deploy/rebalance flows now pass deploy admission correctly, deploy USD basis now preserves executor-derived values instead of silently collapsing to zero on a second lookup, and both memory-rollout and threshold-rollout persistence now fail closed on malformed parseable state instead of silently normalizing lane/rollout state
@@ -114,7 +115,7 @@ A third health check runs on `healthCheckIntervalMin` (default `60`) to summariz
 - Wallet RPC — SOL and token balances
 - Pool screening + wallet-quality inputs — pool metrics, token holder checks, smart-wallet checks, and optional LP-agent enrichment for top-LPer scoring
 
-Agents are powered via OpenRouter-compatible models and can be swapped by changing `managementModel`, `screeningModel`, and `generalModel` in `user-config.json`.
+Agents are powered via OpenRouter-compatible models and can be swapped by changing `managementModel`, `screeningModel`, and `generalModel` in your local `user-config.json` copied from the tracked `user-config.example.json` template.
 
 ---
 
@@ -123,6 +124,7 @@ Agents are powered via OpenRouter-compatible models and can be swapped by changi
 - Node.js 18+
 - [OpenRouter](https://openrouter.ai) API key
 - Solana wallet (base58 private key)
+- Helius API key
 - Telegram bot token (optional, for notifications)
 - `LPAGENT_API_KEY` (optional, enables `score_top_lpers` / top-LPer scoring features when available; comma-separated keys are supported for shared rotation/backoff)
 - `JUPITER_API_KEY` (optional, used for authenticated Jupiter swap/quote requests when available)
@@ -144,31 +146,42 @@ cd Zenith
 npm install
 ```
 
+For reproducible production installs, prefer `npm ci` on the committed lockfile.
+
 **3. Create `.env`**
 
 ```env
 OPENROUTER_API_KEY=sk-or-...
 WALLET_PRIVATE_KEY=your_base58_private_key
-HELIUS_API_KEY=your_helius_key         # optional for some wallet/balance lookups
+HELIUS_API_KEY=your_helius_key         # required for wallet balances and startup health
+# RPC_URL=https://beta.helius-rpc.com/?api-key=your_helius_key   # optional override; defaults to Helius Gatekeeper beta from HELIUS_API_KEY
 TELEGRAM_BOT_TOKEN=123456:ABC...       # optional
 LPAGENT_API_KEY=lpagent_a,lpagent_b    # optional, enables LP-agent scoring/overview with shared key rotation when available
 JUPITER_API_KEY=jup_...                # optional, adds authenticated Jupiter API access when available
 DRY_RUN=true                           # safest way to start
 ```
 
-> **RPC**: defaults to `https://pump.helius-rpc.com` if you do not override it. You can set `RPC_URL=` in `.env` or `rpcUrl` in `user-config.json`.
+> **RPC**: defaults to the Helius Gatekeeper beta mainnet endpoint using `HELIUS_API_KEY` if you do not override it. You can set `RPC_URL=` in `.env` or `rpcUrl` in `user-config.json` to use a custom endpoint.
 
-**4. Create `user-config.json`**
+**4. Create a local `user-config.json` from the tracked example**
 
-Use the interactive setup:
+Preferred manual path:
+
+```bash
+cp user-config.example.json user-config.json
+```
+
+Then edit `user-config.json` for your wallet, chat ID, and runtime preferences.
+
+Or use the interactive setup:
 
 ```bash
 npm run setup
 ```
 
-Or copy `user-config.example.json` to `user-config.json` and edit it manually. Invalid mutable runtime values now fail closed at boot and on reload, so hand-edited config needs to respect the same schedule and bounds rules enforced by `update_config`.
+`user-config.example.json` is the tracked template that should live in the repo. Your filled-in `user-config.json` is local operator state and should stay uncommitted. Invalid mutable runtime values now fail closed at boot and on reload, so hand-edited config needs to respect the same schedule and bounds rules enforced by `update_config`.
 
-`user-config.json` is for runtime settings only. Keep wallet secrets in `.env`; setup now writes `WALLET_PRIVATE_KEY` there instead of persisting it in `user-config.json`.
+`user-config.json` is for runtime settings only. Keep wallet secrets and the Helius API key in `.env`; setup now writes `WALLET_PRIVATE_KEY` and `HELIUS_API_KEY` there instead of persisting them in `user-config.json`, and leaves `rpcUrl` unset unless you explicitly override the default Helius Gatekeeper beta RPC.
 
 **5. Run**
 
@@ -184,38 +197,45 @@ On startup Zenith loads wallet state, open positions, and current candidates, th
 
 ## Config reference
 
-Edit `user-config.json`. The example file is a starting point; the runtime defaults below reflect the current code path.
+Use `user-config.example.json` as the committed starter template, then copy it to a local `user-config.json` for actual runtime use. The sample values below match the shipped example config rather than a private operator file.
 
-| Field | Default | Description |
+| Field | Example value | Description |
 |---|---|---|
-| `rpcUrl` | — | Solana RPC endpoint URL |
+| `rpcUrl` | Helius default from `HELIUS_API_KEY` when unset | Solana RPC endpoint URL override |
 | `dryRun` | `true` | Simulate transactions without submitting them |
 | `deployAmountSol` | `0.5` | Minimum deploy floor used by the sizing logic |
 | `positionSizePct` | `0.35` | Fraction of deployable SOL used when wallet-based sizing scales upward |
 | `gasReserve` | `0.2` | SOL kept back from deployment sizing |
 | `maxDeployAmount` | `50` | Maximum deploy size cap |
 | `maxPositions` | `3` | Maximum concurrent open positions |
-| `minSolToOpen` | `0.55` | Minimum SOL balance before opening a new position |
+| `minSolToOpen` | `0.7` | Minimum SOL balance before opening a new position; must stay `>= deployAmountSol + gasReserve` |
 | `managementIntervalMin` | `3` | Default management cadence |
 | `screeningIntervalMin` | `30` | Default screening cadence |
-| `healthCheckIntervalMin` | `60` | Health-summary cadence; must be `<60`, exactly `60`, an hourly multiple under `1440`, or exactly `1440` |
-| `managementModel` | `openrouter/healer-alpha` | LLM model for position management |
-| `screeningModel` | `openrouter/hunter-alpha` | LLM model for pool screening |
-| `generalModel` | `openrouter/healer-alpha` | LLM model for REPL chat and general prompts |
+| `healthCheckIntervalMin` | `60` | Read-only health-summary cadence; must be `<60`, exactly `60`, an hourly multiple under `1440`, or exactly `1440` |
+| `managementModel` | `qwen/qwen3.6-plus:free` | LLM model for position management |
+| `screeningModel` | `qwen/qwen3.6-plus:free` | LLM model for pool screening |
+| `generalModel` | `qwen/qwen3.6-plus:free` | LLM model for REPL chat and general prompts |
 | `minFeeActiveTvlRatio` | `0.05` | Minimum fee/active-TVL ratio |
 | `minTvl` | `10000` | Minimum pool TVL in USD |
 | `maxTvl` | `150000` | Maximum pool TVL in USD |
 | `minVolume` | `500` | Minimum pool volume threshold |
+| `category` | `trending` | Pool category filter |
 | `minOrganic` | `60` | Minimum organic score |
-| `minHolders` | `500` | Minimum token holder count |
+| `minHolders` | `750` | Minimum token holder count |
 | `minMcap` | `150000` | Minimum market cap |
 | `maxMcap` | `10000000` | Maximum market cap |
 | `minBinStep` | `80` | Minimum supported bin step |
 | `maxBinStep` | `125` | Maximum supported bin step |
+| `minTokenAgeHours` | `24` | Minimum token age for deterministic screening |
+| `maxTokenAgeHours` | `240` | Maximum token age for deterministic screening |
 | `timeframe` | `5m` | Screening timeframe |
-| `category` | `trending` | Pool category filter |
+| `minTokenFeesSol` | `30` | Minimum aggregate token fees signal used during screening |
+| `maxBundlersPct` | `30` | Maximum allowed bundler concentration across top-100 holders |
+| `athFilterPct` | `null` | Maximum allowed `% of ATH`; `-20` means the token must be at or below 80% of ATH |
 | `takeProfitFeePct` | `5` | Close when fees reach this percent of deployed capital |
 | `minClaimAmount` | `5` | Fee threshold for claim / safe-mode compounding |
+| `autoSwapAfterClaim` | `false` | Only auto-swap after direct `claim_fees`; default off in the shipped example |
+| `outOfRangeBinsToClose` | `10` | Number of bins away from range before close heuristics can engage |
 | `protectionsEnabled` | `true` | Enable portfolio-level autonomous trading pauses |
 | `maxRecentRealizedLossUsd` | `100` | Pause new autonomous capital deployment if recent realized losses exceed this USD amount |
 | `maxDrawdownPct` | `25` | Pause new autonomous capital deployment if portfolio equity drawdown exceeds this percentage |
@@ -227,8 +247,10 @@ Edit `user-config.json`. The example file is a starting point; the runtime defau
 | `outOfRangeWaitMinutes` | `30` | Recorded out-of-range timing window and alert context; runtime management cadence is now enforced from live open-position volatility |
 | `minVolumeToRebalance` | `1000` | Minimum pool volume needed for rebalance logic |
 | `maxBundlersPct` | `30` | Maximum allowed bundler concentration across top-100 holders |
-| `maxTop10Pct` | `60` | Maximum allowed top-10 real-holder concentration |
+| `maxBotHoldersPct` | `null` | Maximum allowed Jupiter bot-holder percentage; `null` disables the filter |
+| `maxTop10Pct` | `30` | Maximum allowed top-10 real-holder concentration |
 | `maxBundlePct` | `30` | Maximum allowed OKX bundle concentration before finalist hard-blocking |
+| `blockedLaunchpads` | `[]` | Launchpad names to hard-block during finalist screening |
 
 ---
 
@@ -282,7 +304,7 @@ Free-form chat keeps recent session history so you can continue the conversation
 
 1. Create a bot via [@BotFather](https://t.me/BotFather) and copy the token
 2. Add `TELEGRAM_BOT_TOKEN=<token>` to your `.env`
-3. Configure `TELEGRAM_CHAT_ID=<your_chat_id>` in `.env` or `telegramChatId` in `user-config.json`
+3. Configure `TELEGRAM_CHAT_ID=<your_chat_id>` in `.env` or `telegramChatId` in your local `user-config.json` copied from `user-config.example.json`
 
 Zenith does not auto-register the first sender anymore. If no chat ID is configured, Telegram polling stays disabled.
 
@@ -421,7 +443,7 @@ Finalist quality gates are now stricter than the wide deterministic ranker:
 
 - finalists hard-block on blacklisted holder or funding addresses from `address-blacklist.json`
 - finalists hard-block on blocked creators from `creator-blacklist.json` using either discovery `pool.dev` or OKX `creatorAddress`
-- finalists hard-block on `okx_honeypot_tag`, excessive OKX bundle concentration, or unavailable critical holder / OKX advanced intel
+- finalists hard-block on `okx_honeypot_tag`, `okx_dev_sold_all`, excessive OKX bundle concentration, or unavailable critical holder / OKX advanced intel
 - if a top candidate hard-blocks during finalist enrichment, Zenith backfills the finalist set from the shortlist before thesis generation
 
 ### Deploy basis and action contracts
