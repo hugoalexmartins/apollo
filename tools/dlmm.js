@@ -12,6 +12,7 @@ import { recordPerformance } from "../lessons.js";
 import { log } from "../logger.js";
 import { getPoolDeployCooldown } from "../pool-memory.js";
 import { evaluatePortfolioGuard } from "../portfolio-guards.js";
+import { getEffectiveRpcUrl } from "../rpc-config.js";
 import { estimateInitialValueUsd } from "../runtime-helpers.js";
 import {
 	DEPLOY_GOVERNANCE_CODES,
@@ -35,7 +36,9 @@ import {
 import {
 	buildTrackedPositionFallback,
 	captureBalanceSnapshotForMints,
+	evaluateSingleSidedSolDeployOrientation,
 	getPositionExecutionContext,
+	resolveCanonicalPoolIdentity,
 	resolvePoolTokenMints,
 } from "./dlmm-position-context.js";
 import {
@@ -81,7 +84,9 @@ let _wallet = null;
 
 function getConnection() {
 	if (!_connection) {
-		_connection = new Connection(process.env.RPC_URL, "confirmed");
+		const rpcUrl = getEffectiveRpcUrl();
+		if (!rpcUrl) throw new Error("RPC_URL not set and HELIUS_API_KEY missing for default Helius Gatekeeper beta RPC");
+		_connection = new Connection(rpcUrl, "confirmed");
 	}
 	return _connection;
 }
@@ -179,9 +184,21 @@ export async function getPoolGovernanceMetadata({ pool_address }) {
 	pool_address = normalizeMint(pool_address);
 	try {
 		const pool = await getPool(pool_address);
+		const poolIdentity = resolveCanonicalPoolIdentity({
+			token_x_mint: pool?.lbPair?.tokenXMint?.toString() || null,
+			token_y_mint: pool?.lbPair?.tokenYMint?.toString() || null,
+			solMint: config.tokens?.SOL,
+		});
 		return {
 			pool_address,
-			base_mint: pool?.lbPair?.tokenXMint?.toString() || null,
+			base_mint: poolIdentity.risk_mint,
+			risk_mint: poolIdentity.risk_mint,
+			risk_token_side: poolIdentity.risk_token_side,
+			counter_mint: poolIdentity.counter_mint,
+			token_x_mint: poolIdentity.token_x_mint,
+			token_y_mint: poolIdentity.token_y_mint,
+			orientation_status: poolIdentity.orientation_status,
+			sol_side: poolIdentity.sol_side,
 			bin_step: pool?.lbPair?.binStep ?? null,
 		};
 	} catch (error) {
@@ -309,8 +326,12 @@ export async function deployPosition({
 	}
 
 	const { StrategyType } = await getDLMM();
-	const wallet = getWallet();
 	const pool = await getPool(pool_address);
+	const poolIdentity = resolveCanonicalPoolIdentity({
+		token_x_mint: pool?.lbPair?.tokenXMint?.toString() || null,
+		token_y_mint: pool?.lbPair?.tokenYMint?.toString() || null,
+		solMint: config.tokens?.SOL,
+	});
 	const activeBin = await pool.getActiveBin();
 
 	// Range calculation
@@ -334,6 +355,25 @@ export async function deployPosition({
 	// If amount_y is not provided but amount_sol is, use amount_sol (for backward compatibility)
 	const finalAmountY = amount_y ?? amount_sol ?? 0;
 	const finalAmountX = amount_x ?? 0;
+	const orientationGuard = evaluateSingleSidedSolDeployOrientation({
+		amount_x: finalAmountX,
+		amount_y: finalAmountY,
+		token_x_mint: pool?.lbPair?.tokenXMint?.toString() || null,
+		token_y_mint: pool?.lbPair?.tokenYMint?.toString() || null,
+		solMint: config.tokens?.SOL,
+	});
+	if (orientationGuard.blocked) {
+		return {
+			success: false,
+			blocked: true,
+			reason: orientationGuard.reason_code,
+			error: orientationGuard.message,
+			orientation_status: orientationGuard.orientation?.status || null,
+			sol_side: orientationGuard.orientation?.sol_side || null,
+			pool: pool_address,
+		};
+	}
+	const wallet = getWallet();
 	const walletBalances = await getWalletBalances({}).catch(() => null);
 	const solPrice = Number(walletBalances?.sol_price) || 0;
 	const resolvedInitialValueUsd = resolveDeployInitialValueUsd({
@@ -366,7 +406,7 @@ export async function deployPosition({
 			position: positionAddress,
 			pool: pool_address,
 			pool_name,
-			base_mint: pool.lbPair.tokenXMint.toString(),
+			base_mint: poolIdentity.risk_mint,
 			strategy: activeStrategy,
 			bin_range: {
 				min: minBinId,
@@ -786,6 +826,13 @@ export async function getMyPositions({ force = false } = {}) {
 
 				const tracked = getTrackedPosition(r.position);
 				const poolMints = mintsByPool[r.pool] || null;
+				const poolIdentity = poolMints
+					? resolveCanonicalPoolIdentity({
+						token_x_mint: poolMints.token_x_mint,
+						token_y_mint: poolMints.token_y_mint,
+						solMint: config.tokens?.SOL,
+					})
+					: null;
 				const ageFromPnlApi = p?.createdAt
 					? Math.floor((Date.now() - p.createdAt * 1000) / 60000)
 					: null;
@@ -811,7 +858,7 @@ export async function getMyPositions({ force = false } = {}) {
 					amount_sol: tracked?.amount_sol ?? null,
 					initial_value_usd: tracked?.initial_value_usd ?? null,
 					base_mint:
-						tracked?.base_mint || poolMints?.token_x_mint || r.base_mint,
+						tracked?.base_mint || poolIdentity?.risk_mint || r.base_mint,
 					lower_bin: lowerBin,
 					upper_bin: upperBin,
 					active_bin: activeBin,
@@ -844,8 +891,15 @@ export async function getMyPositions({ force = false } = {}) {
 				wallet: walletAddress,
 				total_positions: positions.length,
 				positions,
+				observation: {
+					completeness: "complete",
+					observed_at_ms: Date.now(),
+				},
 			};
-			syncOpenPositions(positions.map((p) => p.position));
+			syncOpenPositions({
+				active_addresses: positions.map((p) => p.position),
+				observation: result.observation,
+			});
 			_positionsCache = result;
 			_positionsCacheAt = Date.now();
 			return result;
@@ -928,6 +982,13 @@ export async function getWalletPositions({ wallet_address }) {
 		const positions = raw.map((r) => {
 			const p = pnlByPool[r.pool]?.[r.position] || null;
 			const poolMints = mintsByPool[r.pool] || null;
+			const poolIdentity = poolMints
+				? resolveCanonicalPoolIdentity({
+					token_x_mint: poolMints.token_x_mint,
+					token_y_mint: poolMints.token_y_mint,
+					solMint: config.tokens?.SOL,
+				})
+				: null;
 			const oorDirection = getOutOfRangeDirection(
 				p?.lowerBinId ?? null,
 				p?.upperBinId ?? null,
@@ -937,7 +998,7 @@ export async function getWalletPositions({ wallet_address }) {
 			return {
 				position: r.position,
 				pool: r.pool,
-				base_mint: poolMints?.token_x_mint || null,
+				base_mint: poolIdentity?.risk_mint || null,
 				lower_bin: p?.lowerBinId ?? null,
 				upper_bin: p?.upperBinId ?? null,
 				active_bin: p?.poolActiveBinId ?? null,
@@ -1156,6 +1217,25 @@ export async function rebalanceOnExit({
 			action_plan: actionPlan,
 		};
 	}
+	if (strategy === "bid_ask") {
+		const plannedOrientationGuard = evaluateSingleSidedSolDeployOrientation({
+			amount_x: 0,
+			amount_y: 1,
+			token_x_mint: poolTokenMints.token_x_mint,
+			token_y_mint: poolTokenMints.token_y_mint,
+			solMint: config.tokens?.SOL,
+		});
+		if (plannedOrientationGuard.blocked) {
+			return {
+				success: false,
+				error: `Rebalance redeploy blocked before close: ${plannedOrientationGuard.message}`,
+				position: position_address,
+				action_plan: actionPlan,
+				orientation_status: plannedOrientationGuard.orientation?.status || null,
+				sol_side: plannedOrientationGuard.orientation?.sol_side || null,
+			};
+		}
+	}
 
 	const beforeCloseSnapshot = await captureBalanceSnapshotForMints({
 		token_x_mint: poolTokenMints.token_x_mint,
@@ -1279,6 +1359,33 @@ export async function rebalanceOnExit({
 		decision_context,
 		bypass_portfolio_guard: true,
 	};
+	const redeployOrientationGuard = evaluateSingleSidedSolDeployOrientation({
+		amount_x: deployArgs.amount_x,
+		amount_y: deployArgs.amount_y,
+		token_x_mint: poolTokenMints.token_x_mint,
+		token_y_mint: poolTokenMints.token_y_mint,
+		solMint: config.tokens?.SOL,
+	});
+	if (redeployOrientationGuard.blocked) {
+		return {
+			success: false,
+			error: `Closed position but redeploy blocked: ${redeployOrientationGuard.message}`,
+			position: position_address,
+			close_result: closeResult,
+			orientation_status: redeployOrientationGuard.orientation?.status || null,
+			sol_side: redeployOrientationGuard.orientation?.sol_side || null,
+			action_plan: {
+				...actionPlan,
+				deploy_position: deployArgs,
+			},
+			planning: {
+				reinvestment_plan: {
+					amount_source: "post_close_balance_delta",
+					recovered_deltas: recoveredDeltaPlan,
+				},
+			},
+		};
+	}
 	const remainingPositions = await getMyPositions({ force: true });
 	if (
 		remainingPositions?.error ||
@@ -1307,11 +1414,15 @@ export async function rebalanceOnExit({
 	const remainingOpenPositions = remainingPositions.positions.filter(
 		(position) => position.position !== position_address,
 	);
-	const redeployAdmission = evaluateDeployAdmission({
-		config,
-		poolAddress: deployArgs.pool_address,
-		baseMint: targetPoolMints.token_x_mint,
-		amountY: deployArgs.amount_y ?? 0,
+		const redeployAdmission = evaluateDeployAdmission({
+			config,
+			poolAddress: deployArgs.pool_address,
+			baseMint: resolveCanonicalPoolIdentity({
+				token_x_mint: targetPoolMints.token_x_mint,
+				token_y_mint: targetPoolMints.token_y_mint,
+				solMint: config.tokens?.SOL,
+			}).risk_mint,
+			amountY: deployArgs.amount_y ?? 0,
 		amountX: deployArgs.amount_x ?? 0,
 		binStep: deployArgs.bin_step ?? context.position.bin_step ?? null,
 		positions: remainingOpenPositions,
@@ -1632,7 +1743,12 @@ export async function claimFees({ position_address }) {
 		// Clear cached pool so SDK loads fresh position fee state
 		poolCache.delete(poolAddress.toString());
 		const pool = await getPool(poolAddress);
-		const baseMint = pool.lbPair.tokenXMint.toString();
+		const poolIdentity = resolveCanonicalPoolIdentity({
+			token_x_mint: pool.lbPair.tokenXMint.toString(),
+			token_y_mint: pool.lbPair.tokenYMint.toString(),
+			solMint: config.tokens?.SOL,
+		});
+		const baseMint = poolIdentity.risk_mint || pool.lbPair.tokenXMint.toString();
 		const quoteMint = pool.lbPair.tokenYMint.toString();
 		const claimMints = [...new Set([baseMint, quoteMint].filter(Boolean))];
 		const previousBalancesByMint = {};
@@ -1728,7 +1844,9 @@ export async function claimFees({ position_address }) {
 		try {
 			recordClaim(
 				position_address,
-				settlement.observed_unclaimed_fee_delta ?? undefined,
+				settlement.settled
+					? (settlement.observed_unclaimed_fee_delta ?? undefined)
+					: undefined,
 			);
 		} catch (error) {
 			appendCommittedWriteWarning(
@@ -1745,16 +1863,21 @@ export async function claimFees({ position_address }) {
 			txs: txHashes,
 			base_mint: baseMint,
 			base_amount_received:
-				settlement.observed_mint === baseMint
+				settlement.settled && settlement.observed_mint === baseMint
 					? (settlement.observed_amount_received ?? 0)
-					: 0,
+					: null,
 			claimed_mint: settlement.observed_mint ?? null,
-			claimed_amount_received: settlement.observed_amount_received ?? 0,
+			claimed_amount_received:
+				settlement.settled ? (settlement.observed_amount_received ?? 0) : null,
 			claim_mints: claimMints,
+			capital_settlement_status: settlement.settled ? "settled" : "unverified",
+			residual_exposure_possible: !settlement.settled,
 			settlement_signal: settlement.signal,
 			settlement_attempts: settlement.attempts,
 			observed_unclaimed_fee_delta:
-				settlement.observed_unclaimed_fee_delta ?? null,
+				settlement.settled
+					? (settlement.observed_unclaimed_fee_delta ?? null)
+					: null,
 			settlement,
 		}, persistenceWarnings);
 	} catch (error) {
@@ -1795,7 +1918,12 @@ export async function closePosition({
 		// Clear cached pool so SDK loads fresh position fee state
 		poolCache.delete(poolAddress.toString());
 		const pool = await getPool(poolAddress);
-		const baseMint = pool.lbPair.tokenXMint.toString();
+		const poolIdentity = resolveCanonicalPoolIdentity({
+			token_x_mint: pool.lbPair.tokenXMint.toString(),
+			token_y_mint: pool.lbPair.tokenYMint.toString(),
+			solMint: config.tokens?.SOL,
+		});
+		const baseMint = poolIdentity.risk_mint || pool.lbPair.tokenXMint.toString();
 		const baseBalanceBeforeClose = await getWalletTokenBalance({
 			walletPubkey: wallet.publicKey,
 			mint: baseMint,
@@ -1947,7 +2075,14 @@ export async function closePosition({
 			pnl_usd: closePerformance?.result?.pnl_usd,
 			pnl_pct: closePerformance?.result?.pnl_pct,
 			base_mint: baseMint,
-			base_amount_received: settlement.observed_balance_delta ?? 0,
+			base_amount_received: settlement.settled
+				? (settlement.observed_balance_delta ?? 0)
+				: null,
+			capital_settlement_status: settlement.settled ? "settled" : "unverified",
+			residual_exposure_possible: !settlement.settled,
+			settlement_signal: settlement.signal || null,
+			settlement_attempts: settlement.attempts || 0,
+			settlement,
 			close_reason: reason,
 		}, persistenceWarnings);
 	} catch (error) {

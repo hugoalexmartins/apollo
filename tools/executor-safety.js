@@ -1,4 +1,9 @@
+import {
+	getWalletTokenBalanceFromSnapshot,
+	normalizeDeployAmounts,
+} from "../runtime-helpers.js";
 import { isBlacklisted } from "../token-blacklist.js";
+import { evaluateSingleSidedSolDeployOrientation } from "./dlmm-position-context.js";
 
 export function mergeOpenPositions(livePositions = [], trackedPositions = []) {
 	const merged = new Map();
@@ -27,8 +32,16 @@ export async function runSafetyChecksWithDeps(name, args, meta = {}, deps = {}) 
 	} = deps;
 
 	if (!meta.cycle_id && generalApprovalRequiredTools.has(name)) {
+		const deployShape = name === "deploy_position"
+			? normalizeDeployAmounts({
+				amount_x: args.amount_x,
+				amount_y: args.amount_y,
+				amount_sol: args.amount_sol,
+				defaultAmountY: 0,
+			})
+			: null;
 		const amountSol = name === "deploy_position"
-			? args.amount_y ?? args.amount_sol ?? 0
+			? deployShape.amount_sol
 			: name === "swap_token" && (args.output_mint === "SOL" || args.input_mint === "SOL")
 				? Number(args.amount || 0)
 				: null;
@@ -36,6 +49,8 @@ export async function runSafetyChecksWithDeps(name, args, meta = {}, deps = {}) 
 			tool_name: name,
 			pool_address: args.pool_address || null,
 			position_address: args.position_address || null,
+			amount_x: deployShape?.amount_x ?? null,
+			amount_y: deployShape?.amount_y ?? null,
 			amount_sol: amountSol,
 		});
 		if (!approval.pass) {
@@ -46,15 +61,28 @@ export async function runSafetyChecksWithDeps(name, args, meta = {}, deps = {}) 
 		}
 	}
 
-	switch (name) {
-		case "deploy_position": {
-			if (!meta.cycle_id) {
-				const amountSol = args.amount_y ?? args.amount_sol ?? 0;
-				const preflight = validateRecordedRiskOpeningPreflight(getRuntimeHealth().preflight, {
-					tool_name: name,
-					pool_address: args.pool_address,
-					amount_sol: amountSol,
+		switch (name) {
+			case "deploy_position": {
+				const deployShape = normalizeDeployAmounts({
+					amount_x: args.amount_x,
+					amount_y: args.amount_y,
+					amount_sol: args.amount_sol,
+					defaultAmountY: 0,
 				});
+				if (deployShape.has_invalid_amounts) {
+					return {
+						pass: false,
+						reason: `Invalid deploy amount input: ${deployShape.invalid_fields.join(", ")}`,
+					};
+				}
+				if (!meta.cycle_id) {
+					const preflight = validateRecordedRiskOpeningPreflight(getRuntimeHealth().preflight, {
+						tool_name: name,
+						pool_address: args.pool_address,
+						amount_x: deployShape.amount_x,
+						amount_y: deployShape.amount_y,
+						amount_sol: deployShape.amount_sol,
+					});
 				if (!preflight.pass) {
 					return {
 						pass: false,
@@ -63,8 +91,9 @@ export async function runSafetyChecksWithDeps(name, args, meta = {}, deps = {}) 
 				}
 			}
 
-			const balance = await getWalletBalancesRuntime();
-			if (args?.pool_address) {
+				const balance = await getWalletBalancesRuntime();
+				let walletTokenBalance = null;
+				if (args?.pool_address) {
 				const governanceMetadata = await getPoolGovernanceMetadataRuntime({
 					pool_address: args.pool_address,
 				});
@@ -75,14 +104,45 @@ export async function runSafetyChecksWithDeps(name, args, meta = {}, deps = {}) 
 					};
 				}
 				args.base_mint = governanceMetadata.base_mint;
+				args.risk_mint = governanceMetadata.risk_mint || governanceMetadata.base_mint;
 				args.bin_step = governanceMetadata.bin_step;
+				args.token_x_mint = governanceMetadata.token_x_mint || null;
+				args.token_y_mint = governanceMetadata.token_y_mint || null;
 				if (isBlacklisted(args.base_mint)) {
 					return {
 						pass: false,
 						reason: `Base token ${args.base_mint} is blacklisted and cannot be deployed.`,
 					};
 				}
-			}
+				const orientationGuard = evaluateSingleSidedSolDeployOrientation({
+					amount_x: args.amount_x ?? 0,
+					amount_y: args.amount_y,
+					amount_sol: args.amount_sol,
+					token_x_mint: governanceMetadata.token_x_mint,
+					token_y_mint: governanceMetadata.token_y_mint,
+					solMint: config.tokens?.SOL,
+				});
+					if (orientationGuard.blocked) {
+						return {
+							pass: false,
+							reason: orientationGuard.message,
+						};
+					}
+				if (deployShape.amount_x > 0) {
+					walletTokenBalance = getWalletTokenBalanceFromSnapshot(
+						balance,
+						args.token_x_mint || args.risk_mint,
+					);
+					if (!Number.isFinite(walletTokenBalance)) {
+						return {
+							pass: false,
+							reason: args.token_x_mint || args.risk_mint
+								? `Unable to verify wallet balance for deploy token ${(args.token_x_mint || args.risk_mint)}.`
+								: "Unable to verify wallet base-token readiness for token-funded deploy.",
+						};
+					}
+				}
+				}
 			const positions = await getMyPositionsRuntime({ force: true });
 			if (positions?.error) {
 				return {
@@ -105,13 +165,16 @@ export async function runSafetyChecksWithDeps(name, args, meta = {}, deps = {}) 
 				positions.positions,
 				trackedPositions,
 			);
-			const deployAdmission = evaluateDeployAdmission({
-				config,
-				poolAddress: args.pool_address,
-				baseMint: args.base_mint,
-				amountY: args.amount_y ?? args.amount_sol ?? 0,
-				amountX: args.amount_x ?? 0,
-				binStep: args.bin_step,
+				const deployAdmission = evaluateDeployAdmission({
+					config,
+					poolAddress: args.pool_address,
+					baseMint: args.base_mint,
+					riskMint: args.risk_mint,
+					amountY: deployShape.amount_y,
+					amountX: deployShape.amount_x,
+					binStep: args.bin_step,
+					walletTokenBalance,
+					tokenMint: args.token_x_mint || args.risk_mint,
 				positions: combinedPositions,
 				positionsCount: combinedPositions.length,
 				walletSol: balance.sol,

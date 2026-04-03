@@ -1,5 +1,7 @@
 import { PublicKey } from "@solana/web3.js";
 
+import { resolveCanonicalPoolIdentity } from "./dlmm-position-context.js";
+
 export function sanitizeCloseReason(reason) {
 	const normalized = String(reason || "agent decision").trim().toLowerCase();
 	if (normalized.includes("stop loss")) return "stop_loss";
@@ -24,6 +26,10 @@ export function buildClosePerformancePayload({
 	reason,
 	decisionContext,
 } = {}) {
+	const poolIdentity = resolveCanonicalPoolIdentity({
+		token_x_mint: pool?.lbPair?.tokenXMint?.toString() || null,
+		token_y_mint: pool?.lbPair?.tokenYMint?.toString() || null,
+	});
 	const safeCloseReason = sanitizeCloseReason(reason);
 	const pnlUsd = cachedPosition?.pnl_usd ?? 0;
 	const pnlPct = cachedPosition?.pnl_pct ?? 0;
@@ -44,7 +50,7 @@ export function buildClosePerformancePayload({
 			fee_tvl_ratio: tracked.fee_tvl_ratio || null,
 			organic_score: tracked.organic_score || null,
 			amount_sol: tracked.amount_sol,
-			base_mint: tracked.base_mint || pool.lbPair.tokenXMint.toString(),
+			base_mint: tracked.base_mint || poolIdentity.risk_mint || pool.lbPair.tokenXMint.toString(),
 			fees_earned_usd: feesUsd,
 			final_value_usd: finalValueUsd,
 			initial_value_usd: tracked.initial_value_usd || 0,
@@ -100,8 +106,10 @@ export function evaluatePostCloseSettlementObservation({
 
 	if (positionStillOpen === false) {
 		return {
-			settled: true,
+			settled: false,
+			weak_signal: true,
 			signal: "position_absent_from_open_positions",
+			reason: "position_absent_without_balance_settlement",
 			observed_balance: observedBaseBalance,
 			observed_balance_delta: observedBalanceDelta,
 		};
@@ -143,8 +151,10 @@ export function evaluatePostClaimSettlementObservation({
 	const observedFees = Number(observedUnclaimedFeeUsd);
 	if (Number.isFinite(previousFees) && Number.isFinite(observedFees) && observedFees < previousFees) {
 		return {
-			settled: true,
+			settled: false,
+			weak_signal: true,
 			signal: "unclaimed_fee_drop_observed",
+			reason: "unclaimed_fee_drop_without_token_settlement",
 			observed_unclaimed_fee_usd: observedFees,
 			observed_unclaimed_fee_delta: previousFees - observedFees,
 		};
@@ -181,6 +191,7 @@ export async function waitForPostCloseSettlement({
 	if (!baseMint && !positionAddress) {
 		return { settled: false, reason: "missing_settlement_observation_targets" };
 	}
+	let bestWeakSignal = null;
 
 	for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
 		let observedBaseBalance = null;
@@ -227,8 +238,25 @@ export async function waitForPostCloseSettlement({
 			};
 		}
 
+		if (observed.weak_signal) {
+			bestWeakSignal = {
+				settled: false,
+				weak_signal: true,
+				signal: observed.signal || null,
+				reason: observed.reason || "settlement_signal_weak_only",
+				observed_balance: observed.observed_balance ?? null,
+				observed_balance_delta: observed.observed_balance_delta ?? null,
+				position_still_open: positionStillOpen,
+				attempts: attempt,
+			};
+		}
+
 		if (attempt < maxAttempts) {
 			await new Promise((resolve) => setTimeout(resolve, delayMs));
+		}
+
+		if (attempt === maxAttempts && bestWeakSignal) {
+			return bestWeakSignal;
 		}
 	}
 
@@ -251,6 +279,7 @@ export async function waitForPostClaimSettlement({
 		return { settled: false, reason: "missing_claim_settlement_observation_targets" };
 	}
 	const uniqueMints = [...new Set((observedMints || []).filter(Boolean))];
+	let bestWeakSignal = null;
 
 	for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
 		const observedBalancesByMint = {};
@@ -302,8 +331,28 @@ export async function waitForPostClaimSettlement({
 			};
 		}
 
+		if (observed.weak_signal) {
+			bestWeakSignal = {
+				settled: false,
+				weak_signal: true,
+				signal: observed.signal || null,
+				reason: observed.reason || "claim_settlement_signal_weak_only",
+				observed_mint: observed.observed_mint ?? null,
+				observed_amount_received: observed.observed_amount_received ?? null,
+				observed_balance: observed.observed_balance ?? null,
+				observed_balance_delta: observed.observed_balance_delta ?? null,
+				observed_unclaimed_fee_usd: observed.observed_unclaimed_fee_usd ?? null,
+				observed_unclaimed_fee_delta: observed.observed_unclaimed_fee_delta ?? null,
+				attempts: attempt,
+			};
+		}
+
 		if (attempt < maxAttempts) {
 			await new Promise((resolve) => setTimeout(resolve, delayMs));
+		}
+
+		if (attempt === maxAttempts && bestWeakSignal) {
+			return bestWeakSignal;
 		}
 	}
 

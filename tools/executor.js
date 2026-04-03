@@ -1,6 +1,10 @@
 import { execSync, spawn } from "node:child_process";
 
-import { appendActionLifecycle } from "../action-journal.js";
+import {
+	appendActionLifecycle,
+	foldActionJournal,
+	readActionJournal,
+} from "../action-journal.js";
 import { config } from "../config.js";
 import {
 	addLesson,
@@ -152,6 +156,40 @@ function normalizeToolName(name) {
 
 function buildManualReviewSuppressionReason(toolName, reason) {
 	return `${toolName} requires manual review: ${reason || "unknown write-state divergence"}`;
+}
+
+function isScreeningCycleDeploy(toolName, meta = {}) {
+	return (
+		toolName === "deploy_position" &&
+		meta?.cycle_id &&
+		meta?.cycle_type === "screening"
+	);
+}
+
+function getScreeningDeployCycleGuard(cycleId) {
+	if (!cycleId) return { blocked: false, reason: null, parseErrors: [] };
+	const journal = readActionJournal();
+	if (journal.parse_errors.length > 0) {
+		return {
+			blocked: true,
+			reason: `action journal invalid (${journal.parse_errors.length} parse error(s)); screening deploy guard failed closed`,
+			parseErrors: journal.parse_errors,
+		};
+	}
+	const hasCompletedDeploy = foldActionJournal(journal.entries).some(
+		(workflow) =>
+			workflow?.cycle_id === cycleId &&
+			workflow?.tool === "deploy_position" &&
+			Array.isArray(workflow?.history) &&
+			workflow.history.some((entry) => entry?.lifecycle === "completed"),
+	);
+	return {
+		blocked: hasCompletedDeploy,
+		reason: hasCompletedDeploy
+			? `deploy_position already succeeded in screening cycle ${cycleId}; only one deploy is allowed per screening cycle`
+			: null,
+		parseErrors: [],
+	};
 }
 
 // Registered by index.js so update_config can restart cron jobs when intervals change
@@ -398,14 +436,12 @@ export async function executeTool(name, args, meta = {}) {
 			meta,
 			reason,
 		});
-		if (meta.cycle_id) {
-			setAutonomousWriteSuppression({
-				suppressed: true,
-				reason: buildManualReviewSuppressionReason(toolName, reason),
-				code: "WRITE_MANUAL_REVIEW",
-				incidentKey: workflowId || meta.action_id || null,
-			});
-		}
+		setAutonomousWriteSuppression({
+			suppressed: true,
+			reason: buildManualReviewSuppressionReason(toolName, reason),
+			code: "WRITE_MANUAL_REVIEW",
+			incidentKey: workflowId || meta.action_id || null,
+		});
 	}
 
 	// ─── Validate tool exists ─────────────────
@@ -492,6 +528,31 @@ export async function executeTool(name, args, meta = {}) {
 				blocked: true,
 				reason,
 			};
+		}
+
+		if (isScreeningCycleDeploy(toolName, meta)) {
+			const screeningDeployGuard = getScreeningDeployCycleGuard(meta.cycle_id);
+			if (screeningDeployGuard.blocked) {
+				const reason = screeningDeployGuard.reason;
+				recordToolOutcomeRuntime({
+					tool: toolName,
+					outcome: "blocked",
+					reason,
+					metadata: {
+						pool_address: normalizedArgs?.pool_address || null,
+						position_address: normalizedArgs?.position_address || null,
+						cycle_id: meta.cycle_id || null,
+						action_id: meta.action_id || null,
+						blocked_by_screening_cycle_deploy_guard: true,
+						journal_parse_errors:
+							screeningDeployGuard.parseErrors?.length || 0,
+					},
+				});
+				return {
+					blocked: true,
+					reason,
+				};
+			}
 		}
 
 		workflowId =
@@ -640,6 +701,14 @@ export async function executeTool(name, args, meta = {}) {
 					pool_address: normalizedArgs?.pool_address || null,
 					position_address:
 						normalizedArgs?.position_address || result?.position || null,
+					amount_x:
+						toolName === "deploy_position"
+							? (normalizedArgs?.amount_x ?? 0)
+							: null,
+					amount_y:
+						toolName === "deploy_position"
+							? (normalizedArgs?.amount_y ?? normalizedArgs?.amount_sol ?? 0)
+							: null,
 					amount_sol:
 						toolName === "deploy_position"
 							? (normalizedArgs?.amount_y ?? normalizedArgs?.amount_sol ?? 0)
