@@ -94,7 +94,8 @@ test("operator controls enforce scoped GENERAL write approval", () => {
 			scope: {
 				allowed_tools: ["deploy_position"],
 				pool_address: "pool-1",
-				max_amount_sol: 0.5,
+				max_amount_x: 12,
+				max_amount_y: 0.5,
 				one_shot: true,
 			},
 			nowMs,
@@ -103,6 +104,8 @@ test("operator controls enforce scoped GENERAL write approval", () => {
 		const allowed = evaluateGeneralWriteApproval({
 			tool_name: "deploy_position",
 			pool_address: "pool-1",
+			amount_x: 10,
+			amount_y: 0.5,
 			amount_sol: 0.5,
 			nowMs: nowMs + 60_000,
 		});
@@ -112,6 +115,8 @@ test("operator controls enforce scoped GENERAL write approval", () => {
 		const blockedTool = evaluateGeneralWriteApproval({
 			tool_name: "close_position",
 			pool_address: "pool-1",
+			amount_x: 10,
+			amount_y: 0.5,
 			amount_sol: 0.5,
 			nowMs: nowMs + 60_000,
 		});
@@ -120,18 +125,101 @@ test("operator controls enforce scoped GENERAL write approval", () => {
 		const blockedPool = evaluateGeneralWriteApproval({
 			tool_name: "deploy_position",
 			pool_address: "pool-2",
+			amount_x: 10,
+			amount_y: 0.5,
 			amount_sol: 0.5,
 			nowMs: nowMs + 60_000,
 		});
 		assert.equal(blockedPool.reason_code, "GENERAL_WRITE_POOL_SCOPE_MISMATCH");
 
+		const blockedTokenAmount = evaluateGeneralWriteApproval({
+			tool_name: "deploy_position",
+			pool_address: "pool-1",
+			amount_x: 13,
+			amount_y: 0.5,
+			amount_sol: 0.5,
+			nowMs: nowMs + 60_000,
+		});
+		assert.equal(blockedTokenAmount.reason_code, "GENERAL_WRITE_MAX_NOTIONAL_EXCEEDED");
+
+		const conflictingAliases = evaluateGeneralWriteApproval({
+			tool_name: "deploy_position",
+			pool_address: "pool-1",
+			amount_x: 10,
+			amount_y: 0.5,
+			amount_sol: 0.7,
+			nowMs: nowMs + 60_000,
+		});
+		assert.equal(conflictingAliases.reason_code, "GENERAL_WRITE_INVALID_AMOUNT_INPUT");
+
 		consumeOneShotGeneralWriteApproval({
 			tool_name: "deploy_position",
 			pool_address: "pool-1",
+			amount_x: 10,
+			amount_y: 0.5,
 			amount_sol: 0.5,
 			nowMs: nowMs + 90_000,
 		});
 		assert.equal(getGeneralWriteArmStatus({ nowMs: nowMs + 90_000 }).armed, false);
+	} finally {
+		process.chdir(originalCwd);
+		fs.rmSync(tempDir, { recursive: true, force: true });
+	}
+});
+
+test("operator controls fail closed on invalid deploy amount input", () => {
+	const originalCwd = process.cwd();
+	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "zenith-operator-controls-invalid-amount-test-"));
+	const nowMs = Date.now();
+
+	try {
+		process.chdir(tempDir);
+		armGeneralWriteTools({
+			minutes: 5,
+			reason: "scoped deploy arm",
+			scope: {
+				allowed_tools: ["deploy_position"],
+				pool_address: "pool-1",
+				max_amount_y: 0.5,
+			},
+			nowMs,
+		});
+
+		const invalidAmount = evaluateGeneralWriteApproval({
+			tool_name: "deploy_position",
+			pool_address: "pool-1",
+			amount_x: "oops",
+			amount_y: 0.5,
+			nowMs: nowMs + 60_000,
+		});
+		assert.equal(invalidAmount.reason_code, "GENERAL_WRITE_INVALID_AMOUNT_INPUT");
+	} finally {
+		process.chdir(originalCwd);
+		fs.rmSync(tempDir, { recursive: true, force: true });
+	}
+});
+
+test("operator controls reject conflicting scope aliases for max_amount_y and max_amount_sol", () => {
+	const originalCwd = process.cwd();
+	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "zenith-operator-controls-scope-conflict-test-"));
+	const nowMs = Date.now();
+
+	try {
+		process.chdir(tempDir);
+		assert.throws(
+			() => armGeneralWriteTools({
+				minutes: 5,
+				reason: "conflicting scope aliases",
+				scope: {
+					allowed_tools: ["deploy_position"],
+					pool_address: "pool-1",
+					max_amount_y: 0.5,
+					max_amount_sol: 0.7,
+				},
+				nowMs,
+			}),
+			/max_amount_y_vs_max_amount_sol/i,
+		);
 	} finally {
 		process.chdir(originalCwd);
 		fs.rmSync(tempDir, { recursive: true, force: true });

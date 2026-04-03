@@ -1,6 +1,7 @@
 function parseArmScopeOptions(parts = []) {
 	const scope = {};
 	const reasonParts = [];
+	const invalidNumericFields = [];
 	for (const part of parts) {
 		if (!part) continue;
 		if (part === "once") {
@@ -25,8 +26,25 @@ function parseArmScopeOptions(parts = []) {
 			scope.position_address = value;
 			continue;
 		}
+		if (key === "max_x" || key === "amount_x") {
+			const numeric = Number(value);
+			if (!Number.isFinite(numeric) || numeric < 0) invalidNumericFields.push(key);
+			else scope.max_amount_x = numeric;
+			continue;
+		}
+		if (key === "max_y" || key === "amount_y") {
+			const numeric = Number(value);
+			if (!Number.isFinite(numeric) || numeric < 0) invalidNumericFields.push(key);
+			else scope.max_amount_y = numeric;
+			continue;
+		}
 		if (key === "max_sol" || key === "amount_sol") {
-			scope.max_amount_sol = Number(value);
+			const numeric = Number(value);
+			if (!Number.isFinite(numeric) || numeric < 0) invalidNumericFields.push(key);
+			else {
+				scope.max_amount_y = numeric;
+				scope.max_amount_sol = numeric;
+			}
 			continue;
 		}
 		if (key === "one_shot") {
@@ -38,6 +56,7 @@ function parseArmScopeOptions(parts = []) {
 	return {
 		scope,
 		reason: reasonParts.join(" "),
+		invalid_numeric_fields: invalidNumericFields,
 	};
 }
 
@@ -49,7 +68,10 @@ function formatApprovalScope(scope = null) {
 	}
 	if (scope.pool_address) parts.push(`pool=${scope.pool_address}`);
 	if (scope.position_address) parts.push(`position=${scope.position_address}`);
-	if (scope.max_amount_sol != null) parts.push(`max_sol=${scope.max_amount_sol}`);
+	if (scope.max_amount_x != null) parts.push(`max_x=${scope.max_amount_x}`);
+	if (scope.max_amount_y != null || scope.max_amount_sol != null) {
+		parts.push(`max_sol=${scope.max_amount_y ?? scope.max_amount_sol}`);
+	}
 	if (scope.one_shot) parts.push("once");
 	return parts.length > 0 ? parts.join(" ") : "general scope";
 }
@@ -72,15 +94,29 @@ export async function handleOperatorCommandText({
   if (text.startsWith("/arm")) {
     const [, minutesRaw, ...reasonParts] = text.split(/\s+/);
     const minutes = Math.max(1, Number(minutesRaw) || 10);
-    const parsed = parseArmScopeOptions(reasonParts);
-    if (!Array.isArray(parsed.scope.allowed_tools) || parsed.scope.allowed_tools.length === 0) {
+		const parsed = parseArmScopeOptions(reasonParts);
+		if (parsed.invalid_numeric_fields.length > 0) {
+			return {
+				handled: true,
+				message: `Scoped approvals reject invalid amount input: ${parsed.invalid_numeric_fields.join(", ")}.`,
+			};
+		}
+		if (!Array.isArray(parsed.scope.allowed_tools) || parsed.scope.allowed_tools.length === 0) {
 			return {
 				handled: true,
 				message: "Scoped approvals require at least one explicit tool via tool=<name>.",
 			};
 		}
-    const reason = parsed.reason || `${source} operator arm`;
-    const armStatus = armGeneralWriteTools({ minutes, reason, scope: parsed.scope });
+		const reason = parsed.reason || `${source} operator arm`;
+		let armStatus;
+		try {
+			armStatus = armGeneralWriteTools({ minutes, reason, scope: parsed.scope });
+		} catch (error) {
+			return {
+				handled: true,
+				message: `Cannot arm GENERAL writes: ${error.message}`,
+			};
+		}
     const snapshot = getOperatorControlSnapshot?.() || { general_write_arm: armStatus };
     refreshRuntimeHealth();
     return {
@@ -113,10 +149,13 @@ export async function handleOperatorCommandText({
       && suppression.code === "UNRESOLVED_WORKFLOW"
       && Boolean(suppression.incident_key)
       && report.incident_key === suppression.incident_key;
-    if (!resumableWorkflowBlock) {
+    const resumableWriteManualReviewBlock = suppression.suppressed
+			&& suppression.code === "WRITE_MANUAL_REVIEW"
+			&& Boolean(suppression.incident_key);
+    if (!resumableWorkflowBlock && !resumableWriteManualReviewBlock) {
       return {
         handled: true,
-        message: "Cannot persist resume override unless autonomous writes are currently suppressed for an unresolved-workflow manual-review block.",
+				message: "Cannot persist resume override unless autonomous writes are currently suppressed for an unresolved-workflow or live write manual-review block.",
       };
     }
     let override;

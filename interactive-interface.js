@@ -4,7 +4,10 @@ import {
 	evaluateGeneralWriteApproval,
 	recordOperatorAction,
 } from "./operator-controls.js";
-import { buildRiskOpeningPreflightReport, formatPreflightReport } from "./preflight.js";
+import {
+	buildRiskOpeningPreflightReport as buildRiskOpeningPreflightReportImpl,
+	formatPreflightReport,
+} from "./preflight.js";
 import { formatCandidateInspection, formatCandidates, formatRangeStatus, inspectCandidate } from "./screening-intel.js";
 import { formatInteractiveHelp, renderInteractiveStartup } from "./startup-interface.js";
 
@@ -94,12 +97,12 @@ export async function runThresholdEvolutionCommand({
 
 export async function runPreflightCheckCommand({
 	rawInput = "",
-	deployAmountSol,
+	getPoolGovernanceMetadata = null,
 	getStartupSnapshot,
 	getWalletBalances,
 	getMyPositions,
 	getTopCandidates,
-	buildRiskOpeningPreflightReport,
+	buildRiskOpeningPreflightReport = buildRiskOpeningPreflightReportImpl,
 	isFailClosedResult,
 	getRecoveryWorkflowReport,
 	getAutonomousWriteSuppression,
@@ -119,7 +122,25 @@ export async function runPreflightCheckCommand({
 	const toolName = options.tool || "deploy_position";
 	const poolAddress = options.pool || null;
 	const positionAddress = options.position || null;
-	const amountSol = Number(options.amount_sol ?? options.max_sol ?? deployAmountSol);
+	const invalidAmountFields = [];
+	const rawAmountSol = options.amount_sol ?? options.max_sol;
+	if (
+		options.amount_sol != null
+		&& options.max_sol != null
+		&& (
+			!Number.isFinite(Number(options.amount_sol))
+			|| Number(options.amount_sol) < 0
+			|| !Number.isFinite(Number(options.max_sol))
+			|| Number(options.max_sol) < 0
+			|| Number(options.amount_sol) !== Number(options.max_sol)
+		)
+	) {
+		invalidAmountFields.push("amount_sol_vs_max_sol");
+	}
+	const governanceMetadata =
+		toolName === "deploy_position" && poolAddress && typeof getPoolGovernanceMetadata === "function"
+			? await getPoolGovernanceMetadata({ pool_address: poolAddress }).catch(() => null)
+			: null;
 	const startupSnapshot = await getStartupSnapshot({
 		force: true,
 		getWalletBalances,
@@ -130,13 +151,23 @@ export async function runPreflightCheckCommand({
 		tool_name: toolName,
 		pool_address: poolAddress,
 		position_address: positionAddress,
-		amount_sol: amountSol,
+		amount_x: options.amount_x ?? null,
+		amount_y: options.amount_y ?? null,
+		amount_sol: rawAmountSol ?? null,
+		invalid_amount_fields: invalidAmountFields,
 	});
 	const report = buildRiskOpeningPreflightReport({
 		tool_name: toolName,
 		pool_address: poolAddress,
 		position_address: positionAddress,
-		amount_sol: amountSol,
+		base_mint:
+			Number(options.amount_x ?? 0) > 0
+				? (governanceMetadata?.token_x_mint || governanceMetadata?.risk_mint || governanceMetadata?.base_mint || null)
+				: (governanceMetadata?.risk_mint || governanceMetadata?.base_mint || null),
+		amount_x: options.amount_x ?? null,
+		amount_y: options.amount_y ?? null,
+		amount_sol: rawAmountSol ?? null,
+		invalid_amount_fields: invalidAmountFields,
 		startupSnapshot,
 		isFailClosedResult,
 		recoveryReport: getRecoveryWorkflowReport({ limit: 10 }),
@@ -150,6 +181,7 @@ export async function runPreflightCheckCommand({
 
 export async function runInteractiveInterface({
   buildPrompt,
+  getPoolGovernanceMetadata,
   bootRecovery,
   bootRecoveryBlockActive,
   summarizeRecoveryBlock,
@@ -352,10 +384,11 @@ export async function runInteractiveInterface({
 				try {
 					await sendMessage(
 						formatPreflightReport(
-							await runPreflightCheckCommand({
-								rawInput: telegramPreflight[1] || "",
-								deployAmountSol,
-								getStartupSnapshot,
+						await runPreflightCheckCommand({
+							rawInput: telegramPreflight[1] || "",
+							deployAmountSol,
+							getPoolGovernanceMetadata,
+							getStartupSnapshot,
 								getWalletBalances,
 								getMyPositions,
 								getTopCandidates,
@@ -492,6 +525,7 @@ export async function runInteractiveInterface({
 						await runPreflightCheckCommand({
 							rawInput: preflightMatch[1] || "",
 							deployAmountSol,
+							getPoolGovernanceMetadata,
 							getStartupSnapshot,
 							getWalletBalances,
 							getMyPositions,

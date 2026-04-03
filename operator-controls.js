@@ -6,6 +6,7 @@ import {
 	readJsonSnapshotWithBackupSync,
 	writeJsonSnapshotAtomicSync,
 } from "./durable-store.js";
+import { normalizeDeployAmounts } from "./runtime-helpers.js";
 
 const DATA_DIR = "./data";
 const ACTIONS_FILE = path.join(DATA_DIR, "operator-actions.jsonl");
@@ -20,7 +21,16 @@ function emptyState() {
     recovery_resume_override_reason: null,
     recovery_resume_override_source: null,
     recovery_resume_override_incident_key: null,
-  };
+	};
+}
+
+function normalizeScopedNumber(value, fieldName) {
+	if (value == null || value === "") return { value: null, invalid_field: null };
+	const numeric = Number(value);
+	if (!Number.isFinite(numeric) || numeric < 0) {
+		return { value: null, invalid_field: fieldName };
+	}
+	return { value: numeric, invalid_field: null };
 }
 
 function normalizeGeneralWriteScope(scope = {}) {
@@ -30,12 +40,34 @@ function normalizeGeneralWriteScope(scope = {}) {
 		: typeof scope.allowed_tools === "string"
 			? scope.allowed_tools.split(",").map((tool) => tool.trim()).filter(Boolean)
 			: [];
-	const maxAmountSol = scope.max_amount_sol == null ? null : Number(scope.max_amount_sol);
+	const maxAmountX = normalizeScopedNumber(scope.max_amount_x, "max_amount_x");
+	const rawMaxAmountY =
+		scope.max_amount_y ??
+		scope.max_amount_sol ??
+		scope.amount_y ??
+		scope.amount_sol;
+	const scopeAliasConflict =
+		scope.max_amount_y != null
+		&& scope.max_amount_sol != null
+		&& Number.isFinite(Number(scope.max_amount_y))
+		&& Number.isFinite(Number(scope.max_amount_sol))
+		&& Number(scope.max_amount_y) !== Number(scope.max_amount_sol);
+	const maxAmountY = normalizeScopedNumber(rawMaxAmountY, "max_amount_y");
+	const maxAmountSol = normalizeScopedNumber(scope.max_amount_sol, "max_amount_sol");
+	const invalid_numeric_fields = [
+		maxAmountX.invalid_field,
+		maxAmountY.invalid_field,
+		maxAmountSol.invalid_field,
+		scopeAliasConflict ? "max_amount_y_vs_max_amount_sol" : null,
+	].filter(Boolean);
 	return {
 		allowed_tools: tools.length > 0 ? tools : null,
 		pool_address: scope.pool_address || null,
 		position_address: scope.position_address || null,
-		max_amount_sol: Number.isFinite(maxAmountSol) && maxAmountSol >= 0 ? maxAmountSol : null,
+		max_amount_x: maxAmountX.value,
+		max_amount_y: maxAmountY.value,
+		max_amount_sol: maxAmountSol.value,
+		invalid_numeric_fields,
 		one_shot: Boolean(scope.one_shot),
 	};
 }
@@ -93,9 +125,13 @@ export function recordOperatorAction(entry = {}) {
 export function armGeneralWriteTools({ minutes = 10, reason = "manual operator arm", scope = null, nowMs = Date.now() } = {}) {
   const state = loadState();
   const previousState = cloneState(state);
+  const normalizedScope = normalizeGeneralWriteScope(scope);
+  if (normalizedScope?.invalid_numeric_fields?.length > 0) {
+		throw new Error(`Invalid GENERAL approval scope amount input: ${normalizedScope.invalid_numeric_fields.join(", ")}`);
+	}
   state.general_write_arm_until_ms = nowMs + (Number(minutes) || 10) * 60_000;
   state.general_write_arm_reason = reason;
-  state.general_write_arm_scope = normalizeGeneralWriteScope(scope);
+	state.general_write_arm_scope = normalizedScope;
 	persistStateAndAudit(state, {
 		type: "arm_general_writes",
 		minutes,
@@ -135,9 +171,19 @@ export function evaluateGeneralWriteApproval({
 	tool_name,
 	pool_address = null,
 	position_address = null,
+	amount_x = null,
+	amount_y = null,
 	amount_sol = null,
+	invalid_amount_fields = [],
 	nowMs = Date.now(),
 } = {}) {
+	const deployShape = normalizeDeployAmounts({
+		amount_x,
+		amount_y,
+		amount_sol,
+		additionalInvalidFields: invalid_amount_fields,
+		defaultAmountY: 0,
+	});
 	const arm = getGeneralWriteArmStatus({ nowMs });
 	if (!arm.armed) {
 		return {
@@ -148,6 +194,20 @@ export function evaluateGeneralWriteApproval({
 	}
 
 	const scope = arm.scope || {};
+	if (Array.isArray(scope.invalid_numeric_fields) && scope.invalid_numeric_fields.length > 0) {
+		return {
+			pass: false,
+			reason_code: "GENERAL_WRITE_SCOPE_INVALID",
+			reason: `GENERAL approval scope has invalid amount input: ${scope.invalid_numeric_fields.join(", ")}`,
+		};
+	}
+	if (deployShape.has_invalid_amounts) {
+		return {
+			pass: false,
+			reason_code: "GENERAL_WRITE_INVALID_AMOUNT_INPUT",
+			reason: `Invalid deploy amount input: ${deployShape.invalid_fields.join(", ")}`,
+		};
+	}
 	if (Array.isArray(scope.allowed_tools) && scope.allowed_tools.length > 0 && !scope.allowed_tools.includes(tool_name)) {
 		return {
 			pass: false,
@@ -169,11 +229,19 @@ export function evaluateGeneralWriteApproval({
 			reason: `GENERAL approval is scoped to position ${scope.position_address}.`,
 		};
 	}
-	if (scope.max_amount_sol != null && Number(amount_sol) > scope.max_amount_sol) {
+	if (scope.max_amount_x != null && deployShape.amount_x > scope.max_amount_x) {
 		return {
 			pass: false,
 			reason_code: "GENERAL_WRITE_MAX_NOTIONAL_EXCEEDED",
-			reason: `GENERAL approval max notional is ${scope.max_amount_sol} SOL.`,
+			reason: `GENERAL approval max base-token amount is ${scope.max_amount_x}.`,
+		};
+	}
+	const maxAmountY = scope.max_amount_y ?? scope.max_amount_sol;
+	if (maxAmountY != null && deployShape.amount_y > Number(maxAmountY)) {
+		return {
+			pass: false,
+			reason_code: "GENERAL_WRITE_MAX_NOTIONAL_EXCEEDED",
+			reason: `GENERAL approval max notional is ${Number(maxAmountY)} SOL.`,
 		};
 	}
 
@@ -190,6 +258,8 @@ export function consumeOneShotGeneralWriteApproval({
 	tool_name,
 	pool_address = null,
 	position_address = null,
+	amount_x = null,
+	amount_y = null,
 	amount_sol = null,
 	nowMs = Date.now(),
 } = {}) {
@@ -204,6 +274,8 @@ export function consumeOneShotGeneralWriteApproval({
 		tool_name,
 		pool_address,
 		position_address,
+		amount_x,
+		amount_y,
 		amount_sol,
 		nowMs,
 	});
@@ -218,6 +290,8 @@ export function consumeOneShotGeneralWriteApproval({
 		tool_name,
 		pool_address,
 		position_address,
+		amount_x,
+		amount_y,
 		amount_sol,
 	}, previousState);
   return getGeneralWriteArmStatus({ nowMs });

@@ -3,6 +3,79 @@ export function getRequiredSolBalance({ deployAmountSol = 0, gasReserve = 0 }) {
   return Number(required.toFixed(3));
 }
 
+function normalizeNonNegativeAmountField(value, fieldName) {
+	const provided = !(value == null || value === "");
+	if (!provided) {
+		return {
+			provided: false,
+			value: 0,
+			invalid_field: null,
+		};
+	}
+	const numeric = Number(value);
+	if (!Number.isFinite(numeric) || numeric < 0) {
+		return {
+			provided: true,
+			value: 0,
+			invalid_field: fieldName,
+		};
+	}
+	return {
+		provided: true,
+		value: numeric,
+		invalid_field: null,
+	};
+}
+
+export function normalizeDeployAmounts({
+	amount_x = null,
+	amount_y = null,
+	amount_sol = null,
+	defaultAmountY = 0,
+	additionalInvalidFields = [],
+} = {}) {
+	const parsedAmountX = normalizeNonNegativeAmountField(amount_x, "amount_x");
+	const parsedAmountY = normalizeNonNegativeAmountField(amount_y, "amount_y");
+	const parsedAmountSol = normalizeNonNegativeAmountField(amount_sol, "amount_sol");
+	const aliasConflict = parsedAmountY.provided
+		&& parsedAmountSol.provided
+		&& !parsedAmountY.invalid_field
+		&& !parsedAmountSol.invalid_field
+		&& parsedAmountY.value !== parsedAmountSol.value;
+	let amountY = parsedAmountY.provided
+		? parsedAmountY.value
+		: parsedAmountSol.provided
+			? parsedAmountSol.value
+			: parsedAmountX.value <= 0
+				? Number(defaultAmountY) || 0
+				: 0;
+	if (!Number.isFinite(amountY) || amountY < 0) amountY = 0;
+	const invalid_fields = [
+		parsedAmountX.invalid_field,
+		parsedAmountY.invalid_field,
+		parsedAmountSol.invalid_field,
+		aliasConflict ? "amount_y_vs_amount_sol" : null,
+		...additionalInvalidFields,
+	].filter(Boolean);
+	return {
+		amount_x: Number(parsedAmountX.value.toFixed(9)),
+		amount_y: Number(amountY.toFixed(9)),
+		amount_sol: Number(amountY.toFixed(9)),
+		invalid_fields,
+		has_invalid_amounts: invalid_fields.length > 0,
+	};
+}
+
+export function getWalletTokenBalanceFromSnapshot(walletSnapshot = null, mint = null) {
+	if (!walletSnapshot || !mint) return null;
+	const tokens = Array.isArray(walletSnapshot.tokens) ? walletSnapshot.tokens : null;
+	if (!tokens) return null;
+	const entry = tokens.find((token) => token?.mint === mint);
+	if (!entry) return 0;
+	const balance = Number(entry.balance);
+	return Number.isFinite(balance) ? balance : null;
+}
+
 export function getEffectiveMinSolToOpen({
   minSolToOpen = 0,
   deployAmountSol = 0,

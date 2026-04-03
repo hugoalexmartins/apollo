@@ -79,7 +79,7 @@ test("operator command handler rejects unscoped arm requests", async () => {
 test("operator command handler parses scoped arm options", async () => {
 	let receivedScope = null;
 	await handleOperatorCommandText({
-		text: "/arm 5 tool=deploy_position pool=pool-1 max_sol=0.5 once scoped deploy",
+		text: "/arm 5 tool=deploy_position pool=pool-1 max_x=12 max_y=0.5 once scoped deploy",
 		source: "test",
 		config: { protections: { recoveryResumeOverrideMinutes: 120 } },
 		getRecoveryWorkflowReport: () => ({ status: "clear" }),
@@ -100,9 +100,56 @@ test("operator command handler parses scoped arm options", async () => {
 	assert.deepEqual(receivedScope, {
 		allowed_tools: ["deploy_position"],
 		pool_address: "pool-1",
-		max_amount_sol: 0.5,
+		max_amount_x: 12,
+		max_amount_y: 0.5,
 		one_shot: true,
 	});
+});
+
+test("operator command handler rejects invalid numeric scope input", async () => {
+	const result = await handleOperatorCommandText({
+		text: "/arm 5 tool=deploy_position pool=pool-1 max_x=oops once bad scope",
+		source: "test",
+		config: { protections: { recoveryResumeOverrideMinutes: 120 } },
+		getRecoveryWorkflowReport: () => ({ status: "clear" }),
+		getAutonomousWriteSuppression: () => ({ suppressed: false }),
+		setAutonomousWriteSuppression: () => {},
+		acknowledgeRecoveryResume: () => ({ override_until: null }),
+		armGeneralWriteTools: () => ({ armed_until: null }),
+		disarmGeneralWriteTools: () => ({ armed: false }),
+		getOperatorControlSnapshot: () => ({
+			general_write_arm: { armed: false, armed_until: null },
+			recovery_resume_override: { active: false, override_until: null },
+		}),
+		refreshRuntimeHealth: () => {},
+	});
+
+	assert.equal(result.handled, true);
+	assert.match(result.message, /reject invalid amount input/i);
+});
+
+test("operator command handler rejects conflicting scope aliases", async () => {
+	const result = await handleOperatorCommandText({
+		text: "/arm 5 tool=deploy_position pool=pool-1 max_y=0.5 max_sol=0.7 once bad scope",
+		source: "test",
+		config: { protections: { recoveryResumeOverrideMinutes: 120 } },
+		getRecoveryWorkflowReport: () => ({ status: "clear" }),
+		getAutonomousWriteSuppression: () => ({ suppressed: false }),
+		setAutonomousWriteSuppression: () => {},
+		acknowledgeRecoveryResume: () => ({ override_until: null }),
+		armGeneralWriteTools: () => {
+			throw new Error("Invalid GENERAL approval scope amount input: max_amount_y_vs_max_amount_sol");
+		},
+		disarmGeneralWriteTools: () => ({ armed: false }),
+		getOperatorControlSnapshot: () => ({
+			general_write_arm: { armed: false, armed_until: null },
+			recovery_resume_override: { active: false, override_until: null },
+		}),
+		refreshRuntimeHealth: () => {},
+	});
+
+	assert.equal(result.handled, true);
+	assert.match(result.message, /max_amount_y_vs_max_amount_sol/i);
 });
 
 test("operator resume clears suppression without clearing portfolio guard pause", async () => {
@@ -244,4 +291,35 @@ test("operator resume blocks override when suppression is not an unresolved-work
 	assert.equal(result.handled, true);
 	assert.equal(acknowledgeCalled, false);
 	assert.match(result.message, /cannot persist resume override unless autonomous writes are currently suppressed/i);
+});
+
+test("operator resume can clear live WRITE_MANUAL_REVIEW suppression", async () => {
+	let suppressionCleared = false;
+	const result = await handleOperatorCommandText({
+		text: "/resume manual write reviewed",
+		source: "test",
+		config: { protections: { recoveryResumeOverrideMinutes: 120 } },
+		getRecoveryWorkflowReport: () => ({ status: "manual_review_required", incident_key: "wf-unrelated" }),
+		getAutonomousWriteSuppression: () => ({
+			suppressed: true,
+			reason: "close_position requires manual review",
+			code: "WRITE_MANUAL_REVIEW",
+			incident_key: "manual-wf-1",
+		}),
+		setAutonomousWriteSuppression: ({ suppressed }) => {
+			suppressionCleared = suppressed === false;
+		},
+		acknowledgeRecoveryResume: ({ incident_key }) => ({ override_until: "until+120", incident_key }),
+		armGeneralWriteTools: () => ({ armed_until: null }),
+		disarmGeneralWriteTools: () => ({ armed: false }),
+		getOperatorControlSnapshot: () => ({
+			general_write_arm: { armed: false, armed_until: null },
+			recovery_resume_override: { active: true, override_until: "until+120" },
+		}),
+		refreshRuntimeHealth: () => {},
+	});
+
+	assert.equal(result.handled, true);
+	assert.equal(suppressionCleared, true);
+	assert.match(result.message, /autonomous write suppression cleared/i);
 });
