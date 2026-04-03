@@ -10,6 +10,9 @@ import {
 test("config registry exposes current mutable keys for update_config surfaces", () => {
 	const help = formatMutableConfigKeyHelp();
 	assert.match(help, /maxBundlePct/);
+	assert.match(help, /maxBotHoldersPct/);
+	assert.match(help, /blockedLaunchpads/);
+	assert.match(help, /athFilterPct/);
 	assert.match(help, /minTokenAgeHours/);
 	assert.match(help, /maxTokenAgeHours/);
 	assert.match(help, /healthCheckIntervalMin/);
@@ -19,7 +22,7 @@ test("config registry exposes current mutable keys for update_config surfaces", 
 
 test("config registry normalizes and validates mutable config changes", () => {
 	const currentConfig = {
-		screening: { minTokenAgeHours: null, maxTokenAgeHours: null, timeframe: "5m", category: "trending", maxBundlePct: 30 },
+		screening: { minTokenAgeHours: null, maxTokenAgeHours: null, timeframe: "5m", category: "trending", maxBundlePct: 30, maxBotHoldersPct: null, blockedLaunchpads: [], athFilterPct: null },
 		management: { autoSwapAfterClaim: false, deployAmountSol: 0.5, gasReserve: 0.2, minSolToOpen: 0.7 },
 		llm: { temperature: 0.3 },
 		strategy: { strategy: "bid_ask" },
@@ -30,21 +33,33 @@ test("config registry normalizes and validates mutable config changes", () => {
 		autoSwapAfterClaim: true,
 		strategy: "spot",
 		maxBundlePct: 25,
+		maxBotHoldersPct: 22,
+		blockedLaunchpads: ["letsbonk.fun", "pump.fun"],
+		athFilterPct: -20,
 	}, currentConfig);
 	assert.deepEqual(valid.errors, []);
 	assert.equal(valid.normalized.minTokenAgeHours, 12);
 	assert.equal(valid.normalized.autoSwapAfterClaim, true);
 	assert.equal(valid.normalized.strategy, "spot");
+	assert.equal(valid.normalized.maxBotHoldersPct, 22);
+	assert.deepEqual(valid.normalized.blockedLaunchpads, ["letsbonk.fun", "pump.fun"]);
+	assert.equal(valid.normalized.athFilterPct, -20);
 
 	const invalid = normalizeMutableConfigChanges({
 		autoSwapAfterClaim: "yes",
 		strategy: "bad",
 		minTokenAgeHours: -3,
+		maxBotHoldersPct: 101,
+		blockedLaunchpads: ["ok", ""],
+		athFilterPct: 5,
 	}, currentConfig);
-	assert.equal(invalid.errors.length, 3);
+	assert.equal(invalid.errors.length, 6);
 	assert.match(invalid.errors.join("; "), /autoSwapAfterClaim/);
 	assert.match(invalid.errors.join("; "), /strategy/);
 	assert.match(invalid.errors.join("; "), /minTokenAgeHours/);
+	assert.match(invalid.errors.join("; "), /maxBotHoldersPct/);
+	assert.match(invalid.errors.join("; "), /blockedLaunchpads/);
+	assert.match(invalid.errors.join("; "), /athFilterPct/);
 
 	const relational = normalizeMutableConfigChanges({
 		minTvl: 20000,

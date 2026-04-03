@@ -28,6 +28,10 @@ import { getLpOverview } from "./tools/lp-overview.js";
 import { appendReplayEnvelope, createCycleId } from "./cycle-trace.js";
 import { classifyRuntimeFailure, isFailClosedResult, validateStartupSnapshot } from "./degraded-mode.js";
 import { getStartupSnapshot } from "./startup-snapshot.js";
+import {
+	getScheduledHealthCheckAgentOptions,
+	getScheduledHealthCheckGoal,
+} from "./health-check.js";
 import { runManagementRuntimeActions } from "./management-runtime.js";
 import { listEvidenceBundles, writeEvidenceBundle } from "./evidence-bundles.js";
 import { getEvidenceBundle } from "./evidence-bundles.js";
@@ -405,11 +409,15 @@ export function startCronJobs() {
     _healthBusy = true;
     log("cron", "Starting health check");
     try {
-      await agentLoop(`
-HEALTH CHECK
-
-        Summarize the current portfolio health, total fees earned, and performance of all open positions. Recommend any high-level adjustments if needed.
-      `, config.llm.maxSteps, [], "MANAGER");
+      await agentLoop(
+		getScheduledHealthCheckGoal(),
+		config.llm.maxSteps,
+		[],
+		"MANAGER",
+		null,
+		null,
+		getScheduledHealthCheckAgentOptions(),
+	);
       refreshRuntimeHealth({
         cycles: {
           health: {

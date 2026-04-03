@@ -8,6 +8,7 @@ import {
 import bs58 from "bs58";
 import { log } from "../logger.js";
 import { config } from "../config.js";
+import { getEffectiveRpcUrl } from "../rpc-config.js";
 import { fetchWithTimeout } from "./fetch-utils.js";
 import { buildSafeSendOptions } from "./solana-send-options.js";
 
@@ -15,7 +16,11 @@ let _connection = null;
 let _wallet = null;
 
 function getConnection() {
-  if (!_connection) _connection = new Connection(process.env.RPC_URL, "confirmed");
+	if (!_connection) {
+		const rpcUrl = getEffectiveRpcUrl();
+		if (!rpcUrl) throw new Error("RPC_URL not set and HELIUS_API_KEY missing for default Helius Gatekeeper beta RPC");
+		_connection = new Connection(rpcUrl, "confirmed");
+	}
   return _connection;
 }
 
@@ -43,6 +48,7 @@ function getJupiterHeaders(extra = {}) {
 /**
  * Get current wallet balances: SOL, USDC, and all SPL tokens using Helius Wallet API.
  * Returns USD-denominated values provided by Helius.
+ * Requires HELIUS_API_KEY for startup and operator-health wallet checks.
  */
 export async function getWalletBalances() {
   let walletAddress;
@@ -54,8 +60,8 @@ export async function getWalletBalances() {
 
   const HELIUS_KEY = process.env.HELIUS_API_KEY;
   if (!HELIUS_KEY) {
-    log("wallet_error", "HELIUS_API_KEY not set in .env");
-    return { wallet: walletAddress, sol: 0, sol_price: 0, sol_usd: 0, usdc: 0, tokens: [], total_usd: 0, error: "Helius API key missing" };
+	  log("wallet_error", "HELIUS_API_KEY not set in .env (required for wallet balances and startup health)");
+	  return { wallet: walletAddress, sol: 0, sol_price: 0, sol_usd: 0, usdc: 0, tokens: [], total_usd: 0, error: "Helius API key missing (required for wallet balances and startup health)" };
   }
 
   try {

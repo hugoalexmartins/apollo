@@ -1,6 +1,10 @@
-import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+
+import {
+	readJsonSnapshotWithBackupSync,
+	writeJsonSnapshotAtomicSync,
+} from "./durable-store.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -18,29 +22,47 @@ function ensureObject(value) {
 
 export function readUserConfigSnapshot({ allowMissing = true } = {}) {
 	const userConfigPath = getUserConfigPath();
-	if (!fs.existsSync(userConfigPath)) {
-		if (!allowMissing) {
+	const snapshot = readJsonSnapshotWithBackupSync(userConfigPath);
+	if (snapshot.value == null) {
+		if (!snapshot.error) {
+			if (snapshot.source) {
+				return {
+					ok: false,
+					error: `Invalid user config at ${userConfigPath}: user-config.json must contain a JSON object`,
+					path: userConfigPath,
+					source: snapshot.source,
+				};
+			}
+			if (!allowMissing) {
+				return {
+					ok: false,
+					error: `Missing user config at ${userConfigPath}`,
+					path: userConfigPath,
+				};
+			}
 			return {
-				ok: false,
-				error: `Missing user config at ${userConfigPath}`,
+				ok: true,
+				value: {},
+				missing: true,
 				path: userConfigPath,
+				source: null,
 			};
 		}
 		return {
-			ok: true,
-			value: {},
-			missing: true,
+			ok: false,
+			error: `Invalid user config at ${userConfigPath}: ${snapshot.error}`,
 			path: userConfigPath,
+			source: snapshot.source,
 		};
 	}
 
 	try {
-		const parsed = JSON.parse(fs.readFileSync(userConfigPath, "utf8"));
 		return {
 			ok: true,
-			value: ensureObject(parsed),
+			value: ensureObject(snapshot.value),
 			missing: false,
 			path: userConfigPath,
+			source: snapshot.source,
 		};
 	} catch (error) {
 		return {
@@ -54,8 +76,7 @@ export function readUserConfigSnapshot({ allowMissing = true } = {}) {
 export function writeUserConfigSnapshot(value) {
 	const userConfigPath = getUserConfigPath();
 	const normalized = ensureObject(value);
-	fs.mkdirSync(path.dirname(userConfigPath), { recursive: true });
-	fs.writeFileSync(userConfigPath, JSON.stringify(normalized, null, 2));
+	writeJsonSnapshotAtomicSync(userConfigPath, normalized);
 	return {
 		ok: true,
 		path: userConfigPath,

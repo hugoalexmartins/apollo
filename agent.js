@@ -86,7 +86,7 @@ const client = new OpenAI({
   timeout: 5 * 60 * 1000,
 });
 
-const DEFAULT_MODEL = process.env.LLM_MODEL || "openrouter/healer-alpha";
+const DEFAULT_MODEL = process.env.LLM_MODEL || "qwen/qwen3.6-plus:free";
 
 function getProviderErrorCode(error) {
   const code = Number(error?.status ?? error?.code ?? error?.error?.status ?? error?.error?.code);
@@ -208,7 +208,7 @@ export async function agentLoop(goal, maxSteps = config.llm.maxSteps, sessionHis
       const activeModel = model || DEFAULT_MODEL;
 
       // Retry up to 3 times on transient provider errors (502, 503, 529)
-      const FALLBACK_MODEL = "stepfun/step-3.5-flash:free";
+		const FALLBACK_MODEL = "qwen/qwen3.6-plus:free";
       let response;
       let usedModel = activeModel;
       let lastProviderError = null;

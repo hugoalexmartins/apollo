@@ -1,5 +1,6 @@
-import { computeAdaptiveDeployAmount, getEffectiveMinSolToOpen, normalizeOptionalNonNegativeNumber } from "./runtime-helpers.js";
 import { applyMutableConfigValues, getMutableConfigEntry, normalizeMutableConfigChanges } from "./config-registry.js";
+import { buildDefaultHeliusRpcUrl } from "./rpc-config.js";
+import { computeAdaptiveDeployAmount, getEffectiveMinSolToOpen, normalizeOptionalNonNegativeNumber } from "./runtime-helpers.js";
 import { readUserConfigSnapshot } from "./user-config-store.js";
 
 const initialUserConfig = readUserConfigSnapshot();
@@ -14,7 +15,18 @@ export const secretHealth = {
 };
 
 // Apply wallet/RPC from user-config if not already in env
-if (u.rpcUrl)    process.env.RPC_URL            ||= u.rpcUrl;
+const explicitEnvRpcUrl = process.env.RPC_URL;
+const bootRpcUrl = explicitEnvRpcUrl || u.rpcUrl || buildDefaultHeliusRpcUrl();
+if (bootRpcUrl) {
+	process.env.RPC_URL = bootRpcUrl;
+	process.env.ZENITH_RPC_URL_SOURCE = explicitEnvRpcUrl
+		? "env"
+		: u.rpcUrl
+			? "user_config"
+			: "helius_default";
+} else {
+	delete process.env.ZENITH_RPC_URL_SOURCE;
+}
 if (u.dryRun !== undefined) process.env.DRY_RUN ||= String(u.dryRun);
 
 export const config = {
@@ -31,19 +43,26 @@ export const config = {
     maxTvl:            u.maxTvl            ?? 150_000,
     minVolume:         u.minVolume         ?? 500,
     minOrganic:        u.minOrganic        ?? 60,
-    minHolders:        u.minHolders        ?? 500,
+    minHolders:        u.minHolders        ?? 750,
     minMcap:           u.minMcap           ?? 150_000,
     maxMcap:           u.maxMcap           ?? 10_000_000,
     minBinStep:        u.minBinStep        ?? 80,
     maxBinStep:        u.maxBinStep        ?? 125,
-    minTokenAgeHours:  normalizeOptionalNonNegativeNumber(u.minTokenAgeHours, null),
-    maxTokenAgeHours:  normalizeOptionalNonNegativeNumber(u.maxTokenAgeHours, null),
+    minTokenAgeHours:  Object.hasOwn(u, "minTokenAgeHours")
+      ? normalizeOptionalNonNegativeNumber(u.minTokenAgeHours, null)
+      : 24,
+    maxTokenAgeHours:  Object.hasOwn(u, "maxTokenAgeHours")
+      ? normalizeOptionalNonNegativeNumber(u.maxTokenAgeHours, null)
+      : 240,
     timeframe:         u.timeframe         ?? "5m",
     category:          u.category          ?? "trending",
     minTokenFeesSol:   u.minTokenFeesSol   ?? 30,  // global fees paid (priority+jito tips). below = bundled/scam
     maxBundlersPct:    u.maxBundlersPct    ?? 30,  // max bundlers % in top 100 holders
-    maxTop10Pct:       u.maxTop10Pct       ?? 60,  // max top 10 holders concentration
+    maxBotHoldersPct:  u.maxBotHoldersPct  ?? null,
+    maxTop10Pct:       u.maxTop10Pct       ?? 30,  // max top 10 holders concentration
     maxBundlePct:      u.maxBundlePct      ?? 30,  // OKX bundle holding threshold for finalist hard block
+    blockedLaunchpads: Array.isArray(u.blockedLaunchpads) ? u.blockedLaunchpads : [],
+    athFilterPct:      u.athFilterPct      ?? null,
   },
 
   // ─── Position Management ────────────────
@@ -97,14 +116,14 @@ export const config = {
   },
 
   // ─── LLM Settings ──────────────────────
-  llm: {
-    temperature: u.temperature ?? 0.373,
-    maxTokens:   u.maxTokens   ?? 4096,
-    maxSteps:    u.maxSteps    ?? 20,
-		managementModel: u.managementModel ?? legacyModel ?? "openrouter/healer-alpha",
-		screeningModel:  u.screeningModel  ?? legacyModel ?? "openrouter/hunter-alpha",
-		generalModel:    u.generalModel    ?? legacyModel ?? "openrouter/healer-alpha",
-  },
+	llm: {
+		temperature: u.temperature ?? 0.373,
+		maxTokens:   u.maxTokens   ?? 4096,
+		maxSteps:    u.maxSteps    ?? 20,
+		managementModel: u.managementModel ?? legacyModel ?? "qwen/qwen3.6-plus:free",
+		screeningModel:  u.screeningModel  ?? legacyModel ?? "qwen/qwen3.6-plus:free",
+		generalModel:    u.generalModel    ?? legacyModel ?? "qwen/qwen3.6-plus:free",
+	},
 
   // ─── Common Token Mints ────────────────
   tokens: {

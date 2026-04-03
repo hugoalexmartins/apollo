@@ -105,6 +105,49 @@ test("agentLoop retries thrown transient provider failures", async () => {
 	assert.equal(result.content, "ok");
 });
 
+test("agentLoop defaults and fallback model both use qwen/qwen3.6-plus:free", async () => {
+	process.env.OPENROUTER_API_KEY ||= "test-openrouter-key";
+	const originalLlmModel = process.env.LLM_MODEL;
+	delete process.env.LLM_MODEL;
+	const { agentLoop } = await import(`./agent.js?test=${Date.now()}`);
+	const requestedModels = [];
+
+	try {
+		const result = await agentLoop("Say ok", 2, [], "GENERAL", null, 128, {
+			stateSnapshot: {
+				portfolio: { wallet: null, sol: 0, sol_price: 0, sol_usd: 0, usdc: 0, tokens: [], total_usd: 0 },
+				positions: { wallet: null, total_positions: 0, positions: [] },
+			},
+			llmClient: {
+				chat: {
+					completions: {
+						create: async (request) => {
+							requestedModels.push(request.model);
+							if (requestedModels.length === 1) {
+								const error = new Error("service unavailable");
+								error.status = 503;
+								throw error;
+							}
+							return {
+								choices: [{ message: { role: "assistant", content: "ok" } }],
+							};
+						},
+					},
+				},
+			},
+		});
+
+		assert.equal(result.content, "ok");
+		assert.deepEqual(requestedModels, [
+			"qwen/qwen3.6-plus:free",
+			"qwen/qwen3.6-plus:free",
+		]);
+	} finally {
+		if (originalLlmModel == null) delete process.env.LLM_MODEL;
+		else process.env.LLM_MODEL = originalLlmModel;
+	}
+});
+
 test("agentLoop reports invalid tool arguments without executing the tool", async () => {
 	process.env.OPENROUTER_API_KEY ||= "test-openrouter-key";
 	const { agentLoop } = await import("./agent.js");
@@ -208,4 +251,47 @@ test("agentLoop repairs malformed tool JSON, sanitizes history, and normalizes t
 	const repairedAssistantMessage = requests[1].messages.find((message) => Array.isArray(message.tool_calls));
 	assert.equal(repairedAssistantMessage.tool_calls[0].function.name, "get_pool_info");
 	assert.equal(repairedAssistantMessage.tool_calls[0].function.arguments, '{"pool_address":"pool-1"}');
+});
+
+test("scheduled health check manager run is forced into no-tools mode", async () => {
+	process.env.OPENROUTER_API_KEY ||= "test-openrouter-key";
+	const { agentLoop } = await import("./agent.js");
+	const {
+		getScheduledHealthCheckAgentOptions,
+		getScheduledHealthCheckGoal,
+	} = await import("./health-check.js");
+	let capturedRequest = null;
+
+	const result = await agentLoop(
+		getScheduledHealthCheckGoal(),
+		1,
+		[],
+		"MANAGER",
+		"test-model",
+		128,
+		{
+			...getScheduledHealthCheckAgentOptions(),
+			stateSnapshot: {
+				portfolio: { wallet: null, sol: 1, sol_price: 100, sol_usd: 100, usdc: 0, tokens: [], total_usd: 100 },
+				positions: { wallet: null, total_positions: 0, positions: [] },
+			},
+			llmClient: {
+				chat: {
+					completions: {
+						create: async (request) => {
+							capturedRequest = request;
+							return {
+								choices: [{ message: { role: "assistant", content: "health summary ok" } }],
+							};
+						},
+					},
+				},
+			},
+		},
+	);
+
+	assert.equal(result.content, "health summary ok");
+	assert.equal(capturedRequest.tool_choice, "none");
+	assert.equal(Object.hasOwn(capturedRequest, "tools"), false);
+	assert.match(capturedRequest.messages[0].content, /TOOLS ARE DISABLED FOR THIS TURN\./);
 });

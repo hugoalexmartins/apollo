@@ -1,6 +1,7 @@
 import { formatRecoveryWorkflowReport } from "./boot-recovery.js";
 import { listOperatorActions } from "./operator-controls.js";
 import { formatPortfolioGuardReport, getPortfolioGuardStatus } from "./portfolio-guards.js";
+import { describeRpcHealth } from "./rpc-config.js";
 import { formatRuntimeHealthReport } from "./runtime-health.js";
 
 export function buildStaticProviderHealth({ secretHealth, telegramEnabled }) {
@@ -10,11 +11,17 @@ export function buildStaticProviderHealth({ secretHealth, telegramEnabled }) {
       detail: secretHealth.wallet_key_source,
       checked_at: new Date().toISOString(),
     },
-    rpc: {
-      status: process.env.RPC_URL ? "configured" : "missing",
-      detail: process.env.RPC_URL ? "RPC_URL present" : "RPC_URL missing",
-      checked_at: new Date().toISOString(),
-    },
+		rpc: {
+			...describeRpcHealth(),
+			checked_at: new Date().toISOString(),
+		},
+		helius: {
+			status: process.env.HELIUS_API_KEY ? "configured" : "missing",
+			detail: process.env.HELIUS_API_KEY
+				? "HELIUS_API_KEY present"
+				: "HELIUS_API_KEY missing (wallet balances/startup health require it)",
+			checked_at: new Date().toISOString(),
+		},
     llm: {
       status: process.env.OPENROUTER_API_KEY || process.env.LLM_API_KEY ? "configured" : "missing",
       detail: process.env.OPENROUTER_API_KEY ? "OPENROUTER_API_KEY present" : process.env.LLM_API_KEY ? "LLM_API_KEY present" : "no model auth configured",

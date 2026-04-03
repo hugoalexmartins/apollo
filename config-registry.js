@@ -21,8 +21,11 @@ const MUTABLE_CONFIG_ENTRIES = [
 	{ key: "category", section: "screening", field: "category", group: "Screening", kind: "enum", values: ENUM_CATEGORY },
 	{ key: "minTokenFeesSol", section: "screening", field: "minTokenFeesSol", group: "Screening", kind: "number", min: 0 },
 	{ key: "maxBundlersPct", section: "screening", field: "maxBundlersPct", group: "Screening", kind: "number", min: 0, max: 100 },
+	{ key: "maxBotHoldersPct", section: "screening", field: "maxBotHoldersPct", group: "Screening", kind: "optionalNumber", min: 0, max: 100 },
 	{ key: "maxTop10Pct", section: "screening", field: "maxTop10Pct", group: "Screening", kind: "number", min: 0, max: 100 },
 	{ key: "maxBundlePct", section: "screening", field: "maxBundlePct", group: "Screening", kind: "number", min: 0, max: 100 },
+	{ key: "blockedLaunchpads", section: "screening", field: "blockedLaunchpads", group: "Screening", kind: "stringArray" },
+	{ key: "athFilterPct", section: "screening", field: "athFilterPct", group: "Screening", kind: "optionalNumber", min: -100, max: 0 },
 	{ key: "protectionsEnabled", section: "protections", field: "enabled", group: "Protections", kind: "boolean" },
 	{ key: "maxRecentRealizedLossUsd", section: "protections", field: "maxRecentRealizedLossUsd", group: "Protections", kind: "number", min: 0 },
 	{ key: "maxDrawdownPct", section: "protections", field: "maxDrawdownPct", group: "Protections", kind: "number", min: 0, max: 100 },
@@ -124,6 +127,27 @@ function normalizeByKind(entry, value, currentValue = undefined) {
 			}
 			if (entry.max != null && normalized != null && normalized > entry.max) {
 				return { ok: false, error: `${entry.key} must be <= ${entry.max}` };
+			}
+			return { ok: true, value: normalized };
+		}
+		case "optionalNumber": {
+			if (value == null) return { ok: true, value: null };
+			const numeric = Number(value);
+			if (!Number.isFinite(numeric)) return { ok: false, error: `${entry.key} must be null or a finite number` };
+			if (entry.integer && !Number.isInteger(numeric)) return { ok: false, error: `${entry.key} must be an integer` };
+			if (entry.min != null && numeric < entry.min) return { ok: false, error: `${entry.key} must be >= ${entry.min}` };
+			if (entry.max != null && numeric > entry.max) return { ok: false, error: `${entry.key} must be <= ${entry.max}` };
+			return { ok: true, value: numeric };
+		}
+		case "stringArray": {
+			if (!Array.isArray(value)) return { ok: false, error: `${entry.key} must be an array of non-empty strings` };
+			const normalized = [];
+			for (const item of value) {
+				if (typeof item !== "string" || item.trim().length === 0) {
+					return { ok: false, error: `${entry.key} must be an array of non-empty strings` };
+				}
+				const trimmed = item.trim();
+				if (!normalized.includes(trimmed)) normalized.push(trimmed);
 			}
 			return { ok: true, value: normalized };
 		}

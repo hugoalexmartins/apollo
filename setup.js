@@ -10,6 +10,7 @@ import path from "node:path";
 import readline from "node:readline";
 import { fileURLToPath } from "node:url";
 import { getMutableConfigEntry } from "./config-registry.js";
+import { buildDefaultHeliusRpcUrl } from "./rpc-config.js";
 import { getEffectiveMinSolToOpen } from "./runtime-helpers.js";
 import { buildIntervalCron } from "./schedule-runtime.js";
 import { readUserConfigSnapshot, writeUserConfigSnapshot } from "./user-config-store.js";
@@ -27,6 +28,20 @@ function ask(question, defaultVal) {
       resolve(trimmed === "" ? defaultVal : trimmed);
     });
   });
+}
+
+function askOptional(question, { defaultVal, blankHint = null } = {}) {
+	return new Promise((resolve) => {
+		const hint = defaultVal !== undefined
+			? ` (default: ${defaultVal})`
+			: blankHint
+				? ` (${blankHint})`
+				: "";
+		rl.question(`${question}${hint}: `, (ans) => {
+			const trimmed = ans.trim();
+			resolve(trimmed === "" ? defaultVal : trimmed);
+		});
+	});
 }
 
 function askSecret(question, { hasExisting = false } = {}) {
@@ -53,6 +68,15 @@ function askSecret(question, { hasExisting = false } = {}) {
       resolve(ans.trim());
     });
   });
+}
+
+async function askRequiredSecret(question, { existingValue = "" } = {}) {
+	while (true) {
+		const answer = await askSecret(question, { hasExisting: Boolean(existingValue) });
+		const finalValue = String(answer || existingValue || "").trim();
+		if (finalValue) return finalValue;
+		console.log("  ⚠ This value is required.");
+	}
 }
 
 function askNum(question, defaultVal, { min, max } = {}) {
@@ -106,6 +130,39 @@ function askScheduleInterval(question, defaultVal) {
 	})();
 }
 
+function askOptionalNumber(question, { defaultVal, blankHint = null, min, max } = {}) {
+	return (async () => {
+		while (true) {
+			const hint = defaultVal != null
+				? ` (default: ${defaultVal})`
+				: blankHint
+					? ` (${blankHint})`
+					: "";
+			const raw = await new Promise((resolve) => rl.question(`${question}${hint}: `, (ans) => resolve(ans.trim())));
+			if (raw === "") return defaultVal ?? null;
+			const n = parseFloat(raw);
+			if (Number.isNaN(n)) { console.log("  ⚠ Please enter a number or leave blank."); continue; }
+			if (min !== undefined && n < min) { console.log(`  ⚠ Minimum is ${min}.`); continue; }
+			if (max !== undefined && n > max) { console.log(`  ⚠ Maximum is ${max}.`); continue; }
+			return n;
+		}
+	})();
+}
+
+function askStringArray(question, { defaultVal = [], blankHint = null } = {}) {
+	return (async () => {
+		const normalizedDefault = Array.isArray(defaultVal) ? defaultVal.filter((value) => typeof value === "string" && value.trim().length > 0) : [];
+		const hint = normalizedDefault.length > 0
+			? ` (default: ${normalizedDefault.join(", ")})`
+			: blankHint
+				? ` (${blankHint})`
+				: "";
+		const raw = await new Promise((resolve) => rl.question(`${question}${hint}: `, (ans) => resolve(ans.trim())));
+		if (raw === "") return normalizedDefault;
+		return [...new Set(raw.split(",").map((value) => value.trim()).filter(Boolean))];
+	})();
+}
+
 function upsertEnvValue(key, value) {
   const safeValue = String(value || "").trim();
   const existing = fs.existsSync(ENV_PATH) ? fs.readFileSync(ENV_PATH, "utf8") : "";
@@ -127,7 +184,7 @@ const PRESETS = {
     label:                 "🔥 Degen",
     timeframe:             "30m",
     minOrganic:            60,
-    minHolders:            200,
+    minHolders:            400,
     maxMcap:               5_000_000,
     takeProfitFeePct:      10,
     outOfRangeWaitMinutes: 15,
@@ -139,7 +196,7 @@ const PRESETS = {
     label:                 "⚖️  Moderate",
     timeframe:             "4h",
     minOrganic:            65,
-    minHolders:            500,
+    minHolders:            750,
     maxMcap:               10_000_000,
     takeProfitFeePct:      5,
     outOfRangeWaitMinutes: 30,
@@ -151,7 +208,7 @@ const PRESETS = {
     label:                 "🛡️  Safe",
     timeframe:             "24h",
     minOrganic:            75,
-    minHolders:            1000,
+    minHolders:            1200,
     maxMcap:               10_000_000,
     takeProfitFeePct:      3,
     outOfRangeWaitMinutes: 60,
@@ -196,9 +253,18 @@ const p = (key, fallback) => preset?.[key] ?? e(key, fallback);
 // ─── Wallet & RPC ─────────────────────────────────────────────────────────────
 console.log("── Wallet & RPC ──────────────────────────────");
 
-const rpcUrl = await ask(
-  "RPC URL",
-  e("rpcUrl", process.env.RPC_URL || "https://api.mainnet-beta.solana.com")
+const existingHeliusApiKey = process.env.HELIUS_API_KEY || "";
+const finalHeliusApiKey = await askRequiredSecret(
+	"Helius API key (required for wallet balances/startup health)",
+	{ existingValue: existingHeliusApiKey },
+);
+const rpcUrl = await askOptional(
+	"RPC URL override",
+		e("rpcUrl", process.env.RPC_URL)
+			? { defaultVal: e("rpcUrl", process.env.RPC_URL) }
+			: {
+				blankHint: `leave blank to use default Helius Gatekeeper beta RPC (${buildDefaultHeliusRpcUrl(finalHeliusApiKey)})`,
+			},
 );
 
 const existingWalletPrivateKey = process.env.WALLET_PRIVATE_KEY || "";
@@ -255,7 +321,7 @@ const minOrganic = await askNum(
 
 const minHolders = await askNum(
   "Min token holders",
-  p("minHolders", 500),
+	 p("minHolders", 750),
   { min: 1 }
 );
 
@@ -263,6 +329,21 @@ const maxMcap = await askNum(
   "Max token market cap USD",
   p("maxMcap", 10_000_000),
   { min: 100_000 }
+);
+
+const maxBotHoldersPct = await askOptionalNumber(
+	"Max bot-holder percentage (blank = disabled)",
+	{ defaultVal: e("maxBotHoldersPct", undefined), blankHint: "leave blank to disable", min: 0, max: 100 },
+);
+
+const athFilterPct = await askOptionalNumber(
+	"ATH filter percentage (blank = disabled, -20 means at least 20% below ATH)",
+	{ defaultVal: e("athFilterPct", undefined), blankHint: "leave blank to disable", min: -100, max: 0 },
+);
+
+const blockedLaunchpads = await askStringArray(
+	"Blocked launchpads (comma-separated, blank = none)",
+	{ defaultVal: e("blockedLaunchpads", []), blankHint: "leave blank for none" },
 );
 
 // ─── Exit ─────────────────────────────────────────────────────────────────────
@@ -303,7 +384,7 @@ console.log("\n── LLM ──────────────────
 
 const defaultModel = await ask(
 	"Default LLM model for management/screening/general",
-	e("managementModel", e("screeningModel", e("generalModel", e("llmModel", process.env.LLM_MODEL || "nousresearch/hermes-3-llama-3.1-405b")))),
+	e("managementModel", e("screeningModel", e("generalModel", e("llmModel", process.env.LLM_MODEL || "qwen/qwen3.6-plus:free")))),
 );
 
 const dryRun = await ask(
@@ -315,17 +396,23 @@ rl.close();
 
 // ─── Save ──────────────────────────────────────────────────────────────────────
 const userConfig = {
-  rpcUrl,
+  ...(rpcUrl ? { rpcUrl } : {}),
   deployAmountSol,
   maxPositions,
   maxDeployAmount,
   gasReserve,
   minSolToOpen: getEffectiveMinSolToOpen({ minSolToOpen, deployAmountSol, gasReserve }),
   timeframe,
-  minOrganic,
-  minHolders,
-  maxMcap,
-  takeProfitFeePct,
+	minOrganic,
+	minHolders,
+	maxTop10Pct: p("maxTop10Pct", 30),
+	maxBotHoldersPct,
+	blockedLaunchpads,
+	athFilterPct,
+	minTokenAgeHours: p("minTokenAgeHours", 24),
+	maxTokenAgeHours: p("maxTokenAgeHours", 240),
+	maxMcap,
+	takeProfitFeePct,
   outOfRangeWaitMinutes,
   managementIntervalMin,
   screeningIntervalMin,
@@ -340,6 +427,7 @@ writeUserConfigSnapshot(userConfig);
 if (finalWalletPrivateKey) {
   upsertEnvValue("WALLET_PRIVATE_KEY", finalWalletPrivateKey);
 }
+upsertEnvValue("HELIUS_API_KEY", finalHeliusApiKey);
 
 const presetName = preset ? preset.label : "Custom";
 
@@ -357,7 +445,8 @@ Timeframe:    ${timeframe}
   Organic:     min ${minOrganic}
   Holders:     min ${minHolders}
 
-Wallet private key saved to .env (not user-config.json)
+Wallet private key + Helius API key saved to .env (not user-config.json)
+  RPC:         ${rpcUrl || "default Helius via HELIUS_API_KEY"}
   Max mcap:    $${maxMcap.toLocaleString()}
   Gas reserve: ${gasReserve} SOL
   OOR close:   after ${outOfRangeWaitMinutes} min

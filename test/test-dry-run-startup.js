@@ -22,7 +22,13 @@ async function main() {
     console.log("=== Dry-run startup verification ===");
 
     const recovery = await runBootRecovery({
-      observeOpenPositions: async () => ({ positions: [] }),
+      observeOpenPositions: async () => ({
+        positions: [],
+        observation: {
+          completeness: "complete",
+          observed_at_ms: Date.now(),
+        },
+      }),
       observeTrackedPositions: async () => [],
     });
     assert.equal(recovery.status, "clear");
