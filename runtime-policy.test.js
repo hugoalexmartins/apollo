@@ -195,7 +195,7 @@ test("fresh positions suppress pnl-driven closes during the first 2 minutes", ()
 	assert.equal(result, null);
 });
 
-test("stale pnl still allows deterministic out-of-range rebalance", () => {
+test("stale range/pnl signals block out-of-range rebalance triggers", () => {
 	const result = planManagementRuntimeAction(
 		{
 			position: "pos-stale-oor",
@@ -206,8 +206,7 @@ test("stale pnl still allows deterministic out-of-range rebalance", () => {
 		config,
 	);
 
-	assert.equal(result.toolName, "rebalance_on_exit");
-	assert.equal(result.rule, MANAGEMENT_SUBREASONS.OUT_OF_RANGE);
+	assert.equal(result, null);
 });
 
 test("isPnlSignalStale detects explicit stale markers", () => {
@@ -410,10 +409,11 @@ test("deploy governance helpers centralize exposure and live deploy checks", () 
 		},
 		poolAddress: "pool-2",
 		baseMint: "mint-a",
+		riskMint: "mint-canonical-a",
 		amountY: 0.5,
 		amountX: 0,
 		binStep: 100,
-		positions: [{ pool: "pool-1", base_mint: "mint-a" }],
+		positions: [{ pool: "pool-1", base_mint: "mint-a", risk_mint: "mint-canonical-a" }],
 		walletSol: 10,
 	});
 	assert.equal(deployAdmission.pass, false);
@@ -432,8 +432,48 @@ test("deploy governance helpers centralize exposure and live deploy checks", () 
 		binStep: 100,
 		positions: [],
 		walletSol: 10,
+		walletTokenBalance: 8,
+		tokenMint: "mint-b",
 	});
 	assert.equal(tokenOnlySpotAdmission.pass, true);
+
+	const tokenOnlyBlocked = evaluateDeployAdmission({
+		config: {
+			screening: { minBinStep: 80, maxBinStep: 125 },
+			management: { deployAmountSol: 0.5, gasReserve: 0.1 },
+			risk: { maxPositions: 3, maxDeployAmount: 50 },
+		},
+		poolAddress: "pool-3b",
+		baseMint: "mint-b",
+		amountY: 0,
+		amountX: 9,
+		binStep: 100,
+		positions: [],
+		walletSol: 10,
+		walletTokenBalance: 8,
+		tokenMint: "mint-b",
+	});
+	assert.equal(tokenOnlyBlocked.pass, false);
+	assert.equal(tokenOnlyBlocked.code, DEPLOY_GOVERNANCE_CODES.INSUFFICIENT_BASE_TOKEN);
+
+	const tokenOnlyAboveCap = evaluateDeployAdmission({
+		config: {
+			screening: { minBinStep: 80, maxBinStep: 125 },
+			management: { deployAmountSol: 0.5, gasReserve: 0.1 },
+			risk: { maxPositions: 3, maxDeployAmount: 50 },
+		},
+		poolAddress: "pool-3c",
+		baseMint: "mint-b",
+		amountY: 0,
+		amountX: 60,
+		binStep: 100,
+		positions: [],
+		walletSol: 10,
+		walletTokenBalance: 80,
+		tokenMint: "mint-b",
+	});
+	assert.equal(tokenOnlyAboveCap.pass, false);
+	assert.equal(tokenOnlyAboveCap.code, DEPLOY_GOVERNANCE_CODES.ABOVE_MAX_DEPLOY);
 
 	const missingAmountAdmission = evaluateDeployAdmission({
 		config: {

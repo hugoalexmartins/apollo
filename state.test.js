@@ -182,7 +182,13 @@ test("syncOpenPositions skips auto-close when unresolved workflow references pos
 			pool_address: "pool-guard-1",
 		});
 
-		syncOpenPositions([]);
+		syncOpenPositions({
+			active_addresses: [],
+			observation: {
+				completeness: "complete",
+				observed_at_ms: Date.now(),
+			},
+		});
 
 		const after = JSON.parse(fs.readFileSync(statePath, "utf8"));
 		assert.equal(after.positions["pos-guard-1"].closed, false);
@@ -223,13 +229,57 @@ test("syncOpenPositions auto-closes missing position when no unresolved workflow
 		).toISOString();
 		fs.writeFileSync(statePath, JSON.stringify(persisted, null, 2));
 
-		syncOpenPositions([]);
+		syncOpenPositions({
+			active_addresses: [],
+			observation: {
+				completeness: "complete",
+				observed_at_ms: Date.now(),
+			},
+		});
 
 		const after = JSON.parse(fs.readFileSync(statePath, "utf8"));
 		assert.equal(after.positions["pos-close-1"].closed, true);
 		assert.ok(after.positions["pos-close-1"].closed_at);
 	} finally {
 		setActionJournalPathForTests(null);
+		process.chdir(originalCwd);
+		fs.rmSync(tempDir, { recursive: true, force: true });
+	}
+});
+
+test("syncOpenPositions fails closed when omission-safety metadata is missing", () => {
+	const originalCwd = process.cwd();
+	const tempDir = fs.mkdtempSync(
+		path.join(os.tmpdir(), "zenith-state-sync-omission-safety-test-"),
+	);
+
+	try {
+		process.chdir(tempDir);
+		fs.mkdirSync(path.join(tempDir, "logs"), { recursive: true });
+
+		trackPosition({
+			position: "pos-omission-1",
+			pool: "pool-omission-1",
+			pool_name: "Pool Omission One",
+			strategy: "spot",
+			amount_sol: 0.5,
+			active_bin: 12,
+			initial_value_usd: 100,
+		});
+
+		const statePath = path.join(tempDir, "state.json");
+		const persisted = JSON.parse(fs.readFileSync(statePath, "utf8"));
+		persisted.positions["pos-omission-1"].deployed_at = new Date(
+			Date.now() - 30 * 60 * 1000,
+		).toISOString();
+		fs.writeFileSync(statePath, JSON.stringify(persisted, null, 2));
+
+		syncOpenPositions([]);
+
+		const after = JSON.parse(fs.readFileSync(statePath, "utf8"));
+		assert.equal(after.positions["pos-omission-1"].closed, false);
+		assert.equal(after.positions["pos-omission-1"].closed_at, null);
+	} finally {
 		process.chdir(originalCwd);
 		fs.rmSync(tempDir, { recursive: true, force: true });
 	}
@@ -362,7 +412,13 @@ test("syncOpenPositions skips auto-close when manual-review workflow references 
 			reason: "operator_review_required",
 		});
 
-		syncOpenPositions([]);
+		syncOpenPositions({
+			active_addresses: [],
+			observation: {
+				completeness: "complete",
+				observed_at_ms: Date.now(),
+			},
+		});
 
 		const after = JSON.parse(fs.readFileSync(statePath, "utf8"));
 		assert.equal(after.positions["pos-manual-1"].closed, false);

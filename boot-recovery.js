@@ -100,7 +100,12 @@ function createRecoveryIncidentKey(workflows = []) {
 }
 
 function isValidOpenPositionObservation(payload) {
-  return !payload?.error && Array.isArray(payload?.positions);
+	if (payload?.error || !Array.isArray(payload?.positions)) return false;
+	const observedAtMs = Number(
+		payload?.observation?.observed_at_ms ?? payload?.observed_at_ms ?? null,
+	);
+	if (!Number.isFinite(observedAtMs) || observedAtMs <= 0) return false;
+	return payload?.observation?.completeness === "complete";
 }
 
 export function getRecoveryWorkflowReport({ limit = 10 } = {}) {

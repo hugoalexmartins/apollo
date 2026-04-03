@@ -31,6 +31,7 @@ export const DEPLOY_GOVERNANCE_CODES = Object.freeze({
   BELOW_MIN_DEPLOY: "below_min_deploy",
   ABOVE_MAX_DEPLOY: "above_max_deploy",
   INSUFFICIENT_SOL: "insufficient_sol",
+  INSUFFICIENT_BASE_TOKEN: "insufficient_base_token",
 });
 
 export const SCREENING_ADMISSION_STATUSES = Object.freeze({
@@ -334,11 +335,13 @@ function toSet(values) {
 export function evaluateExposureAdmission({
   poolAddress = null,
   baseMint = null,
+  riskMint = null,
   occupiedPools = new Set(),
   occupiedMints = new Set(),
 } = {}) {
   const poolSet = toSet(occupiedPools);
   const mintSet = toSet(occupiedMints);
+  const exposureMint = riskMint || baseMint;
   const hardBlocks = [];
   let code = null;
   let message = null;
@@ -349,11 +352,11 @@ export function evaluateExposureAdmission({
     message ||= `Already have an open position in pool ${poolAddress}. Cannot open duplicate.`;
   }
 
-  if (baseMint && mintSet.has(baseMint)) {
-    hardBlocks.push("base_token_already_held");
-    code ||= DEPLOY_GOVERNANCE_CODES.BASE_TOKEN_ALREADY_HELD;
-    message ||= `Already holding base token ${baseMint} in another pool. One position per token only.`;
-  }
+	if (exposureMint && mintSet.has(exposureMint)) {
+		hardBlocks.push("base_token_already_held");
+		code ||= DEPLOY_GOVERNANCE_CODES.BASE_TOKEN_ALREADY_HELD;
+		message ||= `Already holding base token ${exposureMint} in another pool. One position per token only.`;
+	}
 
   return {
     pass: hardBlocks.length === 0,
@@ -368,12 +371,15 @@ export function evaluateDeployAdmission({
   config,
   poolAddress = null,
   baseMint = null,
+  riskMint = null,
   amountY = 0,
   amountX = 0,
   binStep = null,
   positions = [],
   positionsCount = null,
   walletSol = null,
+  walletTokenBalance = null,
+  tokenMint = null,
   portfolioGuard = null,
   poolCooldown = null,
   enforcePositionLimit = true,
@@ -444,15 +450,16 @@ export function evaluateDeployAdmission({
     };
   }
 
-  if (enforceExposure) {
-    const exposure = evaluateExposureAdmission({
-      poolAddress,
-      baseMint,
-      occupiedPools: openPositions.map((position) => position?.pool),
-      occupiedMints: openPositions.map((position) => position?.base_mint),
-    });
-    if (!exposure.pass) {
-      return exposure;
+	if (enforceExposure) {
+		const exposure = evaluateExposureAdmission({
+			poolAddress,
+			baseMint,
+			riskMint,
+			occupiedPools: openPositions.map((position) => position?.pool),
+			occupiedMints: openPositions.map((position) => position?.risk_mint || position?.base_mint),
+		});
+		if (!exposure.pass) {
+			return exposure;
     }
   }
 
@@ -481,19 +488,37 @@ export function evaluateDeployAdmission({
         message: `SOL amount ${amountY} exceeds maximum allowed per position (${config.risk.maxDeployAmount}).`,
       };
     }
+
+		if (amountX > config.risk.maxDeployAmount) {
+			return {
+				pass: false,
+				code: DEPLOY_GOVERNANCE_CODES.ABOVE_MAX_DEPLOY,
+				message: `Base-token amount ${amountX} exceeds maximum allowed per position (${config.risk.maxDeployAmount}).`,
+			};
+		}
   }
 
   if (enforceBalance && walletSol != null) {
-    const gasReserve = config.management.gasReserve;
-    const minRequired = amountY + gasReserve;
+		const gasReserve = config.management.gasReserve;
+		const minRequired = amountY + gasReserve;
     if (walletSol < minRequired) {
       return {
         pass: false,
         code: DEPLOY_GOVERNANCE_CODES.INSUFFICIENT_SOL,
         message: `Insufficient SOL: have ${walletSol} SOL, need ${minRequired} SOL (${amountY} deploy + ${gasReserve} gas reserve).`,
       };
-    }
-  }
+		}
+	}
+
+	if (enforceBalance && amountX > 0 && walletTokenBalance != null) {
+		if (walletTokenBalance < amountX) {
+			return {
+				pass: false,
+				code: DEPLOY_GOVERNANCE_CODES.INSUFFICIENT_BASE_TOKEN,
+				message: `Insufficient base token${tokenMint ? ` ${tokenMint}` : ""}: have ${walletTokenBalance}, need ${amountX}.`,
+			};
+		}
+	}
 
   return {
     pass: true,
@@ -531,10 +556,12 @@ export function planManagementRuntimeAction(position, config, expectedVolumeProf
 		? 0
 		: feesUsd + asNumber(position.collected_fees_usd, 0);
 	const initialValueUsd = asNumber(position.initial_value_usd, 0);
-	const feeTakeProfitPct = initialValueUsd > 0
+  const feeTakeProfitPct = initialValueUsd > 0
 		? (totalFeesEarnedUsd / initialValueUsd) * 100
 		: null;
 	const oorMinutes = asNumber(position.minutes_out_of_range, 0);
+	const rangeSignalStale =
+		position?.stale === true || position?.status === "stale" || pnlSignalStale;
 	const derivedVolumeProfile = expectedVolumeProfile || deriveExpectedVolumeProfile({
     fee_tvl_ratio: position.fee_tvl_ratio,
     volatility: position.pnl?.volatility ?? position.volatility,
@@ -568,9 +595,9 @@ export function planManagementRuntimeAction(position, config, expectedVolumeProf
 		};
 	}
 
-  if (position.in_range === false) {
-    return {
-      toolName: "rebalance_on_exit",
+	if (position.in_range === false && !rangeSignalStale) {
+		return {
+			toolName: "rebalance_on_exit",
       args: {
         position_address: position.position,
         execute: true,
@@ -578,8 +605,12 @@ export function planManagementRuntimeAction(position, config, expectedVolumeProf
       },
       reason: oorMinutes > 0 ? `out of range for ${oorMinutes}m` : "out of range",
       rule: MANAGEMENT_SUBREASONS.OUT_OF_RANGE,
-    };
-  }
+		};
+	}
+
+	if (position.in_range === false && rangeSignalStale) {
+		return null;
+	}
 
 	if (phase === "fast") {
 		return null;

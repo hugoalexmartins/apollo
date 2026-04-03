@@ -414,9 +414,51 @@ export function setLastBriefingDate() {
  */
 const SYNC_GRACE_MS = 5 * 60_000; // don't auto-close positions deployed < 5 min ago
 
-export function syncOpenPositions(active_addresses) {
+function resolveSyncOpenPositionObservation(payload) {
+	if (Array.isArray(payload)) {
+		return {
+			active_addresses: payload,
+			omission_safe: false,
+			reason: "legacy_address_list_missing_observation_metadata",
+		};
+	}
+
+	const activeAddresses = Array.isArray(payload?.active_addresses)
+		? payload.active_addresses
+		: Array.isArray(payload?.positions)
+			? payload.positions
+					.map((position) => position?.position)
+					.filter(Boolean)
+			: [];
+	const observation = payload?.observation;
+	const observedAtMs = Number(
+		observation?.observed_at_ms ?? payload?.observed_at_ms ?? null,
+	);
+	const hasObservedAtMs = Number.isFinite(observedAtMs) && observedAtMs > 0;
+	const omissionSafe =
+		observation?.completeness === "complete" && hasObservedAtMs;
+
+	return {
+		active_addresses: activeAddresses,
+		omission_safe: omissionSafe,
+		reason: omissionSafe
+			? null
+			: "open_position_observation_not_marked_complete",
+	};
+}
+
+export function syncOpenPositions(observed_open_positions) {
+	const observation = resolveSyncOpenPositionObservation(observed_open_positions);
+	if (!observation.omission_safe) {
+		log(
+			"state_warn",
+			`State sync skipped omission-based auto-close because open-position observation is not omission-safe (${observation.reason})`,
+		);
+		return;
+	}
+
 	const state = load();
-	const activeSet = new Set(active_addresses);
+	const activeSet = new Set(observation.active_addresses);
 	let changed = false;
 
 	const journal = readActionJournal();

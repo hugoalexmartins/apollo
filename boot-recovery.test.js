@@ -37,6 +37,7 @@ test("boot recovery parks rebalance for manual review even when replacement is o
     const decision = await runBootRecovery({
       observeOpenPositions: async () => ({
         positions: [{ position: "new-pos-9", pool: "pool-1" }],
+				observation: { completeness: "complete", observed_at_ms: Date.now() },
       }),
       observeTrackedPositions: async () => [],
     });
@@ -76,6 +77,7 @@ test("boot recovery parks deploy intent for manual review even when the target p
     let decision = await runBootRecovery({
       observeOpenPositions: async () => ({
         positions: [{ position: "open-1", pool: "pool-deploy" }],
+				observation: { completeness: "complete", observed_at_ms: Date.now() },
       }),
       observeTrackedPositions: async () => [],
     });
@@ -93,7 +95,10 @@ test("boot recovery parks deploy intent for manual review even when the target p
     });
 
     decision = await runBootRecovery({
-      observeOpenPositions: async () => ({ positions: [] }),
+			observeOpenPositions: async () => ({
+				positions: [],
+				observation: { completeness: "complete", observed_at_ms: Date.now() },
+			}),
       observeTrackedPositions: async () => [],
     });
 
@@ -135,6 +140,7 @@ test("boot recovery resolves close intent when target position is no longer open
     const decision = await runBootRecovery({
       observeOpenPositions: async () => ({
         positions: [{ position: "other-open", pool: "pool-z" }],
+				observation: { completeness: "complete", observed_at_ms: Date.now() },
       }),
       observeTrackedPositions: async () => [],
     });
@@ -180,6 +186,40 @@ test("boot recovery blocks autonomous writes when open-position observation is i
 		assert.equal(decision.reason_code, "OPEN_POSITIONS_INVALID");
 		assert.equal(decision.parked_manual_review_workflows.includes("cycle-invalid:close_position:1"), true);
 		assert.equal(decision.observed.open_positions_invalid, true);
+	} finally {
+		setActionJournalPathForTests(null);
+		process.chdir(originalCwd);
+		fs.rmSync(tempDir, { recursive: true, force: true });
+	}
+});
+
+test("boot recovery fails closed for shape-valid observations without completeness metadata", async () => {
+	const originalCwd = process.cwd();
+	const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "zenith-boot-recovery-shape-valid-incomplete-test-"));
+	const journalPath = path.join(tempDir, "data", "workflow-actions.jsonl");
+
+	try {
+		process.chdir(tempDir);
+		fs.mkdirSync(path.join(tempDir, "logs"), { recursive: true });
+		setActionJournalPathForTests(journalPath);
+
+		appendActionLifecycle({
+			workflow_id: "cycle-shape:close_position:1",
+			lifecycle: "intent",
+			tool: "close_position",
+			cycle_id: "cycle-shape",
+			action_id: "cycle-shape:close_position:1",
+			position_address: "pos-shape-1",
+		});
+
+		const decision = await runBootRecovery({
+			observeOpenPositions: async () => ({ positions: [] }),
+			observeTrackedPositions: async () => [],
+		});
+
+		assert.equal(decision.suppress_autonomous_writes, true);
+		assert.equal(decision.reason_code, "OPEN_POSITIONS_INVALID");
+		assert.equal(decision.parked_manual_review_workflows.includes("cycle-shape:close_position:1"), true);
 	} finally {
 		setActionJournalPathForTests(null);
 		process.chdir(originalCwd);
@@ -261,7 +301,10 @@ test("boot recovery re-suppresses persisted manual-review write workflows after 
 		});
 
 		const decision = await runBootRecovery({
-			observeOpenPositions: async () => ({ positions: [] }),
+			observeOpenPositions: async () => ({
+				positions: [],
+				observation: { completeness: "complete", observed_at_ms: Date.now() },
+			}),
 			observeTrackedPositions: async () => [],
 		});
 
@@ -298,7 +341,10 @@ test("invalid state.json does not erase journal-based recovery gating", async ()
     });
 
     const decision = await runBootRecovery({
-      observeOpenPositions: async () => ({ positions: [] }),
+			observeOpenPositions: async () => ({
+				positions: [],
+				observation: { completeness: "complete", observed_at_ms: Date.now() },
+			}),
       observeTrackedPositions: async () => getTrackedPositions(true),
     });
 
@@ -326,7 +372,10 @@ test("boot recovery blocks autonomous writes when journal contains parse errors"
     fs.writeFileSync(journalPath, "{invalid json\n");
 
     const decision = await runBootRecovery({
-      observeOpenPositions: async () => ({ positions: [] }),
+			observeOpenPositions: async () => ({
+				positions: [],
+				observation: { completeness: "complete", observed_at_ms: Date.now() },
+			}),
       observeTrackedPositions: async () => [],
     });
 

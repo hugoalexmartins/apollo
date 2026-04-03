@@ -53,7 +53,7 @@ test("runManagementRuntimeActions only executes deterministic runtime actions", 
   assert.equal(results[0].toolName, "rebalance_on_exit");
 });
 
-test("runManagementRuntimeActions suppresses stale-pnl exits but keeps out-of-range rebalance", async () => {
+test("runManagementRuntimeActions suppresses stale-pnl exits and stale out-of-range rebalance", async () => {
   const calls = [];
   const results = await runManagementRuntimeActions([
     {
@@ -80,11 +80,8 @@ test("runManagementRuntimeActions suppresses stale-pnl exits but keeps out-of-ra
 		getMemoryVersionStatus: () => ({ active_version: "policy-v1", shadow_version: "policy-shadow-v1" }),
   });
 
-  assert.equal(calls.length, 1);
-  assert.equal(calls[0].name, "rebalance_on_exit");
-  assert.equal(calls[0].args.position_address, "pos-stale-oor");
-  assert.equal(results.length, 1);
-  assert.equal(results[0].position, "pos-stale-oor");
+	assert.equal(calls.length, 0);
+	assert.equal(results.length, 0);
 });
 
 test("runManagementRuntimeActions closes parsed instruction thresholds without escalating to the model", async () => {

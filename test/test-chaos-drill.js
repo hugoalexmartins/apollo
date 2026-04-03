@@ -91,7 +91,7 @@ async function main() {
     assert.ok(failures.find((bundle) => bundle.cycle_id === timeoutCycleId));
     assert.ok(failures.find((bundle) => bundle.cycle_id === partialCycleId));
 
-    console.log("=== Chaos drill: management stale PnL remains deterministic ===");
+    console.log("=== Chaos drill: stale management signals stay suppressed ===");
     const managementCycleId = createCycleId("management");
     const positionInputs = [
       {
@@ -126,9 +126,8 @@ async function main() {
         return { success: true, tool: name };
       },
     });
-    assert.equal(calls.length, 1);
-    assert.equal(calls[0].name, "rebalance_on_exit");
-    assert.equal(calls[0].args.position_address, "pos-stale-oor");
+    assert.equal(calls.length, 0);
+    assert.equal(runtimeActions.length, 0);
 
     const managementEnvelope = {
       cycle_id: managementCycleId,
