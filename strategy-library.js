@@ -64,8 +64,8 @@ export const AUTONOMOUS_STRATEGY_PRESETS = {
 		lp_strategy: "spot",
 		token_criteria: {
 			min_organic_score: 80,
-			min_fee_tvl_ratio: 0.04,
-			min_holders: 1000,
+			min_fee_tvl_ratio: 0.05,
+			min_holders: 1500,
 		},
 		entry: {
 			condition:
@@ -74,10 +74,10 @@ export const AUTONOMOUS_STRATEGY_PRESETS = {
 		},
 		range: {
 			type: "balanced",
-			bins_below: 18,
-			bins_above: 18,
+			bins_below: 24,
+			bins_above: 24,
 			notes:
-				"Symmetric spot floor that can widen with planner bins for higher-quality range-bound pools.",
+				"Broader symmetric spot floor that can widen with planner bins for higher-quality, deeper-holder pools.",
 		},
 		exit: {
 			take_profit_pct: 5,
@@ -85,12 +85,12 @@ export const AUTONOMOUS_STRATEGY_PRESETS = {
 				"Use existing runtime exits; this preset only changes deploy shape and activation.",
 		},
 		best_for:
-			"High-quality pools with strong top-LP proof, calm price action, and enough holder depth.",
+			"High-quality pools with strong top-LP proof, calm price action, and deeper holder participation.",
 		activation: {
 			mode: "top_lper_quality_gate",
 			min_top_lper_win_rate_pct: 80,
-			max_abs_price_change_pct: 8,
-			max_volatility: 8,
+			max_abs_price_change_pct: 6,
+			max_volatility: 6,
 		},
 	},
 	yield_spot_wide: {
@@ -99,8 +99,9 @@ export const AUTONOMOUS_STRATEGY_PRESETS = {
 		author: "Zenith",
 		lp_strategy: "spot",
 		token_criteria: {
-			min_organic_score: 72,
-			min_fee_tvl_ratio: 0.08,
+			min_organic_score: 78,
+			min_fee_tvl_ratio: 0.09,
+			min_holders: 1000,
 		},
 		entry: {
 			condition:
@@ -109,10 +110,10 @@ export const AUTONOMOUS_STRATEGY_PRESETS = {
 		},
 		range: {
 			type: "wide",
-			bins_below: 36,
-			bins_above: 36,
+			bins_below: 48,
+			bins_above: 48,
 			notes:
-				"Wider symmetric spot floor for calm pools with strong fee/TVL but weaker wallet proof than Quality Spot.",
+				"Broader symmetric spot floor for calm, fee-efficient pools that still clear stronger holder-depth gates.",
 		},
 		exit: {
 			take_profit_pct: 5,
@@ -120,11 +121,12 @@ export const AUTONOMOUS_STRATEGY_PRESETS = {
 				"Use existing runtime exits; this preset only changes deploy shape and activation.",
 		},
 		best_for:
-			"Calm, fee-efficient pools where spot exposure makes sense even without elite top-LP confirmation.",
+			"Calm, fee-efficient pools with stronger holder depth where spot exposure makes sense even without elite top-LP confirmation.",
 		activation: {
 			mode: "fee_efficiency_gate",
-			min_fee_tvl_ratio: 0.08,
-			max_abs_price_change_pct: 6,
+			min_fee_tvl_ratio: 0.09,
+			min_holders: 1000,
+			max_abs_price_change_pct: 5,
 			max_volatility: 4,
 		},
 	},
@@ -254,10 +256,10 @@ export function resolveAutonomousStrategyPreset({
 		topLperWinRatePct != null &&
 		topLperWinRatePct >= 80 &&
 		organicScore >= 80 &&
-		holders >= 1000 &&
-		feeTvlRatio >= 0.04 &&
-		absPriceChangePct <= 8 &&
-		volatility <= 8
+		holders >= 1500 &&
+		feeTvlRatio >= 0.05 &&
+		absPriceChangePct <= 6 &&
+		volatility <= 6
 	) {
 		return {
 			...clone(AUTONOMOUS_STRATEGY_PRESETS.quality_spot),
@@ -267,9 +269,10 @@ export function resolveAutonomousStrategyPreset({
 
 	if (
 		plannerStrategy === "spot" &&
-		feeTvlRatio >= 0.08 &&
-		organicScore >= 72 &&
-		absPriceChangePct <= 6 &&
+		feeTvlRatio >= 0.09 &&
+		organicScore >= 78 &&
+		holders >= 1000 &&
+		absPriceChangePct <= 5 &&
 		volatility <= 4
 	) {
 		return {

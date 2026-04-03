@@ -1,10 +1,19 @@
 import { config } from "./config.js";
 import { isBlacklistedCreator } from "./creator-blacklist.js";
-import { recallForPool } from "./pool-memory.js";
 import { getWalletScoreMemory, recallForScreening } from "./memory.js";
+import { recallForPool } from "./pool-memory.js";
 import { checkSmartWalletsOnPool } from "./smart-wallets.js";
+import { resolveCanonicalPoolIdentity } from "./tools/dlmm-position-context.js";
 import { getFullTokenAnalysis } from "./tools/okx.js";
 import { getTokenHolders, getTokenInfo, getTokenNarrative } from "./tools/token.js";
+
+function getPoolRiskMint(pool = {}) {
+	return pool.risk?.mint || resolveCanonicalPoolIdentity({
+		token_x_mint: pool.base?.mint || null,
+		token_y_mint: pool.quote?.mint || null,
+		solMint: config.tokens?.SOL,
+	}).risk_mint;
+}
 
 export function asNumber(value, fallback = 0) {
   const num = Number(value);
@@ -107,10 +116,17 @@ function formatBlacklistedAddressBlock(hits = []) {
 	return `blacklisted_scam_addresses ${hits.length}${summary ? ` (${summary}${overflow})` : ""}`;
 }
 
+function normalizeLaunchpad(value) {
+	if (typeof value !== "string") return null;
+	const normalized = value.trim().toLowerCase();
+	return normalized.length > 0 ? normalized : null;
+}
+
 export function evaluateCandidateIntel(pool, {
   smartWallets,
   holders,
   narrative,
+  tokenInfo,
   scoredLpers,
   okx,
   availability = {},
@@ -124,6 +140,11 @@ export function evaluateCandidateIntel(pool, {
   const blacklistedAddressHits = Array.isArray(holders?.blacklisted_addresses)
 		? holders.blacklisted_addresses
 		: [];
+  const blockedLaunchpads = Array.isArray(config.screening.blockedLaunchpads)
+		? config.screening.blockedLaunchpads.map(normalizeLaunchpad).filter(Boolean)
+		: [];
+  const launchpad = normalizeLaunchpad(tokenInfo?.launchpad);
+  const botHoldersPct = asNumber(tokenInfo?.audit?.bot_holders_pct, null);
   const blockedCreator = isBlacklistedCreator(pool?.dev)
 		? pool.dev
 		: isBlacklistedCreator(okx?.advanced?.creator)
@@ -144,6 +165,12 @@ export function evaluateCandidateIntel(pool, {
   if (holders && bundlersPct > config.screening.maxBundlersPct) {
     hardBlocks.push(`bundlers_pct ${bundlersPct.toFixed(1)} > ${config.screening.maxBundlersPct}`);
   }
+  if (launchpad && blockedLaunchpads.includes(launchpad)) {
+		hardBlocks.push(`blocked_launchpad ${launchpad}`);
+	}
+  if (botHoldersPct != null && config.screening.maxBotHoldersPct != null && botHoldersPct > config.screening.maxBotHoldersPct) {
+		hardBlocks.push(`bot_holders_pct ${botHoldersPct.toFixed(1)} > ${config.screening.maxBotHoldersPct}`);
+	}
   if (holdersUnavailable) {
 		hardBlocks.push("holder_intel_unavailable");
 	}
@@ -159,8 +186,17 @@ export function evaluateCandidateIntel(pool, {
   if (okx?.advanced?.is_honeypot) {
 		hardBlocks.push("okx_honeypot_tag");
 	}
+  if (okx?.advanced?.dev_sold_all) {
+		hardBlocks.push("okx_dev_sold_all");
+	}
   if (okx?.advanced?.bundle_pct != null && bundlePct > config.screening.maxBundlePct) {
 		hardBlocks.push(`okx_bundle_pct ${bundlePct.toFixed(1)} > ${config.screening.maxBundlePct}`);
+	}
+  if (okx?.price?.price_vs_ath_pct != null && config.screening.athFilterPct != null) {
+		const athThresholdPct = 100 + config.screening.athFilterPct;
+		if (okx.price.price_vs_ath_pct > athThresholdPct) {
+			hardBlocks.push(`price_vs_ath_pct ${asNumber(okx.price.price_vs_ath_pct, 0).toFixed(1)} > ${athThresholdPct.toFixed(1)}`);
+		}
 	}
   if (smartWalletCount === 0 && !hasUsableNarrative(narrative)) {
     hardBlocks.push("missing_specific_narrative_without_smart_wallets");
@@ -171,7 +207,7 @@ export function evaluateCandidateIntel(pool, {
     lp_wallet_bonus: roundMetric(Math.min(10, lpWalletTopScore / 10)),
     narrative_bonus: hasUsableNarrative(narrative) ? 4 : 0,
     okx_smart_money_bonus: okx?.advanced?.smart_money_buy ? 3 : 0,
-    okx_dev_exit_bonus: okx?.advanced?.dev_sold_all ? 2 : 0,
+    okx_dev_exit_bonus: 0,
     okx_cluster_kol_bonus: clusterKol ? 2 : 0,
   };
   const walletScoreMessage = scoredLpers?.message || null;
@@ -258,7 +294,7 @@ export function formatCandidateInspection(candidate) {
 }
 
 export async function inspectCandidate(pool, executeTool, { includeWalletScore = true } = {}) {
-  const mint = pool.base?.mint;
+	const mint = getPoolRiskMint(pool);
   const [smartWallets, holders, narrative, tokenInfo, okx, poolMemory, activeBin] = await Promise.allSettled([
     checkSmartWalletsOnPool({ pool_address: pool.pool }),
     mint ? getTokenHolders({ mint, limit: 100 }) : Promise.resolve(null),
@@ -384,12 +420,12 @@ export function formatFinalistInspectionBlock({
     : null;
   const narrativeLine = truncatePromptText(n?.narrative, 200);
   const poolMemoryLine = truncatePromptText(mem, 140);
-  const memoryHits = recallForScreening({
-    name: pool.name,
-    pair: pool.name,
-    base_token: pool.base?.mint,
-    bin_step: pool.bin_step,
-  });
+	const memoryHits = recallForScreening({
+		name: pool.name,
+		pair: pool.name,
+		base_token: getPoolRiskMint(pool),
+		bin_step: pool.bin_step,
+	});
   const learnedMemory = memoryHits.length
     ? memoryHits.map((hit) => `[${hit.source}] ${hit.key}: ${hit.answer}`).join(" | ")
     : null;

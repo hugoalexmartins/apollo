@@ -1,5 +1,5 @@
-import fs from "fs";
-import path from "path";
+import fs from "node:fs";
+import path from "node:path";
 
 import {
 	readJsonSnapshotWithBackupSync,
@@ -13,7 +13,7 @@ const REGIME_PACKS = {
       minFeeActiveTvlRatio: 0.1,
       minOrganic: 72,
       minVolume: 1200,
-      minHolders: 900,
+      minHolders: 1200,
     },
     deploy: {
       regime_multiplier: 0.75,
@@ -32,7 +32,7 @@ const REGIME_PACKS = {
       minFeeActiveTvlRatio: 0.04,
       minOrganic: 58,
       minVolume: 350,
-      minHolders: 400,
+      minHolders: 600,
     },
     deploy: {
       regime_multiplier: 1.2,

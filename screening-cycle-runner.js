@@ -5,6 +5,9 @@ import {
 	resolveAutonomousStrategyPreset,
 	resolveDeploySemantics,
 } from "./strategy-library.js";
+import { resolveSingleSidedSolPoolOrientation } from "./tools/dlmm-position-context.js";
+
+const SOL_MINT = "So11111111111111111111111111111111111111112";
 
 function classifyScreeningDecisionStatus(decisionResult) {
 	if (decisionResult?.manual_review) return "manual_review";
@@ -180,6 +183,42 @@ function evaluateResolvedStrategyProtection({
 	}
 
 	return null;
+}
+
+function evaluateSingleSidedSolOrientationGuard({
+	pool,
+	deployPlan,
+	solMint,
+}) {
+	if (
+		deployPlan?.deposit_sidedness !== "single_sided"
+		|| deployPlan?.deposit_asset !== "sol"
+	) {
+		return {
+			applies: false,
+			blocked: false,
+			reason: null,
+			orientation: null,
+		};
+	}
+
+	const orientation = resolveSingleSidedSolPoolOrientation({
+		token_x_mint: pool?.base?.mint || null,
+		token_y_mint: pool?.quote?.mint || null,
+		solMint,
+	});
+	const reasonByStatus = {
+		wrong_side: "single_sided_sol_requires_token_y_sol",
+		unknown: "single_sided_sol_orientation_unknown",
+		not_sol_pool: "single_sided_sol_pool_not_sol_quoted",
+		ambiguous: "single_sided_sol_orientation_ambiguous",
+	};
+	return {
+		applies: true,
+		blocked: !orientation.compatible,
+		reason: orientation.compatible ? null : reasonByStatus[orientation.status],
+		orientation,
+	};
 }
 
 async function inspectDeployCandidate({
@@ -575,10 +614,11 @@ export function createScreeningCycleRunner(deps) {
 				? `ACTIVE STRATEGY: ${activeStrategy.name} - LP: ${activeStrategy.lp_strategy} | execution shape: autonomous screening deploys are currently single-sided SOL unless explicit token amounts are added elsewhere | bins_above: ${activeStrategy.range?.bins_above ?? 0} (FIXED - never change) | best for: ${activeStrategy.best_for}`
 				: [
 					"AUTONOMOUS DEPLOY PRESETS: strategy and bins are resolved deterministically per finalist.",
-					"quality_spot -> activate when top LP win rate >= 80%, organic >= 80, holders >= 1000, fee/TVL >= 0.04, price action is calm, and planner already prefers spot.",
-						"yield_spot_wide -> activate when fee/TVL >= 0.08, volatility <= 4, price action is calm, and planner already prefers spot.",
-						"bid_ask_default -> activate otherwise, especially for hotter or less-proven pools.",
-					].join(" ");
+					"quality_spot -> activate when top LP win rate >= 80%, organic >= 80, holders >= 1500, fee/TVL >= 0.05, price action is calm, and planner already prefers spot.",
+						"yield_spot_wide -> activate when holders >= 1000, organic >= 78, fee/TVL >= 0.09, volatility <= 4, price action is calm, and planner already prefers spot.",
+					"bid_ask_default -> activate otherwise, especially for hotter or less-proven pools.",
+					"Any single-sided SOL deploy plan fails closed unless SOL is confirmed on token_y/quote side for that pool.",
+				].join(" ");
 
 			const buildStaticStrategyPolicy = (regimeLabel) => {
 				if (!activeStrategy) return null;
@@ -712,7 +752,7 @@ export function createScreeningCycleRunner(deps) {
 						total_eligible: totalEligible,
 						blocked_summary: blockedSummary,
 					},
-					candidates: [],
+					candidates: screeningTopCandidates?.candidate_evaluations || [],
 				};
 				appendReplayEnvelope({
 					cycle_id: cycleId,
@@ -721,6 +761,7 @@ export function createScreeningCycleRunner(deps) {
 					summary: screeningEvaluation.summary,
 					total_screened: screeningTopCandidates?.total_screened ?? 0,
 					screening_config: regimeContext.effectiveScreeningConfig,
+					candidate_evaluations: screeningTopCandidates?.candidate_evaluations || [],
 					candidate_inputs: screeningTopCandidates?.candidate_inputs || [],
 					occupied_pools: screeningTopCandidates?.occupied_pools || [],
 					occupied_mints: screeningTopCandidates?.occupied_mints || [],
@@ -735,9 +776,20 @@ export function createScreeningCycleRunner(deps) {
 				name: pool.name,
 				ranking_score: roundMetric(pool.deterministic_score),
 				context_score: roundMetric(pool.deterministic_score),
+				eligibility_reason: pool.eligibility_reason || "eligible",
+				deterministic_hard_blocks: Array.isArray(pool.hard_blocks)
+					? [...pool.hard_blocks]
+					: [],
 				hard_blocked: false,
 				hard_blocks: [],
-				smart_wallet_count: 0,
+					deploy_strategy: null,
+					deploy_bins_below: null,
+					deploy_bins_above: null,
+					deploy_preset_id: null,
+					deploy_shape: null,
+					deploy_orientation_status: null,
+					deploy_sol_side: null,
+					smart_wallet_count: 0,
 				holder_metrics: null,
 				okx: null,
 				wallet_score_source: "finalist_preload",
@@ -768,6 +820,7 @@ export function createScreeningCycleRunner(deps) {
 					smartWallets: inspection.smartWallets,
 					holders: inspection.holders,
 					narrative: inspection.narrative,
+					tokenInfo: inspection.tokenInfo,
 					scoredLpers,
 					okx: inspection.okx,
 					availability: inspection.availability,
@@ -786,10 +839,19 @@ export function createScreeningCycleRunner(deps) {
 						getNegativeRegimeMemory,
 						getNegativeRegimeCooldown,
 					});
-				if (resolvedStrategyGuard?.blocked) {
+				const orientationGuard = evaluateSingleSidedSolOrientationGuard({
+					pool,
+					deployPlan,
+					solMint: config.tokens?.SOL || SOL_MINT,
+				});
+				const deployGuardReasons = [
+					resolvedStrategyGuard?.blocked ? resolvedStrategyGuard.reason : null,
+					orientationGuard.blocked ? orientationGuard.reason : null,
+				].filter(Boolean);
+				if (deployGuardReasons.length > 0) {
 					pool.hard_blocked = true;
-					pool.hard_blocks = [...new Set([...(pool.hard_blocks || []), resolvedStrategyGuard.reason])];
-					if (resolvedStrategyGuard.invalid_state) {
+					pool.hard_blocks = [...new Set([...(pool.hard_blocks || []), ...deployGuardReasons])];
+					if (resolvedStrategyGuard?.invalid_state) {
 						resolvedGuardInvalidStates.push(resolvedStrategyGuard.reason);
 					}
 				}
@@ -805,6 +867,7 @@ export function createScreeningCycleRunner(deps) {
 					evalEntry.context_score = candidateIntel.score.context_score;
 					evalEntry.hard_blocked = candidateIntel.hard_blocked;
 					evalEntry.hard_blocks = candidateIntel.hard_blocks;
+					evalEntry.finalist_hard_blocks = [...candidateIntel.hard_blocks];
 					evalEntry.smart_wallet_count = candidateIntel.smart_wallet_count;
 					evalEntry.holder_metrics = candidateIntel.holder_metrics;
 					evalEntry.okx = candidateIntel.okx;
@@ -826,10 +889,24 @@ export function createScreeningCycleRunner(deps) {
 					deploy_deposit_asset: deployPlan.deposit_asset,
 					deploy_range_shape: deployPlan.range_shape,
 					deploy_semantics_label: deployPlan.strategy_semantics_label,
+					deploy_orientation_status:
+						orientationGuard.orientation?.status || "not_applicable",
+					deploy_sol_side: orientationGuard.orientation?.sol_side || null,
 				});
-				if (evalEntry && resolvedStrategyGuard?.blocked) {
+				if (evalEntry && deployGuardReasons.length > 0) {
 					evalEntry.hard_blocked = true;
-					evalEntry.hard_blocks = [...new Set([...(evalEntry.hard_blocks || []), resolvedStrategyGuard.reason])];
+					evalEntry.hard_blocks = [...new Set([...(evalEntry.hard_blocks || []), ...deployGuardReasons])];
+				}
+				if (evalEntry) {
+					evalEntry.deploy_strategy = deployPlan.strategy;
+					evalEntry.deploy_bins_below = deployPlan.bins_below;
+					evalEntry.deploy_bins_above = deployPlan.bins_above;
+					evalEntry.deploy_preset_id = deployPlan.preset_id;
+					evalEntry.deploy_shape = deployPlan.strategy_semantics_label;
+					evalEntry.deploy_orientation_status =
+						orientationGuard.orientation?.status || "not_applicable";
+					evalEntry.deploy_sol_side =
+						orientationGuard.orientation?.sol_side || null;
 				}
 
 				finalistBlocks.push(`${formatFinalistInspectionBlock({
@@ -841,6 +918,7 @@ export function createScreeningCycleRunner(deps) {
 				})}
   deploy_preset: ${deployPlan.preset_id || "none"} -> strategy=${deployPlan.strategy}, bins_below=${deployPlan.bins_below ?? "?"}, bins_above=${deployPlan.bins_above ?? "?"}
   deploy_shape: ${deployPlan.strategy_semantics_label}
+  deploy_orientation: ${orientationGuard.orientation?.status || "not_applicable"}${orientationGuard.orientation?.sol_side ? ` (${orientationGuard.orientation.sol_side})` : ""}
   deploy_preset_reason: ${deployPlan.activation_summary || "not available"}`);
 			}
 			if (resolvedGuardInvalidStates.length > 0) {
@@ -931,7 +1009,12 @@ export function createScreeningCycleRunner(deps) {
 							getNegativeRegimeMemory,
 							getNegativeRegimeCooldown,
 						});
-						if (!altGuard?.blocked) {
+						const altOrientationGuard = evaluateSingleSidedSolOrientationGuard({
+							pool: altCandidate,
+							deployPlan,
+							solMint: config.tokens?.SOL || SOL_MINT,
+						});
+						if (!altGuard?.blocked && !altOrientationGuard.blocked) {
 							altTop = altCandidate;
 							break;
 						}
@@ -1077,6 +1160,7 @@ export function createScreeningCycleRunner(deps) {
 				cycle_type: "screening",
 				occupied_pools: screeningTopCandidates?.occupied_pools || [],
 				occupied_mints: screeningTopCandidates?.occupied_mints || [],
+				candidate_evaluations: candidateEvaluations,
 				candidate_inputs: screeningTopCandidates?.candidate_inputs || [],
 				screening_config: regimeContext.effectiveScreeningConfig,
 				shortlist: shortlist.map((pool) => ({

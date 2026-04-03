@@ -4,17 +4,27 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { fetchWithTimeout } from "./fetch-utils.js";
-import { getTokenHolders } from "./token.js";
-import { discoverPools, evaluateCandidateSnapshot, getTopCandidates, rankCandidateSnapshots, resetDiscoveryCache } from "./screening.js";
 import { config } from "../config.js";
 import { evaluateCandidateIntel } from "../screening-intel.js";
+import { fetchWithTimeout } from "./fetch-utils.js";
+import {
+	discoverPools,
+	evaluateCandidateSnapshot,
+	getTopCandidates,
+	rankCandidateSnapshots,
+	resetDiscoveryCache,
+} from "./screening.js";
+import { getTokenHolders } from "./token.js";
+
+const SOL_MINT = "So11111111111111111111111111111111111111112";
 
 function buildPool(overrides = {}) {
   return {
     pool: overrides.pool || "pool-a",
     name: overrides.name || "Alpha-SOL",
     base: { mint: overrides.baseMint || "mint-a", symbol: "ALPHA" },
+    quote: { mint: overrides.quoteMint || SOL_MINT, symbol: overrides.quoteSymbol || "SOL" },
+    risk: { mint: overrides.riskMint || overrides.baseMint || "mint-a", symbol: overrides.riskSymbol || "ALPHA", side: overrides.riskSide || "token_x" },
     fee_active_tvl_ratio: overrides.fee_active_tvl_ratio ?? 0.4,
     volume_window: overrides.volume_window ?? 50000,
     organic_score: overrides.organic_score ?? 85,
@@ -37,7 +47,27 @@ test("evaluateCandidateSnapshot adds deterministic score and hard blocks", () =>
   assert.equal(blocked.eligible, false);
   assert.deepEqual(blocked.hard_blocks, ["pool_already_open", "base_token_already_held"]);
   assert.equal(typeof blocked.deterministic_score, "number");
-  assert.equal(typeof blocked.score_breakdown.total_score, "number");
+	assert.equal(typeof blocked.score_breakdown.total_score, "number");
+});
+
+test("evaluateCandidateSnapshot uses canonical risk mint when SOL is token X", () => {
+	const blocked = evaluateCandidateSnapshot(
+		buildPool({
+			pool: "pool-sol-base",
+			baseMint: SOL_MINT,
+			quoteMint: "mint-held",
+			quoteSymbol: "HELD",
+			riskMint: "mint-held",
+			riskSymbol: "HELD",
+			riskSide: "token_y",
+		}),
+		{
+			occupiedMints: new Set(["mint-held"]),
+		},
+	);
+
+	assert.equal(blocked.eligible, false);
+	assert.ok(blocked.hard_blocks.includes("base_token_already_held"));
 });
 
 test("rankCandidateSnapshots sorts eligible pools by deterministic score", () => {
@@ -156,6 +186,31 @@ test("getTopCandidates reuses a provided positions snapshot without re-reading p
 	assert.deepEqual(result.occupied_pools, ["pool-blocked"]);
 	assert.equal(result.candidates.length, 1);
 	assert.equal(result.candidates[0].pool, "pool-ok");
+	assert.equal(Array.isArray(result.candidate_evaluations), true);
+	assert.equal(result.candidate_evaluations.length, 2);
+});
+
+test("getTopCandidates returns deterministic candidate evaluations for blocked pools", async () => {
+	const result = await getTopCandidates({
+		limit: 2,
+		discoverPoolsFn: async () => ({
+			pools: [
+				buildPool({ pool: "pool-new", baseMint: "mint-new", token_age_hours: 2 }),
+			],
+		}),
+		positionsSnapshot: { total_positions: 0, positions: [] },
+		screeningConfig: {
+			...config.screening,
+			minTokenAgeHours: 24,
+			maxTokenAgeHours: 240,
+		},
+	});
+
+	assert.equal(result.candidates.length, 0);
+	assert.equal(Array.isArray(result.candidate_evaluations), true);
+	assert.equal(result.candidate_evaluations.length, 1);
+	assert.equal(result.candidate_evaluations[0].eligibility_reason, "token_too_new");
+	assert.ok(result.candidate_evaluations[0].hard_blocks.includes("token_too_new"));
 });
 
 test("fetchWithTimeout aborts hung screening fetches", async () => {
@@ -442,6 +497,7 @@ test("evaluateCandidateIntel hard-blocks honeypot and excessive OKX bundle conce
 
 	assert.equal(intel.hard_blocked, true);
 	assert.ok(intel.hard_blocks.includes("okx_honeypot_tag"));
+	assert.ok(intel.hard_blocks.includes("okx_dev_sold_all"));
 	assert.ok(intel.hard_blocks.some((entry) => entry.startsWith("okx_bundle_pct")));
 	assert.equal(intel.okx.smart_money_buy, true);
 	assert.equal(intel.okx.cluster_has_kol, true);
@@ -497,6 +553,60 @@ test("evaluateCandidateIntel hard-blocks denylisted creator from OKX enrichment"
 		if (originalEnv) process.env.ZENITH_CREATOR_BLACKLIST_FILE = originalEnv;
 		else delete process.env.ZENITH_CREATOR_BLACKLIST_FILE;
 		fs.rmSync(tempDir, { recursive: true, force: true });
+	}
+});
+
+test("evaluateCandidateIntel hard-blocks blocked launchpads, excessive bot holders, and ATH proximity", () => {
+	const originalBlockedLaunchpads = config.screening.blockedLaunchpads;
+	const originalMaxBotHoldersPct = config.screening.maxBotHoldersPct;
+	const originalAthFilterPct = config.screening.athFilterPct;
+
+	config.screening.blockedLaunchpads = ["letsbonk.fun"];
+	config.screening.maxBotHoldersPct = 25;
+	config.screening.athFilterPct = -20;
+
+	try {
+		const intel = evaluateCandidateIntel(buildPool(), {
+			smartWallets: { in_pool: [] },
+			holders: {
+				top_10_real_holders_pct: "15.00",
+				bundlers_pct_in_top_100: "1.00",
+				global_fees_sol: 90,
+				blacklisted_addresses: [],
+			},
+			narrative: { narrative: "Real narrative that would otherwise pass screening." },
+			tokenInfo: {
+				launchpad: "LetsBonk.Fun",
+				audit: { bot_holders_pct: "30.00" },
+			},
+			scoredLpers: { candidates: [] },
+			okx: {
+				advanced: {
+					bundle_pct: 1,
+					is_honeypot: false,
+					creator: null,
+					smart_money_buy: false,
+					dev_sold_all: false,
+					dex_boost: false,
+					dex_screener_paid: false,
+				},
+				clusters: [],
+				price: { price_vs_ath_pct: 85 },
+			},
+			availability: {
+				holders: "ok",
+				okx_advanced: "ok",
+			},
+		});
+
+		assert.equal(intel.hard_blocked, true);
+		assert.ok(intel.hard_blocks.includes("blocked_launchpad letsbonk.fun"));
+		assert.ok(intel.hard_blocks.some((entry) => entry.startsWith("bot_holders_pct 30.0 > 25")));
+		assert.ok(intel.hard_blocks.some((entry) => entry.startsWith("price_vs_ath_pct 85.0 > 80.0")));
+	} finally {
+		config.screening.blockedLaunchpads = originalBlockedLaunchpads;
+		config.screening.maxBotHoldersPct = originalMaxBotHoldersPct;
+		config.screening.athFilterPct = originalAthFilterPct;
 	}
 });
 

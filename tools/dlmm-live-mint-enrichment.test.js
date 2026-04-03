@@ -3,13 +3,17 @@ import test from "node:test";
 
 import { getTopCandidates } from "./screening.js";
 
+const SOL_MINT = "So11111111111111111111111111111111111111112";
+
 test("live base mint enrichment still blocks same-token screening candidates", async () => {
 	const candidates = await getTopCandidates({
 		pools: [
 			{
 				pool: "pool-candidate",
 				name: "Candidate Pool",
-				base: { mint: "mint-live" },
+				base: { mint: SOL_MINT, symbol: "SOL" },
+				quote: { mint: "mint-live", symbol: "LIVE" },
+				risk: { mint: "mint-live", symbol: "LIVE", side: "token_y" },
 				bin_step: 100,
 				organic_score: 80,
 				fee_tvl_ratio: 0.08,

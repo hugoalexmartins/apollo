@@ -3,6 +3,21 @@ function toNullableFiniteNumber(value) {
 	return Number.isFinite(num) ? num : null;
 }
 
+const DEFAULT_SOL_MINT = "So11111111111111111111111111111111111111112";
+
+function normalizeMintLabel(mint) {
+	return typeof mint === "string" ? mint.trim() : "";
+}
+
+function isSolMintLabel(mint, solMint = DEFAULT_SOL_MINT) {
+	const normalizedMint = normalizeMintLabel(mint);
+	const normalizedSolMint = normalizeMintLabel(solMint || DEFAULT_SOL_MINT);
+	return Boolean(normalizedMint)
+		&& (normalizedMint === normalizedSolMint
+			|| normalizedMint === "SOL"
+			|| normalizedMint === "native");
+}
+
 function findTokenBalanceByMint(walletBalances, mint, normalizeMint) {
 	if (!mint || !walletBalances || !Array.isArray(walletBalances.tokens)) return null;
 	const normalizedMint = normalizeMint(mint);
@@ -72,6 +87,212 @@ export async function resolvePoolTokenMints({ poolAddress, getPool }) {
 	}
 }
 
+export function resolveCanonicalPoolIdentity({
+	token_x_mint = null,
+	token_y_mint = null,
+	solMint = null,
+} = {}) {
+	const tokenXMint = normalizeMintLabel(token_x_mint);
+	const tokenYMint = normalizeMintLabel(token_y_mint);
+	const normalizedSolMint = normalizeMintLabel(solMint || DEFAULT_SOL_MINT);
+	const tokenXIsSol = isSolMintLabel(tokenXMint, normalizedSolMint);
+	const tokenYIsSol = isSolMintLabel(tokenYMint, normalizedSolMint);
+
+	let riskMint = null;
+	let riskTokenSide = null;
+	if (tokenXIsSol && tokenYIsSol) {
+		riskMint = null;
+		riskTokenSide = null;
+	} else if (tokenXMint && !tokenXIsSol && (!tokenYMint || tokenYIsSol)) {
+		riskMint = tokenXMint;
+		riskTokenSide = "token_x";
+	} else if (tokenYMint && !tokenYIsSol && (!tokenXMint || tokenXIsSol)) {
+		riskMint = tokenYMint;
+		riskTokenSide = "token_y";
+	} else if (tokenXMint) {
+		riskMint = tokenXIsSol && !tokenYMint ? null : tokenXMint;
+		riskTokenSide = riskMint ? "token_x" : null;
+	} else if (tokenYMint) {
+		riskMint = tokenYIsSol ? null : tokenYMint;
+		riskTokenSide = riskMint ? "token_y" : null;
+	}
+
+	const counterMint = riskTokenSide === "token_x"
+		? tokenYMint || null
+		: riskTokenSide === "token_y"
+			? tokenXMint || null
+			: null;
+	const orientation = resolveSingleSidedSolPoolOrientation({
+		token_x_mint: tokenXMint,
+		token_y_mint: tokenYMint,
+		solMint: normalizedSolMint,
+	});
+
+	return {
+		token_x_mint: tokenXMint || null,
+		token_y_mint: tokenYMint || null,
+		token_x_is_sol: tokenXIsSol,
+		token_y_is_sol: tokenYIsSol,
+		risk_mint: riskMint,
+		risk_token_side: riskTokenSide,
+		counter_mint: counterMint,
+		sol_pool: tokenXIsSol || tokenYIsSol,
+		sol_side: orientation.sol_side,
+		orientation_status: orientation.status,
+		orientation,
+	};
+}
+
+export function resolveCanonicalPoolTokenView({
+	token_x = null,
+	token_y = null,
+	solMint = null,
+} = {}) {
+	const identity = resolveCanonicalPoolIdentity({
+		token_x_mint: token_x?.address ?? token_x?.mint ?? null,
+		token_y_mint: token_y?.address ?? token_y?.mint ?? null,
+		solMint,
+	});
+	const riskToken = identity.risk_token_side === "token_y"
+		? token_y || null
+		: identity.risk_token_side === "token_x"
+			? token_x || null
+			: null;
+	const counterToken = identity.risk_token_side === "token_y"
+		? token_x || null
+		: identity.risk_token_side === "token_x"
+			? token_y || null
+			: null;
+
+	return {
+		...identity,
+		risk_token: riskToken,
+		counter_token: counterToken,
+	};
+}
+
+export function resolveSingleSidedSolPoolOrientation({
+	token_x_mint = null,
+	token_y_mint = null,
+	solMint = null,
+} = {}) {
+	const tokenXMint = normalizeMintLabel(token_x_mint);
+	const tokenYMint = normalizeMintLabel(token_y_mint);
+	const normalizedSolMint = normalizeMintLabel(solMint || DEFAULT_SOL_MINT);
+
+	if (!tokenXMint || !tokenYMint || !normalizedSolMint) {
+		return {
+			status: "unknown",
+			compatible: false,
+			sol_side: null,
+			required_amount_field: null,
+			token_x_mint: tokenXMint || null,
+			token_y_mint: tokenYMint || null,
+		};
+	}
+
+	const tokenXIsSol = isSolMintLabel(tokenXMint, normalizedSolMint);
+	const tokenYIsSol = isSolMintLabel(tokenYMint, normalizedSolMint);
+
+	if (tokenXIsSol && tokenYIsSol) {
+		return {
+			status: "ambiguous",
+			compatible: false,
+			sol_side: "both",
+			required_amount_field: null,
+			token_x_mint: tokenXMint,
+			token_y_mint: tokenYMint,
+		};
+	}
+
+	if (tokenYIsSol && !tokenXIsSol) {
+		return {
+			status: "compatible",
+			compatible: true,
+			sol_side: "token_y",
+			required_amount_field: "amount_y",
+			token_x_mint: tokenXMint,
+			token_y_mint: tokenYMint,
+		};
+	}
+
+	if (tokenXIsSol && !tokenYIsSol) {
+		return {
+			status: "wrong_side",
+			compatible: false,
+			sol_side: "token_x",
+			required_amount_field: "amount_x",
+			token_x_mint: tokenXMint,
+			token_y_mint: tokenYMint,
+		};
+	}
+
+	return {
+		status: "not_sol_pool",
+		compatible: false,
+		sol_side: null,
+		required_amount_field: null,
+		token_x_mint: tokenXMint,
+		token_y_mint: tokenYMint,
+	};
+}
+
+export function evaluateSingleSidedSolDeployOrientation({
+	amount_x = null,
+	amount_y = null,
+	amount_sol = null,
+	token_x_mint = null,
+	token_y_mint = null,
+	solMint = null,
+} = {}) {
+	const amountX = toNullableFiniteNumber(amount_x) ?? 0;
+	const amountY = toNullableFiniteNumber(amount_y ?? amount_sol) ?? 0;
+	const applies = amountY > 0 && amountX <= 0;
+	if (!applies) {
+		return {
+			applies: false,
+			blocked: false,
+			reason_code: null,
+			message: null,
+			orientation: null,
+			amount_x: amountX,
+			amount_y: amountY,
+		};
+	}
+
+	const orientation = resolveSingleSidedSolPoolOrientation({
+		token_x_mint,
+		token_y_mint,
+		solMint,
+	});
+	const reasonByStatus = {
+		wrong_side: "single_sided_sol_requires_token_y_sol",
+		unknown: "single_sided_sol_orientation_unknown",
+		not_sol_pool: "single_sided_sol_pool_not_sol_quoted",
+		ambiguous: "single_sided_sol_orientation_ambiguous",
+	};
+	const messageByStatus = {
+		wrong_side:
+			"Single-sided SOL deploy requires SOL to be token_y/quote side for current amount_y semantics.",
+		unknown:
+			"Single-sided SOL deploy blocked because pool token order is unavailable.",
+		not_sol_pool:
+			"Single-sided SOL deploy blocked because target pool is not SOL-quoted.",
+		ambiguous:
+			"Single-sided SOL deploy blocked because pool token order is ambiguous.",
+	};
+
+	return {
+		applies: true,
+		blocked: !orientation.compatible,
+		reason_code: orientation.compatible ? null : reasonByStatus[orientation.status],
+		message: orientation.compatible ? null : messageByStatus[orientation.status],
+		orientation,
+		amount_x: amountX,
+		amount_y: amountY,
+	};
+}
+
 export function buildTrackedPositionFallback(position_address, { getTrackedPosition }) {
 	const tracked = getTrackedPosition(position_address);
 	if (!tracked || tracked.closed) return null;
@@ -89,7 +310,7 @@ export function buildTrackedPositionFallback(position_address, { getTrackedPosit
 		lower_bin: tracked.bin_range?.min ?? null,
 		upper_bin: tracked.bin_range?.max ?? null,
 		active_bin: tracked.active_bin_at_deploy ?? null,
-		in_range: tracked.out_of_range_since ? false : true,
+		in_range: !tracked.out_of_range_since,
 		unclaimed_fees_usd: 0,
 		total_value_usd: tracked.initial_value_usd ?? 0,
 		source: "state_fallback",

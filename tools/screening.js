@@ -1,8 +1,12 @@
 import { config } from "../config.js";
 import { isBlacklistedCreator } from "../creator-blacklist.js";
-import { isBlacklisted } from "../token-blacklist.js";
 import { log } from "../logger.js";
 import { evaluateExposureAdmission } from "../runtime-policy.js";
+import { isBlacklisted } from "../token-blacklist.js";
+import {
+	resolveCanonicalPoolIdentity,
+	resolveCanonicalPoolTokenView,
+} from "./dlmm-position-context.js";
 import { fetchWithTimeout } from "./fetch-utils.js";
 
 const POOL_DISCOVERY_BASE = "https://pool-discovery-api.datapi.meteora.ag";
@@ -10,6 +14,19 @@ const DISCOVERY_CACHE_TTL_MS = 15 * 1000;
 const SCREENING_FETCH_TIMEOUT_MS = 15 * 1000;
 
 const discoveryCache = new Map();
+
+function asFiniteOrNull(value) {
+	const numeric = Number(value);
+	return Number.isFinite(numeric) ? numeric : null;
+}
+
+function getPoolRiskMint(pool) {
+	return pool?.risk?.mint || resolveCanonicalPoolIdentity({
+		token_x_mint: pool?.base?.mint || null,
+		token_y_mint: pool?.quote?.mint || null,
+		solMint: config.tokens?.SOL,
+	}).risk_mint;
+}
 
 function getDiscoveryCacheKey({ page_size, timeframe, category, screeningFingerprint }) {
   return JSON.stringify({ page_size, timeframe, category, screeningFingerprint });
@@ -97,10 +114,12 @@ export async function discoverPools({
 
   // Filter blacklisted base tokens
   const pools = condensed.filter((p) => {
-    if (isBlacklisted(p.base?.mint)) {
-      log("blacklist", `Filtered blacklisted token ${p.base?.symbol} (${p.base?.mint?.slice(0, 8)}) in pool ${p.name}`);
-      return false;
-    }
+	const riskMint = getPoolRiskMint(p);
+	const riskSymbol = p.risk?.symbol || p.base?.symbol;
+	if (riskMint && isBlacklisted(riskMint)) {
+	  log("blacklist", `Filtered blacklisted token ${riskSymbol} (${riskMint.slice(0, 8)}) in pool ${p.name}`);
+	  return false;
+	}
     if (isBlacklistedCreator(p.dev)) {
       log("creator_blacklist", `Filtered blocked creator ${p.dev?.slice(0, 8)} in pool ${p.name}`);
       return false;
@@ -158,9 +177,11 @@ export async function getTopCandidates({
   }
   const { positions } = positionsResult;
   const occupiedPools = new Set(positions.map((p) => p.pool));
-  const occupiedMints = new Set(positions.map((p) => p.base_mint).filter(Boolean));
+	const occupiedMints = new Set(
+		positions.map((p) => p.risk_mint || p.base_mint).filter(Boolean),
+	);
 
-  const { candidates, blocked_summary, total_eligible } = rankCandidateSnapshots(resolvedPools, {
+  const { candidates, blocked_summary, total_eligible, evaluations } = rankCandidateSnapshots(resolvedPools, {
     occupiedPools,
     occupiedMints,
     limit,
@@ -175,6 +196,7 @@ export async function getTopCandidates({
     blocked_summary,
     occupied_pools: Array.from(occupiedPools),
     occupied_mints: Array.from(occupiedMints),
+    candidate_evaluations: evaluations,
     candidate_inputs: resolvedPools,
   };
 }
@@ -217,27 +239,28 @@ export function evaluateCandidateSnapshot(pool, {
   evaluationContext,
 } = {}) {
   const s = screeningConfig || config.screening;
-  const hard_blocks = [];
+	const hard_blocks = [];
+	const riskMint = getPoolRiskMint(pool);
   const token_age_hours = asTokenAgeHours(pool.token_age_hours);
   const minTokenAgeHours = asOptionalTokenAgeThreshold(s.minTokenAgeHours);
   const maxTokenAgeHours = asOptionalTokenAgeThreshold(s.maxTokenAgeHours);
   const tokenTooNew = token_age_hours != null && minTokenAgeHours != null && token_age_hours < minTokenAgeHours;
   const tokenTooOld = token_age_hours != null && maxTokenAgeHours != null && token_age_hours > maxTokenAgeHours;
-  const gate_results = {
-    pool_unoccupied: !occupiedPools.has(pool.pool),
-    token_unoccupied: !pool.base?.mint || !occupiedMints.has(pool.base.mint),
-    not_blacklisted: !isBlacklisted(pool.base?.mint),
-    token_age_available: token_age_hours != null,
+	const gate_results = {
+		pool_unoccupied: !occupiedPools.has(pool.pool),
+		token_unoccupied: !riskMint || !occupiedMints.has(riskMint),
+		not_blacklisted: !riskMint || !isBlacklisted(riskMint),
+		token_age_available: token_age_hours != null,
     token_age_min_ok: minTokenAgeHours == null || token_age_hours == null || token_age_hours >= minTokenAgeHours,
     token_age_max_ok: maxTokenAgeHours == null || token_age_hours == null || token_age_hours <= maxTokenAgeHours,
   };
 
-  const exposure = evaluateExposureAdmission({
-    poolAddress: pool.pool,
-    baseMint: pool.base?.mint,
-    occupiedPools,
-    occupiedMints,
-  });
+	const exposure = evaluateExposureAdmission({
+		poolAddress: pool.pool,
+		riskMint,
+		occupiedPools,
+		occupiedMints,
+	});
   if (!exposure.pass && Array.isArray(exposure.hard_blocks)) hard_blocks.push(...exposure.hard_blocks);
   if (!gate_results.not_blacklisted) hard_blocks.push("base_token_blacklisted");
   if (tokenTooNew) hard_blocks.push("token_too_new");
@@ -302,21 +325,46 @@ export async function getPoolDetail({ pool_address, timeframe = "5m" }) {
  * Raw API returns ~100+ fields per pool. The LLM only needs ~20.
  */
 function condensePool(p) {
+	const tokenView = resolveCanonicalPoolTokenView({
+		token_x: p.token_x || null,
+		token_y: p.token_y || null,
+		solMint: config.tokens?.SOL,
+	});
+	const riskToken = tokenView.risk_token || p.token_x || null;
+	const counterToken = tokenView.counter_token || p.token_y || null;
+	const holders = tokenView.risk_token_side === "token_y"
+		? asFiniteOrNull(p.quote_token_holders ?? p.token_y?.holders ?? p.token_y?.holder_count)
+		: asFiniteOrNull(p.base_token_holders);
   return {
-    pool: p.pool_address,
-    name: p.name,
+		pool: p.pool_address,
+		name: p.name,
     base: {
       symbol: p.token_x?.symbol,
       mint: p.token_x?.address,
       organic: Math.round(p.token_x?.organic_score || 0),
       warnings: p.token_x?.warnings?.length || 0,
     },
-    quote: {
-      symbol: p.token_y?.symbol,
-      mint: p.token_y?.address,
-    },
-    pool_type: p.pool_type,
-    bin_step: p.dlmm_params?.bin_step || null,
+		quote: {
+			symbol: p.token_y?.symbol,
+			mint: p.token_y?.address,
+		},
+		risk: {
+			symbol: riskToken?.symbol,
+			mint: riskToken?.address || null,
+			organic: Math.round(riskToken?.organic_score || 0),
+			warnings: riskToken?.warnings?.length || 0,
+			side: tokenView.risk_token_side,
+		},
+		counter: {
+			symbol: counterToken?.symbol,
+			mint: counterToken?.address || null,
+		},
+		risk_mint: tokenView.risk_mint,
+		risk_token_side: tokenView.risk_token_side,
+		orientation_status: tokenView.orientation_status,
+		sol_side: tokenView.sol_side,
+		pool_type: p.pool_type,
+		bin_step: p.dlmm_params?.bin_step || null,
     fee_pct: p.fee_pct,
 
     // Core metrics (the numbers that matter)
@@ -330,19 +378,19 @@ function condensePool(p) {
     volatility: fix(p.volatility, 2),
 
 
-    // Token health
-    holders: p.base_token_holders,
-    mcap: round(p.token_x?.market_cap),
-    organic_score: Math.round(p.token_x?.organic_score || 0),
-    dev: p.token_x?.dev || null,
+		// Token health
+		holders,
+		mcap: round(riskToken?.market_cap),
+		organic_score: Math.round(riskToken?.organic_score || 0),
+		dev: riskToken?.dev || null,
 
-    // Position health
+		// Position health
     active_positions: p.active_positions,
     active_pct: fix(p.active_positions_pct, 1),
     open_positions: p.open_positions,
 
-    // Token age visibility from discovery payload (ms epoch)
-    token_age_hours: toTokenAgeHours(p.token_x?.created_at),
+		// Token age visibility from discovery payload (ms epoch)
+		token_age_hours: toTokenAgeHours(riskToken?.created_at),
 
     // Price action
     price: p.pool_price,

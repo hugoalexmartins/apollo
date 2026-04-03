@@ -18,9 +18,9 @@ test("resolveAutonomousStrategyPreset selects quality_spot for strong top-LP qua
 	const preset = resolveAutonomousStrategyPreset({
 		pool: {
 			six_hour_volatility: 4,
-			fee_active_tvl_ratio: 0.05,
+			fee_active_tvl_ratio: 0.06,
 			organic_score: 84,
-			holders: 2400,
+			holders: 2600,
 			price_change_pct: 3,
 		},
 		distributionPlan: { strategy: "spot" },
@@ -31,6 +31,8 @@ test("resolveAutonomousStrategyPreset selects quality_spot for strong top-LP qua
 
 	assert.equal(preset.id, "quality_spot");
 	assert.equal(preset.lp_strategy, "spot");
+	assert.equal(preset.range.bins_below, 24);
+	assert.equal(preset.range.bins_above, 24);
 	assert.match(preset.activation_summary || "", /top LP win rate/i);
 });
 
@@ -38,9 +40,9 @@ test("resolveAutonomousStrategyPreset selects yield_spot_wide for calm fee-effic
 	const preset = resolveAutonomousStrategyPreset({
 		pool: {
 			six_hour_volatility: 3,
-			fee_active_tvl_ratio: 0.09,
-			organic_score: 75,
-			holders: 700,
+			fee_active_tvl_ratio: 0.1,
+			organic_score: 80,
+			holders: 1400,
 			price_change_pct: 4,
 		},
 		distributionPlan: { strategy: "spot" },
@@ -49,7 +51,25 @@ test("resolveAutonomousStrategyPreset selects yield_spot_wide for calm fee-effic
 
 	assert.equal(preset.id, "yield_spot_wide");
 	assert.equal(preset.lp_strategy, "spot");
+	assert.equal(preset.range.bins_below, 48);
+	assert.equal(preset.range.bins_above, 48);
 	assert.match(preset.activation_summary || "", /fee\/TVL/i);
+});
+
+test("resolveAutonomousStrategyPreset falls back when calm fee-efficient pool lacks holder depth", () => {
+	const preset = resolveAutonomousStrategyPreset({
+		pool: {
+			six_hour_volatility: 3,
+			fee_active_tvl_ratio: 0.1,
+			organic_score: 80,
+			holders: 700,
+			price_change_pct: 4,
+		},
+		distributionPlan: { strategy: "spot" },
+		scoredLpers: { candidates: [] },
+	});
+
+	assert.equal(preset.id, "bid_ask_default");
 });
 
 test("resolveAutonomousStrategyPreset falls back to bid_ask_default for hotter or weaker pools", () => {
